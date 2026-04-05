@@ -56,8 +56,11 @@ from nt_analyzer.compat_analyzer import (
     compare_compat, analyze_single_pe, get_known_differences, diagnose_bugcheck
 )
 from nt_analyzer.pe_patcher import (
-    PEPatcher, patch_pe_for_win2000, patch_syscall_stubs as patch_sysenter,
-    inject_convention_shim, add_import_to_pe
+    PEPatcher, CodeBlob, DiffEntry, PatchSet,
+    patch_pe_for_win2000, patch_syscall_stubs as patch_sysenter,
+    inject_convention_shim, add_import_to_pe, inject_code_blob_to_pe,
+    rebase_pe, rebuild_pe_exports, strip_pe_debug, compile_and_patch_pe,
+    inspect_pe_tables
 )
 
 
@@ -523,8 +526,126 @@ def cmd_patch_pe(args):
             parts = args.shim.split(',')
             if len(parts) == 4:
                 patcher.apply_convention_shim(parts[0], parts[1], parts[2], int(parts[3]))
+        if args.rebase:
+            new_base = int(args.rebase, 16)
+            patcher.rebase_image(new_base)
+            print(f"  Rebased to 0x{new_base:08X}")
+        if args.strip_debug:
+            patcher.remove_debug_directory()
+            print("  Removed debug directory")
+        if args.grow_section:
+            parts = args.grow_section.split(',')
+            name = parts[0]
+            size = int(parts[1], 16) if len(parts) > 1 else 0x1000
+            patcher.increase_section(name, size)
+            print(f"  Grew section '{name}' by 0x{size:X}")
+        if args.add_import:
+            parts = args.add_import.split('!')
+            if len(parts) == 2:
+                patcher.add_import(parts[0], parts[1])
+                print(f"  Queued import: {parts[0]}!{parts[1]}")
+        if args.forward_export:
+            parts = args.forward_export.split('=')
+            if len(parts) == 2:
+                patcher.add_export_forward(parts[0], parts[1])
+                print(f"  Queued forward: {parts[0]} -> {parts[1]}")
+        if args.symbol_map:
+            count = patcher.load_symbol_map(args.symbol_map)
+            print(f"  Loaded {count} symbols")
         result = patcher.save(output)
     print(f"\n{result.summary()}")
+
+
+def cmd_inspect_pe(args):
+    """Inspect internal PE tables."""
+    tables = inspect_pe_tables(args.pe)
+
+    if args.table in ('all', 'sections'):
+        print("\n=== SECTIONS ===")
+        for s in tables['sections']:
+            flags = []
+            if s['executable']: flags.append('X')
+            if s['writable']: flags.append('W')
+            print(f"  {s['name']:<10s} RVA=0x{s['rva']:08X} VSize=0x{s['virtual_size']:08X} "
+                  f"Raw=0x{s['raw_offset']:08X} RSize=0x{s['raw_size']:08X} [{','.join(flags)}]")
+
+    if args.table in ('all', 'exports'):
+        print(f"\n=== EXPORTS ({len(tables['exports'])}) ===")
+        for e in tables['exports'][:args.limit]:
+            fwd = f" -> {e['forwarder']}" if e['forwarder'] else ""
+            name = e['name'] or f"@{e['ordinal']}"
+            print(f"  [{e['ordinal']:4d}] 0x{e['rva']:08X} {name}{fwd}")
+
+    if args.table in ('all', 'imports'):
+        print(f"\n=== IMPORTS ({len(tables['imports'])}) ===")
+        current_dll = None
+        for i in tables['imports'][:args.limit]:
+            if i['dll'] != current_dll:
+                current_dll = i['dll']
+                print(f"\n  {current_dll}:")
+            name = i['name'] or f"@{i['ordinal']}"
+            print(f"    0x{i['iat_rva']:08X} {name}")
+
+    if args.table in ('all', 'relocations'):
+        relocs = tables['relocations']
+        print(f"\n=== RELOCATIONS ({len(relocs)}) ===")
+        for r in relocs[:args.limit]:
+            print(f"  0x{r['rva']:08X} {r['type_name']}")
+
+
+def cmd_inject_blob(args):
+    """Inject a code blob from a binary file into a PE."""
+    with open(args.blob, 'rb') as f:
+        code = f.read()
+
+    hook_api = []
+    if args.hook:
+        for h in args.hook:
+            parts = h.split('=')
+            if len(parts) == 2:
+                hook_api.append((parts[0], int(parts[1], 16)))
+
+    result = inject_code_blob_to_pe(
+        args.pe, code, hook_api=hook_api, output_path=args.output)
+    print(f"\n{result.summary()}")
+
+
+def cmd_compile_inject(args):
+    """Compile C source and inject into PE (GenPatch-style)."""
+    with open(args.source, 'r') as f:
+        source_code = f.read()
+
+    hook_api = []
+    if args.hook:
+        for h in args.hook:
+            parts = h.split('=')
+            if len(parts) == 2:
+                hook_api.append((parts[0], int(parts[1], 16)))
+
+    patcher = PEPatcher(args.pe)
+    rva = patcher.compile_and_inject(
+        source_code=source_code,
+        compiler=args.compiler,
+        hook_api=hook_api)
+    if rva is not None:
+        print(f"  Injected at RVA 0x{rva:X}")
+    result = patcher.save(args.output)
+    print(f"\n{result.summary()}")
+
+
+def cmd_rebase(args):
+    """Rebase a PE to a new ImageBase."""
+    new_base = int(args.base, 16)
+    result = rebase_pe(args.pe, new_base, args.output)
+    print(f"\n{result.summary()}")
+
+
+def cmd_hex_dump(args):
+    """Hex dump bytes at an RVA in a PE file."""
+    patcher = PEPatcher(args.pe, backup=False)
+    rva = int(args.rva, 16)
+    length = int(args.length, 16) if args.length else 0x80
+    print(patcher.hex_dump(rva, length))
 
 
 def main():
@@ -676,6 +797,46 @@ Examples:
     p.add_argument('--version', help='Set OS version (e.g. 5.0)')
     p.add_argument('--syscalls', action='store_true', help='Patch sysenter to int 0x2E')
     p.add_argument('--shim', help='Add convention shim: funcname,from,to,nparams')
+    p.add_argument('--rebase', help='Rebase to new ImageBase (hex, e.g. 0x10000000)')
+    p.add_argument('--strip-debug', action='store_true', help='Remove debug directory')
+    p.add_argument('--grow-section', help='Grow section: name[,hex_size] (e.g. .text,0x2000)')
+    p.add_argument('--add-import', help='Add import: DLL!Function (e.g. ntdll.dll!RtlInitUnicodeString)')
+    p.add_argument('--forward-export', help='Forward export: Name=DLL.Func')
+    p.add_argument('--symbol-map', help='Load symbol map file (.map or .csv)')
+
+    # inspect-pe
+    p = subparsers.add_parser('inspect-pe', help='Inspect PE internal tables (exports, imports, relocs, sections)')
+    p.add_argument('pe', help='Path to PE file')
+    p.add_argument('-t', '--table', choices=['all', 'sections', 'exports', 'imports', 'relocations'],
+                   default='all', help='Which table to show (default: all)')
+    p.add_argument('-n', '--limit', type=int, default=500, help='Max entries per table')
+
+    # inject-blob
+    p = subparsers.add_parser('inject-blob', help='Inject a raw code blob into a PE')
+    p.add_argument('pe', help='Path to PE file')
+    p.add_argument('blob', help='Path to binary blob file')
+    p.add_argument('-o', '--output', help='Output path')
+    p.add_argument('--hook', action='append', help='Hook export: name=hex_offset (repeatable)')
+
+    # compile-inject
+    p = subparsers.add_parser('compile-inject', help='GenPatch: compile C source and inject into PE')
+    p.add_argument('pe', help='Path to PE file')
+    p.add_argument('source', help='Path to C source file')
+    p.add_argument('-o', '--output', help='Output path')
+    p.add_argument('--compiler', default='gcc', help='Compiler command (default: gcc)')
+    p.add_argument('--hook', action='append', help='Hook export: name=hex_offset (repeatable)')
+
+    # rebase
+    p = subparsers.add_parser('rebase', help='Rebase a PE to a new ImageBase')
+    p.add_argument('pe', help='Path to PE file')
+    p.add_argument('base', help='New ImageBase in hex (e.g. 0x10000000)')
+    p.add_argument('-o', '--output', help='Output path')
+
+    # hex-dump
+    p = subparsers.add_parser('hex-dump', help='Hex dump bytes at an RVA in a PE')
+    p.add_argument('pe', help='Path to PE file')
+    p.add_argument('rva', help='RVA to dump (hex, e.g. 0x1000)')
+    p.add_argument('-l', '--length', help='Number of bytes (hex, default: 0x80)')
 
     args = parser.parse_args()
 
@@ -706,6 +867,11 @@ Examples:
         'compat-known': cmd_compat_known,
         'bugcheck': cmd_bugcheck,
         'patch-pe': cmd_patch_pe,
+        'inspect-pe': cmd_inspect_pe,
+        'inject-blob': cmd_inject_blob,
+        'compile-inject': cmd_compile_inject,
+        'rebase': cmd_rebase,
+        'hex-dump': cmd_hex_dump,
     }
 
     try:

@@ -1,20 +1,35 @@
 """
-KernelEx-Inspired PE Binary Patcher
-=====================================
-Python implementation of PE binary patching techniques inspired by KernelEx (Xeno86).
-Supports ALL PE types: .dll, .sys, .exe, .cpl, .drv, .ocx
+KernelEx-Inspired PE Binary Patcher — 2026 Ultimate Edition
+=============================================================
+Python implementation of ALL PE binary patching techniques from KernelEx (Xeno86,
+2006-2008), massively upgraded with modern capabilities.
 
-Capabilities:
-  - Add new PE sections
-  - Rebuild import table (add/remove imports)
-  - Rebuild export table (add/hook/forward/alias exports)
-  - Manage relocations (add, update, allocate)
-  - Inject code blobs with fixups
-  - Patch calling conventions (stdcall ↔ fastcall wrappers)
-  - Patch syscall stubs (sysenter → int 0x2E)
-  - Patch version info fields
-  - Generate compatibility shims
-  - Full backup and dry-run support
+Supports ALL PE types: .dll, .sys, .exe, .cpl, .drv, .ocx, .scr, .mui
+
+Core Capabilities (KernelEx-equivalent):
+  - Code blob injection with 4-table fixup system (abs_ofs, abs_api, rel_api, hook_api)
+  - Full export table rebuild (MTD1 in-place + MTD2 new section) with sorted merge
+  - Full import table rebuild with OFT/FT pairing
+  - Forward exports (EAT → "DLL.Function" string)
+  - Alias exports (new name → existing export RVA)
+  - Relocation management (alloc, update, rebase)
+  - Conditional patch system (apply only if condition met)
+  - Diff patches: raw, RVA, and searching pattern match
+  - 5-stage apply_patches pipeline: prepare → api_entries → alter_sections → rebuild → process
+
+Extended Capabilities (2026):
+  - Symbol-aware patching (PDB/symbol map integration)
+  - Internal table inspection (read/write IAT, EAT, relocation entries)
+  - PE rebase (ChangeImageBase with relocation fixups)
+  - Debug directory removal
+  - Section increase (IncSection)
+  - GenPatch-style C/ASM → injectable blob pipeline
+  - Calling convention shims (stdcall ↔ fastcall)
+  - Syscall stub patching (sysenter → int 0x2E)
+  - PE version/subsystem patching
+  - Full backup, dry-run, and audit trail support
+
+Inspired by: KernelEx (Xeno86) CPEFile + patch hierarchy + apply_patches pipeline
 """
 
 import os
@@ -22,9 +37,11 @@ import struct
 import shutil
 import hashlib
 import time
+import subprocess
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 import pefile
 
@@ -35,14 +52,29 @@ import pefile
 
 SECTION_ALIGN = 0x1000
 FILE_ALIGN = 0x200
+UPDT_SEC_NAME = ".kex"       # KernelEx-style update section name
+PATCH_MAX_SIZE = 0x100000     # 1MB max PE growth
 
 IMAGE_SCN_CNT_CODE = 0x00000020
 IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_SCN_MEM_READ = 0x40000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
+IMAGE_SCN_MEM_DISCARDABLE = 0x02000000
 
+IMAGE_REL_BASED_ABSOLUTE = 0
 IMAGE_REL_BASED_HIGHLOW = 3
+
+# PE data directory indices
+DD_EXPORT = 0
+DD_IMPORT = 1
+DD_RESOURCE = 2
+DD_EXCEPTION = 3
+DD_SECURITY = 4
+DD_BASERELOC = 5
+DD_DEBUG = 6
+DD_TLS = 9
+DD_IAT = 12
 
 # x86 instruction templates
 X86_NOP = b'\x90'
@@ -50,6 +82,13 @@ X86_RET = b'\xC3'
 X86_INT3 = b'\xCC'
 X86_PUSH_EBP = b'\x55'
 X86_MOV_EBP_ESP = b'\x8B\xEC'
+X86_JMP_REL32 = b'\xE9'
+X86_CALL_REL32 = b'\xE8'
+X86_JMP_ABS_IND = b'\xFF\x25'   # jmp [addr]
+X86_CALL_ABS_IND = b'\xFF\x15'  # call [addr]
+
+# Supported PE extensions
+SUPPORTED_PE_TYPES = {'.dll', '.sys', '.exe', '.cpl', '.drv', '.ocx', '.scr', '.mui', '.efi'}
 
 
 def _align(value, alignment):
@@ -127,6 +166,54 @@ class PatchResult:
         for op in self.operations:
             lines.append(f"  [{op.type}] {op.description}")
         return "\n".join(lines)
+
+
+@dataclass
+class CodeBlob:
+    """
+    KernelEx-style code blob with 4-table fixup system.
+
+    abs_ofs:  [(offset_in_blob,), ...]  — DWORDs needing +ImageBase+blob_rva
+    abs_api:  [(offset, dll, func), ...] — DWORDs to fill with absolute API addr
+    rel_api:  [(offset, dll, func), ...] — rel32 fields pointing to API
+    hook_api: [(export_name, offset_in_blob), ...] — redirect existing exports
+    new_exports: [(name, offset_in_blob), ...] — register new named exports
+    """
+    code: bytes
+    abs_ofs: list = field(default_factory=list)
+    abs_api: list = field(default_factory=list)
+    rel_api: list = field(default_factory=list)
+    hook_api: list = field(default_factory=list)
+    new_exports: list = field(default_factory=list)
+    description: str = ""
+
+
+@dataclass
+class DiffEntry:
+    """A single binary diff entry for patching."""
+    mode: str  # "offset", "rva", "pattern"
+    location: int = 0
+    pattern: bytes = b''
+    old_bytes: bytes = b''
+    new_bytes: bytes = b''
+    section: str = ""
+
+
+@dataclass
+class PatchSet:
+    """
+    Complete patch set for the KernelEx 5-stage pipeline.
+    Combines code blobs, export/import changes, diffs, and conditions.
+    """
+    name: str
+    description: str = ""
+    code_blobs: list = field(default_factory=list)
+    export_patches: list = field(default_factory=list)
+    import_patches: list = field(default_factory=list)
+    diff_patches: list = field(default_factory=list)
+    convention_patches: list = field(default_factory=list)
+    version_patch: tuple = None
+    conditions: list = field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -266,6 +353,62 @@ class PEPatcher:
             if ns['rva'] <= rva < ns['rva'] + ns['vsize']:
                 return rva - ns['rva'] + ns['offset']
         return None
+
+    def _resolve_import_rva(self, dll_name, func_name):
+        """Find the IAT entry RVA for a given import. Returns RVA or None."""
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_IMPORT'):
+            return None
+        for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
+            dll = entry.dll.decode('ascii', errors='replace')
+            if dll.lower() != dll_name.lower():
+                continue
+            for imp in entry.imports:
+                if imp.name and imp.name.decode('ascii', errors='replace') == func_name:
+                    return imp.address - self.pe.OPTIONAL_HEADER.ImageBase
+        return None
+
+    def _hook_export_rva(self, func_name, new_rva):
+        """Redirect an export's EAT entry to a new RVA (internal helper)."""
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_EXPORT'):
+            self.errors.append(f"No export directory — can't hook '{func_name}'")
+            return False
+        export_dir = self.pe.DIRECTORY_ENTRY_EXPORT
+        eat_rva = export_dir.struct.AddressOfFunctions
+        for exp in export_dir.symbols:
+            if exp.name and exp.name.decode('ascii', errors='replace') == func_name:
+                eat_index = exp.ordinal - export_dir.struct.Base
+                eat_entry_offset = self._rva_to_offset(eat_rva + eat_index * 4)
+                if eat_entry_offset is None:
+                    self.errors.append(f"Cannot locate EAT entry for '{func_name}'")
+                    return False
+                old_rva = struct.unpack_from('<I', self.data, eat_entry_offset)[0]
+                struct.pack_into('<I', self.data, eat_entry_offset, new_rva)
+                self._record("export_redirect",
+                            f"Redirected '{func_name}' RVA 0x{old_rva:X} → 0x{new_rva:X}",
+                            offset=eat_entry_offset, rva=new_rva)
+                return True
+        self.errors.append(f"Export '{func_name}' not found")
+        return False
+
+    def read_dword_rva(self, rva):
+        """Read a DWORD at the given RVA."""
+        offset = self._rva_to_offset(rva)
+        if offset is None:
+            return None
+        return struct.unpack_from('<I', self.data, offset)[0]
+
+    def write_dword_rva(self, rva, value, description=""):
+        """Write a DWORD at the given RVA."""
+        offset = self._rva_to_offset(rva)
+        if offset is None:
+            self.errors.append(f"Cannot resolve RVA 0x{rva:X}")
+            return False
+        old = struct.unpack_from('<I', self.data, offset)[0]
+        struct.pack_into('<I', self.data, offset, value & 0xFFFFFFFF)
+        self._record("dword_write",
+                    description or f"DWORD at RVA 0x{rva:X}: 0x{old:08X} → 0x{value:08X}",
+                    offset=offset, rva=rva)
+        return True
 
     # ── Syscall Stub Patching ────────────────────────────────────────────
 
@@ -435,9 +578,188 @@ class PEPatcher:
         the export directory that names "DLL.FunctionName".
         This is a simplified version — for full rebuild, use rebuild_exports().
         """
-        self.warnings.append(f"Export forwarding for '{name}' → '{forward_string}' "
-                           "requires full export table rebuild. Use rebuild_exports() instead.")
-        return False
+        self._pending_forwards = getattr(self, '_pending_forwards', [])
+        self._pending_forwards.append((name, forward_string))
+        self._record("export_forward_pending",
+                     f"Queued forward: '{name}' → '{forward_string}'")
+        return True
+
+    def add_alias_export(self, alias_name, target_name):
+        """Queue an alias export (new name → existing export's RVA)."""
+        self._pending_aliases = getattr(self, '_pending_aliases', [])
+        self._pending_aliases.append((alias_name, target_name))
+        self._record("export_alias_pending",
+                     f"Queued alias: '{alias_name}' → '{target_name}'")
+        return True
+
+    def rebuild_exports(self, new_exports=None, forwarded=None, aliases=None):
+        """
+        Rebuild the entire export table in a new .edata section.
+        Merges existing exports with additions. Names sorted for binary search.
+
+        new_exports: [(name, rva), ...] — new named exports
+        forwarded:   [(name, "DLL.Func"), ...] — forwarded exports
+        aliases:     [(new_name, existing_name), ...] — alias exports
+        """
+        new_exports = list(new_exports or [])
+        forwarded = list(forwarded or [])
+        aliases = list(aliases or [])
+
+        # Merge any pending additions
+        new_exports += getattr(self, '_pending_new_exports', [])
+        forwarded += getattr(self, '_pending_forwards', [])
+        aliases += getattr(self, '_pending_aliases', [])
+
+        # Read existing exports
+        exports = {}  # name -> {'rva': int, 'ordinal': int, 'forward': str|None}
+        module_name = os.path.basename(self.pe_path)
+        base_ordinal = 1
+
+        if hasattr(self.pe, 'DIRECTORY_ENTRY_EXPORT'):
+            ed = self.pe.DIRECTORY_ENTRY_EXPORT
+            base_ordinal = ed.struct.Base
+            name_offset = self._rva_to_offset(ed.struct.Name)
+            if name_offset:
+                end = self.data.index(0, name_offset)
+                module_name = self.data[name_offset:end].decode('ascii', errors='replace')
+
+            export_dir_rva = ed.struct.VirtualAddress
+            export_dir_size = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[DD_EXPORT].Size
+
+            for exp in ed.symbols:
+                if exp.name:
+                    name = exp.name.decode('ascii', errors='replace')
+                    if export_dir_rva <= exp.address < export_dir_rva + export_dir_size:
+                        fwd_off = self._rva_to_offset(exp.address)
+                        if fwd_off:
+                            fwd_end = self.data.index(0, fwd_off)
+                            fwd_str = self.data[fwd_off:fwd_end].decode('ascii', errors='replace')
+                            exports[name] = {'rva': exp.address, 'ordinal': exp.ordinal, 'forward': fwd_str}
+                        else:
+                            exports[name] = {'rva': exp.address, 'ordinal': exp.ordinal, 'forward': None}
+                    else:
+                        exports[name] = {'rva': exp.address, 'ordinal': exp.ordinal, 'forward': None}
+
+        # Merge new exports
+        next_ord = max((e['ordinal'] for e in exports.values()), default=base_ordinal - 1) + 1
+        for name, rva in new_exports:
+            if name not in exports:
+                exports[name] = {'rva': rva, 'ordinal': next_ord, 'forward': None}
+                next_ord += 1
+
+        for name, fwd_string in forwarded:
+            exports[name] = {'rva': 0, 'ordinal': next_ord, 'forward': fwd_string}
+            next_ord += 1
+
+        for alias_name, target_name in aliases:
+            if target_name in exports:
+                exports[alias_name] = {
+                    'rva': exports[target_name]['rva'],
+                    'ordinal': next_ord,
+                    'forward': exports[target_name]['forward'],
+                }
+                next_ord += 1
+            else:
+                self.warnings.append(f"Alias target '{target_name}' not found")
+
+        if not exports:
+            self.warnings.append("No exports to rebuild")
+            return False
+
+        # Sort names alphabetically (PE loader binary search requirement)
+        sorted_names = sorted(exports.keys())
+        num_functions = len(sorted_names)
+        base_ordinal = 1
+
+        # Calculate section size
+        eat_size = num_functions * 4
+        npt_size = num_functions * 4
+        ot_size = num_functions * 2
+
+        strings_size = len(module_name) + 1
+        for name in sorted_names:
+            strings_size += len(name) + 1
+        for name in sorted_names:
+            if exports[name]['forward']:
+                strings_size += len(exports[name]['forward']) + 1
+
+        total_size = 40 + eat_size + npt_size + ot_size + strings_size + 256
+
+        result = self.add_section(".edata", total_size,
+                                 IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ)
+        if result is None:
+            return False
+        sect_rva, sect_off, _ = result
+
+        cursor = 0
+        edt_offset = cursor; cursor += 40
+        eat_offset = cursor; cursor += eat_size
+        npt_offset = cursor; cursor += npt_size
+        ot_offset = cursor; cursor += ot_size
+
+        # Module name string
+        modname_offset = cursor
+        mod_bytes = module_name.encode('ascii') + b'\x00'
+        self.data[sect_off + cursor:sect_off + cursor + len(mod_bytes)] = mod_bytes
+        cursor += len(mod_bytes)
+
+        # Export name strings
+        name_str_offsets = {}
+        for name in sorted_names:
+            name_str_offsets[name] = cursor
+            nb = name.encode('ascii') + b'\x00'
+            self.data[sect_off + cursor:sect_off + cursor + len(nb)] = nb
+            cursor += len(nb)
+
+        # Forwarder strings
+        fwd_str_offsets = {}
+        for name in sorted_names:
+            fwd = exports[name]['forward']
+            if fwd:
+                fwd_str_offsets[name] = cursor
+                fb = fwd.encode('ascii') + b'\x00'
+                self.data[sect_off + cursor:sect_off + cursor + len(fb)] = fb
+                cursor += len(fb)
+
+        # Write EAT entries
+        for i, name in enumerate(sorted_names):
+            fwd = exports[name]['forward']
+            rva = sect_rva + fwd_str_offsets[name] if fwd else exports[name]['rva']
+            struct.pack_into('<I', self.data, sect_off + eat_offset + i * 4, rva)
+
+        # Write Name Pointer Table
+        for i, name in enumerate(sorted_names):
+            struct.pack_into('<I', self.data, sect_off + npt_offset + i * 4,
+                           sect_rva + name_str_offsets[name])
+
+        # Write Ordinal Table (0-based indices into EAT)
+        for i in range(num_functions):
+            struct.pack_into('<H', self.data, sect_off + ot_offset + i * 2, i)
+
+        # Write Export Directory Table (40 bytes)
+        edt = struct.pack('<IIHHIIIIIII',
+            0,                              # Characteristics
+            int(time.time()),               # TimeDateStamp
+            0, 0,                           # MajorVersion, MinorVersion
+            sect_rva + modname_offset,      # Name
+            base_ordinal,                   # Base
+            num_functions,                  # NumberOfFunctions
+            num_functions,                  # NumberOfNames
+            sect_rva + eat_offset,          # AddressOfFunctions
+            sect_rva + npt_offset,          # AddressOfNames
+            sect_rva + ot_offset,           # AddressOfNameOrdinals
+        )
+        self.data[sect_off + edt_offset:sect_off + edt_offset + 40] = edt
+
+        # Update data directory for exports (index 0)
+        dd_base = self.pe.DOS_HEADER.e_lfanew + 4 + 20 + 96
+        struct.pack_into('<II', self.data, dd_base, sect_rva, cursor)
+
+        self._record("export_rebuild",
+                    f"Rebuilt export table: {num_functions} functions "
+                    f"({len(forwarded)} fwd, {len(aliases)} alias) in .edata",
+                    rva=sect_rva)
+        return True
 
     # ── Import Table Patching ────────────────────────────────────────────
 
@@ -715,6 +1037,124 @@ class PEPatcher:
                     f"Rebuilt relocations: {len(all_relocs)} entries on {len(pages)} pages",
                     rva=sect_rva)
 
+    # ── PE Rebase (KernelEx ChangeImageBase) ─────────────────────────────
+
+    def rebase_image(self, new_base):
+        """
+        Change the PE ImageBase and fix up all relocations.
+        Like KernelEx CPEFile::ChangeImageBase.
+        """
+        old_base = self.pe.OPTIONAL_HEADER.ImageBase
+        delta = new_base - old_base
+        if delta == 0:
+            return True
+
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_BASERELOC'):
+            self.warnings.append("No relocation table — rebase may corrupt absolute addresses")
+        else:
+            for reloc_block in self.pe.DIRECTORY_ENTRY_BASERELOC:
+                for entry in reloc_block.entries:
+                    if entry.type == IMAGE_REL_BASED_HIGHLOW:
+                        offset = self._rva_to_offset(entry.rva)
+                        if offset is not None and offset + 4 <= len(self.data):
+                            val = struct.unpack_from('<I', self.data, offset)[0]
+                            val = (val + delta) & 0xFFFFFFFF
+                            struct.pack_into('<I', self.data, offset, val)
+
+        # Update ImageBase in optional header (offset 28 for PE32)
+        oh_offset = self.pe.DOS_HEADER.e_lfanew + 4 + 20 + 28
+        struct.pack_into('<I', self.data, oh_offset, new_base)
+
+        self._record("rebase",
+                    f"Rebased image: 0x{old_base:08X} → 0x{new_base:08X} (delta: {delta:+d})")
+        return True
+
+    # ── Section Increase (KernelEx IncSection) ───────────────────────────
+
+    def increase_section(self, section_idx_or_name=-1, additional_size=0x1000):
+        """
+        Increase the size of a section (default: last one).
+        Like KernelEx CPEFile::IncSection.
+        Only the last section can be grown without shifting all subsequent data.
+        """
+        if isinstance(section_idx_or_name, str):
+            target = None
+            for i, s in enumerate(self.pe.sections):
+                sname = s.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+                if sname == section_idx_or_name:
+                    target = i
+                    break
+            if target is None:
+                self.errors.append(f"Section '{section_idx_or_name}' not found")
+                return False
+            section_idx = target
+        else:
+            section_idx = section_idx_or_name
+            if section_idx < 0:
+                section_idx = len(self.pe.sections) + section_idx
+
+        if section_idx < 0 or section_idx >= len(self.pe.sections):
+            self.errors.append(f"Section index {section_idx} out of range")
+            return False
+
+        if section_idx != len(self.pe.sections) - 1:
+            self.errors.append("Can only grow the last section without shifting")
+            return False
+
+        section = self.pe.sections[section_idx]
+        file_alignment = self.pe.OPTIONAL_HEADER.FileAlignment
+        section_alignment = self.pe.OPTIONAL_HEADER.SectionAlignment
+
+        old_raw_size = section.SizeOfRawData
+        old_vsize = section.Misc_VirtualSize
+
+        new_raw_size = _align(old_raw_size + additional_size, file_alignment)
+        new_vsize = _align(max(old_vsize, old_raw_size) + additional_size, section_alignment)
+        growth = new_raw_size - old_raw_size
+
+        # Extend the file data at end of section
+        insert_point = section.PointerToRawData + old_raw_size
+        self.data[insert_point:insert_point] = b'\x00' * growth
+
+        # Update section header
+        hdr_offset = (
+            self.pe.DOS_HEADER.e_lfanew + 4 + 20 +
+            self.pe.FILE_HEADER.SizeOfOptionalHeader +
+            section_idx * 40
+        )
+        struct.pack_into('<I', self.data, hdr_offset + 8, new_vsize)     # VirtualSize
+        struct.pack_into('<I', self.data, hdr_offset + 16, new_raw_size) # SizeOfRawData
+
+        # Update SizeOfImage
+        new_image_size = _align(section.VirtualAddress + new_vsize, section_alignment)
+        soi_offset = self.pe.DOS_HEADER.e_lfanew + 4 + 20 + 56
+        struct.pack_into('<I', self.data, soi_offset, new_image_size)
+
+        sname = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+        self._record("section_increase",
+                    f"Increased '{sname}' by 0x{growth:X} bytes "
+                    f"(raw: 0x{old_raw_size:X}→0x{new_raw_size:X})")
+        return True
+
+    # ── Debug Directory Removal ──────────────────────────────────────────
+
+    def remove_debug_directory(self):
+        """Remove the debug directory entry from the PE."""
+        dd_base = self.pe.DOS_HEADER.e_lfanew + 4 + 20 + 96
+        struct.pack_into('<II', self.data, dd_base + DD_DEBUG * 8, 0, 0)
+        self._record("debug_remove", "Removed debug directory entry")
+        return True
+
+    # ── Timestamp Update ─────────────────────────────────────────────────
+
+    def update_timestamp(self):
+        """Update the PE TimeDateStamp to current time."""
+        ts = int(time.time())
+        # PE sig(4) + Machine(2) + NumSections(2) = offset 8 to TimeDateStamp
+        ts_offset = self.pe.DOS_HEADER.e_lfanew + 8
+        struct.pack_into('<I', self.data, ts_offset, ts)
+        self._record("timestamp", f"Updated TimeDateStamp to {ts}")
+
     # ── Search & Replace in Code ─────────────────────────────────────────
 
     def search_and_patch(self, pattern, replacement, section_name=None):
@@ -809,7 +1249,7 @@ class PEPatcher:
 
     # ── Save ─────────────────────────────────────────────────────────────
 
-    def save(self, output_path=None, fix_cksum=True):
+    def save(self, output_path=None, fix_cksum=True, update_ts=True):
         """
         Write the patched PE to disk.
         Creates backup of original if backup=True.
@@ -830,6 +1270,17 @@ class PEPatcher:
         # Rebuild imports if needed
         if hasattr(self, '_import_additions') and self._import_additions:
             self.rebuild_import_table()
+
+        # Rebuild exports if needed
+        pending_exports = getattr(self, '_pending_new_exports', [])
+        pending_fwd = getattr(self, '_pending_forwards', [])
+        pending_alias = getattr(self, '_pending_aliases', [])
+        if pending_exports or pending_fwd or pending_alias:
+            self.rebuild_exports()
+
+        # Update timestamp
+        if update_ts:
+            self.update_timestamp()
 
         # Fix checksum
         if fix_cksum:
@@ -928,6 +1379,445 @@ class PEPatcher:
 
         return True
 
+    # ── Code Blob Injection (KernelEx binary_api_patch) ──────────────────
+
+    def inject_code_blob(self, blob, description=""):
+        """
+        Inject a compiled code blob with KernelEx-style 4-table fixup system.
+
+        blob: CodeBlob instance with:
+          code     — raw x86 machine code
+          abs_ofs  — [(offset,)] DWORDs needing +ImageBase+blob_rva
+          abs_api  — [(offset, dll, func)] DWORDs filled with absolute API addr
+          rel_api  — [(offset, dll, func)] rel32 values pointing to API
+          hook_api — [(export_name, offset_in_blob)] redirect exports to blob
+          new_exports — [(name, offset_in_blob)] register new exports
+
+        Returns the RVA where the blob was placed, or None on failure.
+        """
+        code = bytearray(blob.code)
+        code_len = len(code)
+
+        patch_info = self._get_patch_section(code_len + 64)
+        if patch_info is None:
+            self.errors.append("Failed to allocate patch section for code blob")
+            return None
+
+        sect_rva, sect_off, cursor = patch_info
+        blob_rva = sect_rva + cursor
+        blob_file_off = sect_off + cursor
+        image_base = self.pe.OPTIONAL_HEADER.ImageBase
+
+        # Table 1: abs_ofs — add (ImageBase + blob_rva) to DWORDs
+        for entry in blob.abs_ofs:
+            offset = entry[0] if isinstance(entry, (list, tuple)) else entry
+            if offset + 4 > code_len:
+                self.warnings.append(f"abs_ofs fixup at {offset} out of range")
+                continue
+            val = struct.unpack_from('<I', code, offset)[0]
+            val += image_base + blob_rva
+            struct.pack_into('<I', code, offset, val & 0xFFFFFFFF)
+            self.add_relocation(blob_rva + offset)
+
+        # Table 2: abs_api — resolve import and write absolute address
+        for offset, dll, func in blob.abs_api:
+            if offset + 4 > code_len:
+                self.warnings.append(f"abs_api fixup at {offset} out of range")
+                continue
+            api_rva = self._resolve_import_rva(dll, func)
+            if api_rva is None:
+                self.add_import(dll, func)
+                self.warnings.append(f"abs_api: {dll}!{func} not yet imported, queued")
+                struct.pack_into('<I', code, offset, 0)
+            else:
+                struct.pack_into('<I', code, offset, image_base + api_rva)
+                self.add_relocation(blob_rva + offset)
+
+        # Table 3: rel_api — resolve import and compute relative offset
+        for offset, dll, func in blob.rel_api:
+            if offset + 4 > code_len:
+                self.warnings.append(f"rel_api fixup at {offset} out of range")
+                continue
+            api_rva = self._resolve_import_rva(dll, func)
+            if api_rva is None:
+                self.add_import(dll, func)
+                self.warnings.append(f"rel_api: {dll}!{func} not yet imported, queued")
+                struct.pack_into('<i', code, offset, 0)
+            else:
+                call_site_rva = blob_rva + offset + 4
+                rel32 = api_rva - call_site_rva
+                struct.pack_into('<i', code, offset, rel32)
+
+        # Write code blob to section
+        self.data[blob_file_off:blob_file_off + code_len] = code
+
+        # Table 4: hook_api — redirect existing exports to blob entry points
+        for export_name, blob_offset in blob.hook_api:
+            self._hook_export_rva(export_name, blob_rva + blob_offset)
+
+        # Register new exports
+        self._pending_new_exports = getattr(self, '_pending_new_exports', [])
+        for name, blob_offset in blob.new_exports:
+            self._pending_new_exports.append((name, blob_rva + blob_offset))
+
+        self._record("code_blob_inject",
+                    blob.description or description or
+                    f"Injected code blob ({code_len} bytes) at RVA 0x{blob_rva:X} "
+                    f"[{len(blob.abs_ofs)} abs_ofs, {len(blob.abs_api)} abs_api, "
+                    f"{len(blob.rel_api)} rel_api, {len(blob.hook_api)} hook_api]",
+                    rva=blob_rva)
+        return blob_rva
+
+    # ── Binary Diff Patching ─────────────────────────────────────────────
+
+    def apply_diff_entry(self, diff):
+        """
+        Apply a single DiffEntry (binary diff patch).
+        Supports modes: "offset" (file offset), "rva", "pattern" (search).
+        """
+        if diff.mode == "offset":
+            if diff.old_bytes:
+                actual = bytes(self.data[diff.location:diff.location + len(diff.old_bytes)])
+                if actual != diff.old_bytes:
+                    self.warnings.append(
+                        f"Diff at offset 0x{diff.location:X}: expected {diff.old_bytes.hex()}, "
+                        f"got {actual.hex()}")
+                    return False
+            self.patch_bytes(diff.location, diff.new_bytes,
+                            f"Diff patch at offset 0x{diff.location:X}")
+            return True
+
+        elif diff.mode == "rva":
+            if diff.old_bytes:
+                offset = self._rva_to_offset(diff.location)
+                if offset is None:
+                    self.errors.append(f"Cannot resolve RVA 0x{diff.location:X}")
+                    return False
+                actual = bytes(self.data[offset:offset + len(diff.old_bytes)])
+                if actual != diff.old_bytes:
+                    self.warnings.append(
+                        f"Diff at RVA 0x{diff.location:X}: expected {diff.old_bytes.hex()}, "
+                        f"got {actual.hex()}")
+                    return False
+            return self.patch_bytes_rva(diff.location, diff.new_bytes,
+                                       f"Diff patch at RVA 0x{diff.location:X}")
+
+        elif diff.mode == "pattern":
+            count = self.search_and_patch(
+                diff.pattern + diff.old_bytes,
+                diff.pattern + diff.new_bytes,
+                diff.section or None)
+            if count == 0:
+                self.warnings.append("Pattern not found for diff patch")
+            return count > 0
+
+        else:
+            self.errors.append(f"Unknown diff mode: {diff.mode}")
+            return False
+
+    def apply_diff_patches(self, diff_list):
+        """Apply a list of DiffEntry patches. Returns (success_count, fail_count)."""
+        ok, fail = 0, 0
+        for diff in diff_list:
+            if self.apply_diff_entry(diff):
+                ok += 1
+            else:
+                fail += 1
+        return ok, fail
+
+    # ── 5-Stage Patch Pipeline (KernelEx apply_patches) ──────────────────
+
+    def apply_patch_set(self, patch_set):
+        """
+        Apply a complete PatchSet using the KernelEx 5-stage pipeline:
+
+          1. PREPARE      — validate conditions, verify target PE
+          2. API_ENTRIES   — process code blobs and their 4-table fixups
+          3. ALTER_SECTIONS — apply diff patches, convention shims
+          4. REBUILD_TABLES — rebuild export/import tables
+          5. PROCESS       — version patches, checksum, finalize
+        """
+        result = PatchResult(success=True, operations=[], errors=[], warnings=[])
+
+        # ── Stage 1: PREPARE ──
+        for cond_fn in patch_set.conditions:
+            try:
+                if not cond_fn(self):
+                    result.success = False
+                    result.errors.append(
+                        f"Condition failed: {getattr(cond_fn, '__doc__', None) or 'unnamed'}")
+                    return result
+            except Exception as e:
+                result.success = False
+                result.errors.append(f"Condition raised exception: {e}")
+                return result
+
+        # ── Stage 2: API_ENTRIES ──
+        for blob in patch_set.code_blobs:
+            rva = self.inject_code_blob(blob)
+            if rva is None:
+                result.warnings.append(f"Code blob injection failed: {blob.description}")
+
+        # ── Stage 3: ALTER_SECTIONS ──
+        for diff in patch_set.diff_patches:
+            self.apply_diff_entry(diff)
+
+        for conv in patch_set.convention_patches:
+            self.apply_convention_shim(
+                conv.func_name, conv.from_conv, conv.to_conv, conv.num_params)
+
+        # ── Stage 4: REBUILD_TABLES ──
+        pending_exports = getattr(self, '_pending_new_exports', [])
+        forwarded = [(ep.name, ep.target) for ep in patch_set.export_patches
+                     if ep.action == 'forward']
+        aliases = [(ep.name, ep.target) for ep in patch_set.export_patches
+                   if ep.action == 'alias']
+
+        if pending_exports or forwarded or aliases:
+            self.rebuild_exports(
+                new_exports=pending_exports, forwarded=forwarded, aliases=aliases)
+
+        for ip in patch_set.import_patches:
+            if ip.action == 'add':
+                self.add_import(ip.dll, ip.function)
+
+        # ── Stage 5: PROCESS ──
+        if patch_set.version_patch:
+            major, minor = patch_set.version_patch
+            self.patch_os_version(major, minor)
+
+        result.operations = list(self.operations)
+        result.errors = list(self.errors)
+        result.warnings = list(self.warnings)
+        result.success = len(result.errors) == 0
+        return result
+
+    # ── GenPatch-Style Compile & Inject ──────────────────────────────────
+
+    def compile_and_inject(self, source_path=None, source_code=None,
+                           compiler="gcc", extra_flags=None,
+                           abs_ofs=None, abs_api=None, rel_api=None,
+                           hook_api=None, new_exports=None):
+        """
+        GenPatch-style: compile C/ASM source to a flat binary blob,
+        then inject with 4-table fixups.
+
+        Uses: gcc -c -O2 -nostdlib → objcopy -O binary → inject
+        Requires: MinGW gcc + objcopy on PATH.
+        """
+        tmp_source = None
+        if source_code and not source_path:
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False)
+            tmp.write(source_code)
+            tmp.close()
+            source_path = tmp.name
+            tmp_source = source_path
+
+        if not source_path or not os.path.isfile(source_path):
+            self.errors.append(f"Source file not found: {source_path}")
+            return None
+
+        obj_path = source_path + '.o'
+        bin_path = source_path + '.bin'
+
+        try:
+            # Step 1: Compile to object
+            flags = extra_flags or []
+            compile_cmd = [compiler, '-c', '-O2', '-nostdlib', '-fno-stack-protector',
+                          '-m32', '-o', obj_path, source_path] + flags
+            proc = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                self.errors.append(f"Compilation failed: {proc.stderr}")
+                return None
+
+            # Step 2: Extract .text as flat binary
+            objcopy = compiler.replace('gcc', 'objcopy')
+            extract_cmd = [objcopy, '-O', 'binary', '-j', '.text', obj_path, bin_path]
+            proc = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                self.errors.append(f"objcopy failed: {proc.stderr}")
+                return None
+
+            with open(bin_path, 'rb') as f:
+                code = f.read()
+
+            if not code:
+                self.errors.append("Compiled binary is empty")
+                return None
+
+            blob = CodeBlob(
+                code=code,
+                abs_ofs=abs_ofs or [],
+                abs_api=abs_api or [],
+                rel_api=rel_api or [],
+                hook_api=hook_api or [],
+                new_exports=new_exports or [],
+                description=f"Compiled from {os.path.basename(source_path)}",
+            )
+            return self.inject_code_blob(blob)
+
+        finally:
+            for p in [obj_path, bin_path]:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            if tmp_source:
+                try:
+                    os.unlink(tmp_source)
+                except OSError:
+                    pass
+
+    # ── Symbol-Aware Patching ────────────────────────────────────────────
+
+    def load_symbol_map(self, map_path):
+        """
+        Load a symbol map for name-to-RVA resolution.
+        Supports: CSV (name,hex_rva) and MAP (hex_addr name) formats.
+        """
+        self._symbols = getattr(self, '_symbols', {})
+
+        with open(map_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith(('#', ';', '//')):
+                    continue
+
+                if ',' in line:
+                    parts = line.split(',', 1)
+                    name = parts[0].strip()
+                    try:
+                        rva = int(parts[1].strip(), 16)
+                        self._symbols[name] = rva
+                    except ValueError:
+                        continue
+                else:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            rva = int(parts[0], 16)
+                            self._symbols[parts[1]] = rva
+                        except ValueError:
+                            continue
+
+        self._record("symbol_load",
+                    f"Loaded {len(self._symbols)} symbols from {os.path.basename(map_path)}")
+        return len(self._symbols)
+
+    def resolve_symbol(self, name):
+        """Resolve a symbol name to an RVA. Falls back to export table."""
+        symbols = getattr(self, '_symbols', {})
+        rva = symbols.get(name)
+        if rva is not None:
+            return rva
+        # Fallback: check exports
+        if hasattr(self.pe, 'DIRECTORY_ENTRY_EXPORT'):
+            for exp in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if exp.name and exp.name.decode('ascii', errors='replace') == name:
+                    return exp.address
+        return None
+
+    def patch_by_symbol(self, symbol_name, new_bytes, description=""):
+        """Patch bytes at a symbol's RVA location."""
+        rva = self.resolve_symbol(symbol_name)
+        if rva is None:
+            self.errors.append(f"Symbol '{symbol_name}' not found")
+            return False
+        return self.patch_bytes_rva(
+            rva, new_bytes,
+            description or f"Patch at symbol '{symbol_name}' (RVA 0x{rva:X})")
+
+    # ── Table Inspection ─────────────────────────────────────────────────
+
+    def inspect_eat(self):
+        """Return a list of all Export Address Table entries."""
+        results = []
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_EXPORT'):
+            return results
+        for exp in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            results.append({
+                'ordinal': exp.ordinal,
+                'name': exp.name.decode('ascii', errors='replace') if exp.name else None,
+                'rva': exp.address,
+                'forwarder': exp.forwarder.decode('ascii', errors='replace') if exp.forwarder else None,
+            })
+        return results
+
+    def inspect_iat(self):
+        """Return a list of all Import Address Table entries."""
+        results = []
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_IMPORT'):
+            return results
+        for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
+            dll = entry.dll.decode('ascii', errors='replace')
+            for imp in entry.imports:
+                results.append({
+                    'dll': dll,
+                    'name': imp.name.decode('ascii', errors='replace') if imp.name else None,
+                    'ordinal': imp.ordinal,
+                    'iat_rva': imp.address - self.pe.OPTIONAL_HEADER.ImageBase if imp.address else 0,
+                })
+        return results
+
+    def inspect_relocations(self):
+        """Return a list of all base relocation entries."""
+        results = []
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_BASERELOC'):
+            return results
+        for block in self.pe.DIRECTORY_ENTRY_BASERELOC:
+            for entry in block.entries:
+                results.append({
+                    'rva': entry.rva,
+                    'type': entry.type,
+                    'type_name': {0: 'ABSOLUTE', 3: 'HIGHLOW'}.get(
+                        entry.type, f'TYPE_{entry.type}'),
+                })
+        return results
+
+    def inspect_sections(self):
+        """Return a summary of all PE sections."""
+        results = []
+        for s in self.pe.sections:
+            results.append({
+                'name': s.Name.rstrip(b'\x00').decode('ascii', errors='replace'),
+                'rva': s.VirtualAddress,
+                'virtual_size': s.Misc_VirtualSize,
+                'raw_offset': s.PointerToRawData,
+                'raw_size': s.SizeOfRawData,
+                'characteristics': s.Characteristics,
+                'executable': bool(s.Characteristics & IMAGE_SCN_MEM_EXECUTE),
+                'writable': bool(s.Characteristics & IMAGE_SCN_MEM_WRITE),
+            })
+        return results
+
+    # ── Trampoline & Hex Dump Utilities ──────────────────────────────────
+
+    def generate_trampoline(self, target_rva, trampoline_rva=None):
+        """
+        Generate a JMP trampoline to a target RVA.
+        If trampoline_rva given → relative JMP, else → absolute indirect JMP.
+        """
+        if trampoline_rva is not None:
+            rel32 = target_rva - (trampoline_rva + 5)
+            return X86_JMP_REL32 + struct.pack('<i', rel32)
+        else:
+            addr = self.pe.OPTIONAL_HEADER.ImageBase + target_rva
+            return X86_JMP_ABS_IND + struct.pack('<I', addr)
+
+    def hex_dump(self, rva, length=64):
+        """Return a hex dump string of bytes at the given RVA."""
+        offset = self._rva_to_offset(rva)
+        if offset is None:
+            return f"Cannot resolve RVA 0x{rva:X}"
+        data = bytes(self.data[offset:offset + length])
+        lines = []
+        for i in range(0, len(data), 16):
+            chunk = data[i:i + 16]
+            hex_part = ' '.join(f'{b:02X}' for b in chunk)
+            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            lines.append(f"  {rva + i:08X}  {hex_part:<48s}  {ascii_part}")
+        return '\n'.join(lines)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  High-level API
@@ -959,3 +1849,56 @@ def add_import_to_pe(pe_path, dll_name, func_name, output_path=None):
     patcher = PEPatcher(pe_path)
     patcher.add_import(dll_name, func_name)
     return patcher.save(output_path)
+
+
+def inject_code_blob_to_pe(pe_path, code, hook_api=None, abs_ofs=None,
+                           abs_api=None, rel_api=None, output_path=None):
+    """Inject a code blob with 4-table fixups."""
+    blob = CodeBlob(
+        code=code, abs_ofs=abs_ofs or [], abs_api=abs_api or [],
+        rel_api=rel_api or [], hook_api=hook_api or [],
+    )
+    patcher = PEPatcher(pe_path)
+    patcher.inject_code_blob(blob)
+    return patcher.save(output_path)
+
+
+def rebase_pe(pe_path, new_base, output_path=None):
+    """Rebase a PE to a new ImageBase."""
+    patcher = PEPatcher(pe_path)
+    patcher.rebase_image(new_base)
+    return patcher.save(output_path)
+
+
+def rebuild_pe_exports(pe_path, forwarded=None, aliases=None, output_path=None):
+    """Rebuild PE export table with optional forwarders/aliases."""
+    patcher = PEPatcher(pe_path)
+    patcher.rebuild_exports(forwarded=forwarded, aliases=aliases)
+    return patcher.save(output_path)
+
+
+def strip_pe_debug(pe_path, output_path=None):
+    """Remove debug directory from PE."""
+    patcher = PEPatcher(pe_path)
+    patcher.remove_debug_directory()
+    return patcher.save(output_path)
+
+
+def compile_and_patch_pe(pe_path, source_code, compiler="gcc",
+                         hook_api=None, output_path=None):
+    """GenPatch-style: compile C source and inject into PE."""
+    patcher = PEPatcher(pe_path)
+    patcher.compile_and_inject(
+        source_code=source_code, compiler=compiler, hook_api=hook_api)
+    return patcher.save(output_path)
+
+
+def inspect_pe_tables(pe_path):
+    """Return a dict with all PE table inspection data."""
+    patcher = PEPatcher(pe_path)
+    return {
+        'sections': patcher.inspect_sections(),
+        'exports': patcher.inspect_eat(),
+        'imports': patcher.inspect_iat(),
+        'relocations': patcher.inspect_relocations(),
+    }

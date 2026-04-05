@@ -38,8 +38,8 @@ from nt_analyzer.compat_analyzer import (
     compare_compat, analyze_single_pe, get_known_differences, diagnose_bugcheck
 )
 from nt_analyzer.pe_patcher import (
-    PEPatcher, patch_pe_for_win2000, patch_syscall_stubs as patch_sysenter,
-    inject_convention_shim
+    PEPatcher, CodeBlob, patch_pe_for_win2000, patch_syscall_stubs as patch_sysenter,
+    inject_convention_shim, inspect_pe_tables
 )
 
 
@@ -1875,29 +1875,41 @@ class PEPatcherTab(ttk.Frame):
             row=0, column=1, sticky="ew")
         ttk.Button(out_frm, text="Browse...", command=self._browse_out).grid(row=0, column=2, padx=(6, 0))
 
-        # Options
+        # Options row 1
         opt_frm = tk.Frame(self, bg=BG)
         opt_frm.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
 
         self.chk_version = tk.BooleanVar(value=True)
         self.chk_syscalls = tk.BooleanVar(value=True)
+        self.chk_strip_debug = tk.BooleanVar(value=False)
         tk.Checkbutton(opt_frm, text="Patch version to 5.0", variable=self.chk_version,
                        bg=BG, fg=FG, selectcolor=BG_DARKER, activebackground=BG,
                        activeforeground=FG).pack(side="left", padx=8)
         tk.Checkbutton(opt_frm, text="Patch sysenter \u2192 int 0x2E", variable=self.chk_syscalls,
                        bg=BG, fg=FG, selectcolor=BG_DARKER, activebackground=BG,
                        activeforeground=FG).pack(side="left", padx=8)
+        tk.Checkbutton(opt_frm, text="Strip debug info", variable=self.chk_strip_debug,
+                       bg=BG, fg=FG, selectcolor=BG_DARKER, activebackground=BG,
+                       activeforeground=FG).pack(side="left", padx=8)
 
-        # Shim entry
+        # Options row 2: shim + rebase
         shim_frm = tk.Frame(self, bg=BG)
         shim_frm.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
         ttk.Label(shim_frm, text="Convention shim:").pack(side="left", padx=4)
         self.shim_var = tk.StringVar()
         tk.Entry(shim_frm, textvariable=self.shim_var, bg=ENTRY_BG, fg=FG,
                  insertbackground=FG, font=("Consolas", 10), relief="flat",
-                 bd=4, width=50).pack(side="left", padx=4)
+                 bd=4, width=35).pack(side="left", padx=4)
         ttk.Label(shim_frm, text="(func,from,to,nparams)", foreground=FG_DIM).pack(side="left", padx=4)
 
+        ttk.Label(shim_frm, text="  Rebase:").pack(side="left", padx=(12, 4))
+        self.rebase_var = tk.StringVar()
+        tk.Entry(shim_frm, textvariable=self.rebase_var, bg=ENTRY_BG, fg=FG,
+                 insertbackground=FG, font=("Consolas", 10), relief="flat",
+                 bd=4, width=12).pack(side="left", padx=4)
+        ttk.Label(shim_frm, text="(hex address)", foreground=FG_DIM).pack(side="left", padx=4)
+
+        # Buttons row 1
         btn_frm = tk.Frame(self, bg=BG)
         btn_frm.grid(row=4, column=0, sticky="w", padx=8, pady=4)
 
@@ -1905,8 +1917,12 @@ class PEPatcherTab(ttk.Frame):
                    command=self._quick_patch).pack(side="left", padx=4)
         ttk.Button(btn_frm, text="Custom Patch",
                    command=self._custom_patch).pack(side="left", padx=4)
-        ttk.Button(btn_frm, text="Patch Syscall Stubs Only",
+        ttk.Button(btn_frm, text="Patch Syscalls Only",
                    command=self._patch_syscalls).pack(side="left", padx=4)
+        ttk.Button(btn_frm, text="Inspect Tables",
+                   command=self._inspect_tables).pack(side="left", padx=4)
+        ttk.Button(btn_frm, text="Rebase",
+                   command=self._rebase).pack(side="left", padx=4)
         ttk.Button(btn_frm, text="Clear",
                    command=lambda: output_clear(self.output)).pack(side="left", padx=4)
 
@@ -1959,20 +1975,29 @@ class PEPatcherTab(ttk.Frame):
         self.status_var.set("Applying custom patches...")
         output_clear(self.output)
 
+        chk_ver = self.chk_version.get()
+        chk_sys = self.chk_syscalls.get()
+        chk_dbg = self.chk_strip_debug.get()
+        shim = self.shim_var.get().strip()
+        rebase = self.rebase_var.get().strip()
+
         def work():
             patcher = PEPatcher(pe_path)
-            if self.chk_version.get():
+            if chk_ver:
                 patcher.patch_os_version(5, 0)
                 patcher.patch_subsystem_version(5, 0)
-            if self.chk_syscalls.get():
+            if chk_sys:
                 count = patcher.patch_syscall_stubs()
                 patcher._record("info", f"Patched {count} syscall stubs")
-            shim = self.shim_var.get().strip()
+            if chk_dbg:
+                patcher.remove_debug_directory()
             if shim:
                 parts = shim.split(',')
                 if len(parts) == 4:
                     patcher.apply_convention_shim(parts[0].strip(), parts[1].strip(),
                                                   parts[2].strip(), int(parts[3].strip()))
+            if rebase:
+                patcher.rebase_image(int(rebase, 16))
             return patcher.save(output)
 
         def done(result):
@@ -2012,6 +2037,91 @@ class PEPatcherTab(ttk.Frame):
             output_write(self.output, result.summary() + '\n')
             if result.success:
                 output_write(self.output, f"\nSaved to: {result.output_path}\n", "ok")
+            self.status_var.set("Done")
+
+        run_async(work, lambda r: self.after(0, done, r))
+
+    def _inspect_tables(self):
+        pe_path = self.pe_var.get()
+        if not pe_path:
+            messagebox.showwarning("Missing", "Select a PE file.")
+            return
+        self.status_var.set("Inspecting PE tables...")
+        output_clear(self.output)
+
+        def work():
+            return inspect_pe_tables(pe_path)
+
+        def done(tables):
+            if isinstance(tables, Exception):
+                self.status_var.set(f"Error: {tables}")
+                output_write(self.output, f"ERROR: {tables}\n", "error")
+                return
+
+            output_write(self.output, "=== SECTIONS ===\n")
+            for s in tables['sections']:
+                flags = []
+                if s['executable']: flags.append('X')
+                if s['writable']: flags.append('W')
+                output_write(self.output,
+                    f"  {s['name']:<10s} RVA=0x{s['rva']:08X} "
+                    f"VSize=0x{s['virtual_size']:08X} "
+                    f"Raw=0x{s['raw_offset']:08X} "
+                    f"RSize=0x{s['raw_size']:08X} [{','.join(flags)}]\n")
+
+            output_write(self.output, f"\n=== EXPORTS ({len(tables['exports'])}) ===\n")
+            for e in tables['exports'][:200]:
+                fwd = f" -> {e['forwarder']}" if e['forwarder'] else ""
+                name = e['name'] or f"@{e['ordinal']}"
+                output_write(self.output,
+                    f"  [{e['ordinal']:4d}] 0x{e['rva']:08X} {name}{fwd}\n")
+
+            output_write(self.output, f"\n=== IMPORTS ({len(tables['imports'])}) ===\n")
+            cur_dll = None
+            for i in tables['imports'][:200]:
+                if i['dll'] != cur_dll:
+                    cur_dll = i['dll']
+                    output_write(self.output, f"\n  {cur_dll}:\n")
+                name = i['name'] or f"@{i['ordinal']}"
+                output_write(self.output, f"    0x{i['iat_rva']:08X} {name}\n")
+
+            relocs = tables['relocations']
+            output_write(self.output, f"\n=== RELOCATIONS ({len(relocs)}) ===\n")
+            for r in relocs[:100]:
+                output_write(self.output, f"  0x{r['rva']:08X} {r['type_name']}\n")
+            if len(relocs) > 100:
+                output_write(self.output, f"  ... and {len(relocs) - 100} more\n")
+
+            self.status_var.set(f"Inspection complete: {len(tables['exports'])} exports, "
+                              f"{len(tables['imports'])} imports, {len(relocs)} relocs")
+
+        run_async(work, lambda r: self.after(0, done, r))
+
+    def _rebase(self):
+        pe_path = self.pe_var.get()
+        rebase = self.rebase_var.get().strip()
+        if not pe_path:
+            messagebox.showwarning("Missing", "Select a PE file.")
+            return
+        if not rebase:
+            messagebox.showwarning("Missing", "Enter a hex address in the Rebase field.")
+            return
+        output = self.out_var.get() or None
+        self.status_var.set("Rebasing...")
+        output_clear(self.output)
+
+        def work():
+            from nt_analyzer.pe_patcher import rebase_pe
+            return rebase_pe(pe_path, int(rebase, 16), output)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            output_write(self.output, result.summary() + '\n')
+            if result.success:
+                output_write(self.output, f"\nRebased file saved to: {result.output_path}\n", "ok")
             self.status_var.set("Done")
 
         run_async(work, lambda r: self.after(0, done, r))

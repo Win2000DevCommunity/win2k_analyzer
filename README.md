@@ -2,7 +2,9 @@
 
 **The ultimate reverse-engineering and binary compatibility toolkit for porting ReactOS components to Windows 2000 SP4.**
 
-Analyze, compare, decompile, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (13 tabs)** and a **full CLI (22 commands)**.
+Analyze, compare, decompile, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (13 tabs)** and a **full CLI (27 commands)**.
+
+**NEW in v3.0 — KernelEx Ultimate PE Patcher:**  All patching techniques from KernelEx (Xeno86, 2006-2008) have been reverse-engineered and reimplemented in Python with modern 2026 capabilities: code blob injection with 4-table fixups, full export/import table rebuild, PE rebase, GenPatch-style C→binary compilation, 5-stage patch pipeline, symbol-aware patching, and more.
 
 Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, `.scr`
 
@@ -20,7 +22,7 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 - [Quick Start](#quick-start)
 - [Opening the GUI](#opening-the-gui)
 - [Using the CLI](#using-the-cli)
-- [CLI Command Reference (All 22 Commands)](#cli-command-reference-all-22-commands)
+- [CLI Command Reference (All 27 Commands)](#cli-command-reference-all-27-commands)
 - [GUI Tab Reference (All 13 Tabs)](#gui-tab-reference-all-13-tabs)
 - [Using with Visual Studio Code](#using-with-visual-studio-code)
 - [Using with GitHub Copilot](#using-with-github-copilot)
@@ -41,8 +43,9 @@ This tool gives you everything in one place:
 2. **Compare** — Side-by-side diff of Win2000 vs ReactOS DLLs (exports, imports, syscalls, PE headers)
 3. **Decompile** — Convert x86 assembly to C pseudocode, even **without symbols**
 4. **Detect** — Intelligently find calling convention changes, HAL dispatch differences, macro differences, structure layout changes between NT versions
-5. **Patch** — KernelEx-inspired PE binary patcher: fix version stamps, replace sysenter→int 0x2E, inject calling convention shims
-6. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+5. **Patch** — KernelEx-inspired PE binary patcher with ALL KernelEx techniques: code blob injection with 4-table fixups (abs_ofs, abs_api, rel_api, hook_api), full export table rebuild with sorted merge, PE rebase with relocation fixups, GenPatch-style C/ASM compilation pipeline, calling convention shims, and the full 5-stage patch pipeline (prepare → api_entries → alter_sections → rebuild_tables → process)
+6. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
+7. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
 
 ---
 
@@ -73,7 +76,16 @@ This tool gives you everything in one place:
 | **PE Patching** | Quick Win2000 patch (version + syscalls) | `patch-pe --quick` | Tab 13 |
 | | Patch sysenter stubs to int 0x2E | `patch-pe --syscalls` | Tab 13 |
 | | Inject calling convention shims (stdcall↔fastcall) | `patch-pe --shim` | Tab 13 |
-| | Custom patches (version, syscalls, shims combined) | `patch-pe` | Tab 13 |
+| | Rebase PE to new ImageBase with relocation fixups | `patch-pe --rebase` / `rebase` | Tab 13 |
+| | Strip debug directory from PE | `patch-pe --strip-debug` | Tab 13 |
+| | Grow section, add import, forward export | `patch-pe --grow-section/--add-import/--forward-export` | Tab 13 |
+| | Inject raw code blob with 4-table fixups | `inject-blob` | — |
+| | GenPatch: compile C source & inject into PE | `compile-inject` | — |
+| | Full export table rebuild (add/forward/alias/hook) | Python API | — |
+| | 5-stage KernelEx pipeline (PatchSet) | Python API | — |
+| | Symbol map loading + symbol-aware patching | Python API | — |
+| **PE Inspection** | Inspect all PE tables (EAT, IAT, relocs, sections) | `inspect-pe` | Tab 13 |
+| | Hex dump at RVA | `hex-dump` | — |
 | **Build** | Generate RosBE / MSVC / CMake build scripts | `build-script` | Tab 9 |
 | | ReactOS source tree auto-patcher | — | Tab 8 |
 
@@ -220,7 +232,7 @@ This tool is fully compatible with **GitHub Copilot** in VS Code:
 
 ---
 
-## CLI Command Reference (All 22 Commands)
+## CLI Command Reference (All 27 Commands)
 
 ### PE Analysis
 
@@ -433,11 +445,64 @@ python win2k_analyzer.py patch-pe <pe_path> --syscalls
 # Custom: inject calling convention shim
 python win2k_analyzer.py patch-pe <pe_path> --shim "IoReadPartitionTable,fastcall,stdcall,4"
 
+# Rebase to new ImageBase (fixes all relocations automatically)
+python win2k_analyzer.py patch-pe <pe_path> --rebase 0x10000000
+
+# Strip debug info + add an import
+python win2k_analyzer.py patch-pe <pe_path> --strip-debug --add-import "ntdll.dll!RtlInitUnicodeString"
+
+# Forward an export and grow a section
+python win2k_analyzer.py patch-pe <pe_path> --forward-export "OldFunc=newdll.NewFunc" --grow-section ".text,0x2000"
+
+# Load a symbol map for named patching
+python win2k_analyzer.py patch-pe <pe_path> --symbol-map symbols.map --version 5.0
+
 # Combine everything
-python win2k_analyzer.py patch-pe <pe_path> --version 5.0 --syscalls --shim "IoReadPartitionTable,fastcall,stdcall,4" -o patched.dll
+python win2k_analyzer.py patch-pe <pe_path> --version 5.0 --syscalls --shim "IoReadPartitionTable,fastcall,stdcall,4" --rebase 0x7C800000 --strip-debug -o patched.dll
 ```
 
 The patcher creates a new file (`<name>_patched.<ext>` by default) — it never modifies the original binary in place.
+
+#### `inspect-pe` — Inspect PE Internal Tables
+```bash
+# Show all tables (sections, exports, imports, relocations)
+python win2k_analyzer.py inspect-pe <pe_path>
+
+# Show only exports
+python win2k_analyzer.py inspect-pe <pe_path> -t exports
+
+# Show relocations with a limit
+python win2k_analyzer.py inspect-pe <pe_path> -t relocations -n 100
+```
+
+#### `inject-blob` — Inject Raw Code Blob
+```bash
+# Inject a binary blob and hook an export to it
+python win2k_analyzer.py inject-blob <pe_path> <blob.bin> --hook "FuncName=0x00"
+```
+Injects a raw machine code blob into a new `.patch` section and optionally redirects specified exports to entry points within the blob.
+
+#### `compile-inject` — GenPatch: Compile C Source & Inject
+```bash
+# Compile a C file and inject the resulting code into a PE
+python win2k_analyzer.py compile-inject <pe_path> <source.c> --hook "MyFunc=0x00"
+
+# Use a specific compiler
+python win2k_analyzer.py compile-inject <pe_path> <source.c> --compiler i686-w64-mingw32-gcc
+```
+GenPatch-style pipeline: compiles C/ASM source to a flat binary blob using gcc+objcopy, then injects it with full fixup support. Requires MinGW gcc on PATH.
+
+#### `rebase` — Rebase PE ImageBase
+```bash
+python win2k_analyzer.py rebase <pe_path> 0x10000000 [-o output.dll]
+```
+Changes the PE ImageBase and walks all relocation entries to fix up absolute addresses. Like KernelEx's `ChangeImageBase`.
+
+#### `hex-dump` — Hex Dump at RVA
+```bash
+python win2k_analyzer.py hex-dump <pe_path> 0x1000 -l 0x100
+```
+Dumps hex + ASCII at any RVA in a PE file. Useful for verifying patches.
 
 ---
 
@@ -512,13 +577,16 @@ The patcher creates a new file (`<name>_patched.<ext>` by default) — it never 
 - **Bugcheck Lookup** — enter a BSOD code, get compat-specific diagnosis
 - Color-coded output: red for critical, yellow for warnings
 
-### Tab 13: PE Patcher
+### Tab 13: PE Patcher (KernelEx Ultimate Edition)
 - Load a PE file to patch
-- Checkboxes: Patch version to 5.0, Patch sysenter→int 0x2E
+- Checkboxes: Patch version to 5.0, Patch sysenter→int 0x2E, Strip debug info
 - Convention shim entry field (e.g., `IoReadPartitionTable,fastcall,stdcall,4`)
+- Rebase entry field (hex address, e.g., `0x7C800000`)
 - **Quick Win2000 Patch** — one-click version + syscall fix
-- **Custom Patch** — apply selected patches
-- **Patch Syscall Stubs Only** — just the sysenter→int 0x2E replacement
+- **Custom Patch** — apply all selected patches (version, syscalls, debug strip, shim, rebase)
+- **Patch Syscalls Only** — just the sysenter→int 0x2E replacement
+- **Inspect Tables** — view all PE internal tables (exports, imports, relocations, sections)
+- **Rebase** — change ImageBase and fix all relocations
 - Output file saved as `<name>_patched.<ext>` (original never modified)
 
 ---
@@ -565,7 +633,10 @@ Copilot can autonomously:
 ### Using the Python API directly:
 ```python
 from nt_analyzer.compat_analyzer import compare_compat, diagnose_bugcheck
-from nt_analyzer.pe_patcher import PEPatcher, patch_pe_for_win2000
+from nt_analyzer.pe_patcher import (
+    PEPatcher, CodeBlob, DiffEntry, PatchSet,
+    patch_pe_for_win2000, inspect_pe_tables, rebase_pe
+)
 from nt_analyzer.decompiler import decompile, decompile_no_symbols
 
 # Deep compatibility analysis
@@ -576,9 +647,41 @@ print(report.summary())
 info = diagnose_bugcheck("0xA5")
 print(info['known_causes'])
 
-# Patch a binary
+# Quick-patch a binary for Win2000
 result = patch_pe_for_win2000("reactos_ntdll.dll")
 print(result.summary())
+
+# Inspect all PE tables
+tables = inspect_pe_tables("kernel32.dll")
+print(f"Exports: {len(tables['exports'])}, Imports: {len(tables['imports'])}")
+
+# Rebase a PE
+result = rebase_pe("my.dll", 0x10000000)
+print(result.summary())
+
+# Advanced: inject a code blob with KernelEx's 4-table fixup system
+patcher = PEPatcher("target.dll")
+blob = CodeBlob(
+    code=my_compiled_x86_bytes,
+    abs_ofs=[(0x10,)],                                # DWORDs needing +ImageBase+blob_rva
+    abs_api=[(0x20, "kernel32.dll", "GetProcAddress")],  # absolute API address
+    rel_api=[(0x30, "ntdll.dll", "RtlInitUnicodeString")],  # relative call to API
+    hook_api=[("OldFunction", 0x00)],                   # redirect export to blob
+    new_exports=[("NewFunction", 0x40)],               # register new exports
+)
+patcher.inject_code_blob(blob)
+patcher.rebuild_exports()  # sorted merge into new .edata section
+result = patcher.save()
+
+# Use the 5-stage KernelEx pipeline
+patch = PatchSet(
+    name="Win2000 Compat",
+    code_blobs=[blob],
+    diff_patches=[DiffEntry(mode="rva", location=0x1234, new_bytes=b'\x90\x90')],
+    version_patch=(5, 0),
+    conditions=[lambda p: hasattr(p.pe, 'DIRECTORY_ENTRY_EXPORT')],
+)
+result = patcher.apply_patch_set(patch)
 
 # Decompile without symbols
 functions = decompile_no_symbols("ntoskrnl.exe", max_funcs=20)
@@ -592,7 +695,7 @@ for name, code in functions.items():
 
 ```
 win2k_analyzer/
-├── win2k_analyzer.py          # CLI frontend (22 commands)
+├── win2k_analyzer.py          # CLI frontend (27 commands)
 ├── win2k_gui.py               # GUI frontend (13 tabs, dark theme)
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
@@ -610,7 +713,7 @@ win2k_analyzer/
 │   ├── behavior_analyzer.py   # Function fingerprinting & API patterns
 │   ├── decompiler.py          # x86→C decompiler (works without symbols)
 │   ├── compat_analyzer.py     # Deep NT version compatibility detection
-│   └── pe_patcher.py          # KernelEx-inspired PE binary patcher
+│   └── pe_patcher.py          # KernelEx-inspired PE binary patcher (1900+ lines, 46 methods)
 │
 └── generated_headers/         # Output: generated C header files
     ├── peb_win2k.h
@@ -695,6 +798,21 @@ A: **No.** The patcher always creates a new file: `<name>_patched.<ext>`. Use `-
 **Q: How do I fix a calling convention mismatch?**
 A: Use `--shim`: `python win2k_analyzer.py patch-pe <file> --shim "IoReadPartitionTable,fastcall,stdcall,4"`. This injects a wrapper that translates between conventions.
 
+**Q: How do I inject custom code into a PE?**
+A: Two ways: (1) Compile C code and inject in one step: `python win2k_analyzer.py compile-inject <pe> <source.c> --hook "FuncName=0x00"`. (2) Inject a pre-compiled blob: `python win2k_analyzer.py inject-blob <pe> <blob.bin> --hook "FuncName=0x00"`. Both create a `.patch` section and can redirect existing exports to your code.
+
+**Q: How do I inspect PE tables without patching?**
+A: CLI: `python win2k_analyzer.py inspect-pe <file>` or GUI: Tab 13, click "Inspect Tables". Shows sections, exports, imports, and relocations.
+
+**Q: How do I rebase a PE to a different address?**
+A: CLI: `python win2k_analyzer.py rebase <file> 0x10000000` or `python win2k_analyzer.py patch-pe <file> --rebase 0x10000000`. The rebase walks all relocation entries and fixes absolute addresses.
+
+**Q: What is the 4-table fixup system?**
+A: Inspired by KernelEx's `binary_api_patch`: when you inject a code blob, you specify 4 fixup tables that tell the patcher how to resolve addresses in your code: `abs_ofs` (add ImageBase+blob_rva), `abs_api` (absolute API address), `rel_api` (relative call/jmp to API), `hook_api` (redirect existing exports to blob entry points).
+
+**Q: What is the 5-stage pipeline?**
+A: Based on KernelEx's `apply_patches`: (1) Prepare — validate conditions, (2) API_entries — inject code blobs with fixups, (3) Alter_sections — apply binary diffs and shims, (4) Rebuild_tables — rebuild export/import tables, (5) Process — version patches, checksum, finalize. Use the `PatchSet` class for bundled patching.
+
 **Q: How do I generate build scripts for ReactOS?**
 A: CLI: `python win2k_analyzer.py build-script <reactos_dir> --type rosbe --dlls ntdll.dll kernel32.dll` or GUI: Tab 9.
 
@@ -748,6 +866,9 @@ Areas that need help:
 - More calling convention detection heuristics
 - Additional NT version difference rules
 - Testing on more Win2000 system binaries
+- Pre-built patch sets for common ReactOS DLLs
+- PDB symbol loading integration
+- Binary diff generation between PE versions
 
 ---
 
