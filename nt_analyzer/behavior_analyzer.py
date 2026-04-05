@@ -405,10 +405,11 @@ def compare_functions(pe_path_a, pe_path_b, func_name, max_bytes=8192):
     return ComparisonResult(func_name, fp_a, fp_b)
 
 
-def batch_compare(pe_path_a, pe_path_b, func_names=None, max_bytes=8192):
+def batch_compare(pe_path_a, pe_path_b, func_names=None, max_bytes=8192, progress_callback=None):
     """
     Compare multiple (or all shared) exported functions between two PE files.
     Returns list of ComparisonResult sorted by similarity (lowest first).
+    progress_callback(message, pct) is called per function if provided.
     """
     pe_a = pefile.PE(pe_path_a, fast_load=False)
     pe_b = pefile.PE(pe_path_b, fast_load=False)
@@ -432,8 +433,12 @@ def batch_compare(pe_path_a, pe_path_b, func_names=None, max_bytes=8192):
         # Compare all shared exports
         func_names = sorted(exports_a & exports_b)
 
+    total = len(func_names)
     results = []
-    for name in func_names:
+    for i, name in enumerate(func_names):
+        if progress_callback:
+            pct = int((i / total) * 100) if total else 0
+            progress_callback(f"Comparing {name} ({i+1}/{total})", pct)
         has_a = name in exports_a
         has_b = name in exports_b
         if has_a and has_b:
@@ -521,10 +526,11 @@ def detect_api_patterns(pe_path, func_name):
     return {'function': func_name, 'patterns': patterns, 'fingerprint': fp}
 
 
-def scan_all_exports(pe_path, max_functions=500):
+def scan_all_exports(pe_path, max_functions=500, progress_callback=None):
     """
     Scan all exports in a PE and categorize them by behavioral pattern.
     Returns dict of pattern_type → list of function names.
+    progress_callback(message, pct) is called per function if provided.
     """
     pe = pefile.PE(pe_path, fast_load=False)
     exports = []
@@ -534,12 +540,16 @@ def scan_all_exports(pe_path, max_functions=500):
                 exports.append(exp.name.decode('ascii', errors='replace'))
     pe.close()
 
+    total = min(len(exports), max_functions)
     categories = defaultdict(list)
     scanned = 0
 
     for func_name in exports:
         if scanned >= max_functions:
             break
+        if progress_callback:
+            pct = int((scanned / total) * 100) if total else 0
+            progress_callback(f"Scanning {func_name} ({scanned+1}/{total})", pct)
         result = detect_api_patterns(pe_path, func_name)
         if result:
             for ptype, pdesc in result['patterns']:
@@ -596,5 +606,417 @@ def disassemble_function(pe_path, func_name, max_bytes=4096):
             break
         if insn.mnemonic == 'int3':
             break
+
+    return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+#  Advanced Control Flow Analysis
+# ---------------------------------------------------------------------------
+
+class ControlFlowStructure:
+    """Represents a detected control flow structure (loop, if/else, switch)."""
+    __slots__ = ('kind', 'header_addr', 'body_addrs', 'exit_addr',
+                 'condition', 'details', 'children')
+
+    def __init__(self, kind, header_addr):
+        self.kind = kind            # 'loop', 'if_else', 'switch', 'sequence'
+        self.header_addr = header_addr
+        self.body_addrs = []        # addresses of blocks in this structure
+        self.exit_addr = None       # where control goes after this structure
+        self.condition = None       # branch condition string
+        self.details = {}           # extra info (case count, loop type, etc.)
+        self.children = []          # nested structures
+
+
+def detect_loops(blocks):
+    """
+    Detect loop structures via back-edge detection (natural loops).
+    A back edge is B→A where A dominates B (simplified: A.addr <= B.addr).
+
+    Returns list of ControlFlowStructure(kind='loop').
+    """
+    sorted_addrs = sorted(blocks.keys())
+    loops = []
+
+    for addr in sorted_addrs:
+        block = blocks[addr]
+        for succ in block.successors:
+            if succ in blocks and succ <= addr:
+                # Back edge: block→succ forms a loop
+                loop = ControlFlowStructure('loop', succ)
+                # Collect all blocks between header and tail
+                body = set()
+                for a in sorted_addrs:
+                    if succ <= a <= addr:
+                        body.add(a)
+                loop.body_addrs = sorted(body)
+
+                # Determine loop type
+                header = blocks[succ]
+                tail = blocks[addr]
+                if any(m == 'cmp' or m == 'test' for m, _ in header.instructions):
+                    loop.details['type'] = 'while'
+                    # Extract condition from header
+                    for m, o in header.instructions:
+                        if m in ('cmp', 'test'):
+                            loop.condition = f"{m} {o}"
+                            break
+                elif any(m == 'cmp' or m == 'test' for m, _ in tail.instructions):
+                    loop.details['type'] = 'do-while'
+                    for m, o in tail.instructions:
+                        if m in ('cmp', 'test'):
+                            loop.condition = f"{m} {o}"
+                            break
+                else:
+                    loop.details['type'] = 'infinite'
+
+                loop.details['body_insns'] = sum(
+                    len(blocks[a].instructions) for a in body if a in blocks
+                )
+
+                # Exit = first successor of header that's outside loop body
+                for s in header.successors:
+                    if s not in body:
+                        loop.exit_addr = s
+                        break
+
+                loops.append(loop)
+
+    return loops
+
+
+def detect_if_else(blocks):
+    """
+    Detect if/else patterns: a block with exactly 2 successors (conditional
+    jump) where the successors converge to a common target.
+
+    Returns list of ControlFlowStructure(kind='if_else').
+    """
+    sorted_addrs = sorted(blocks.keys())
+    structures = []
+
+    for addr in sorted_addrs:
+        block = blocks[addr]
+        if len(block.successors) != 2:
+            continue
+
+        # Two successors: true_branch and false_branch
+        true_addr, false_addr = block.successors[0], block.successors[1]
+        if true_addr not in blocks or false_addr not in blocks:
+            continue
+
+        true_block = blocks[true_addr]
+        false_block = blocks[false_addr]
+
+        # Extract the condition
+        condition = None
+        for m, o in reversed(block.instructions):
+            if m in ('cmp', 'test'):
+                condition = f"{m} {o}"
+                break
+        # Also get the branch type
+        for m, o in reversed(block.instructions):
+            if m.startswith('j') and m != 'jmp':
+                condition = f"{m} (after {condition})" if condition else m
+                break
+
+        ife = ControlFlowStructure('if_else', addr)
+        ife.condition = condition
+
+        # Check if both branches converge
+        true_succs = set(true_block.successors)
+        false_succs = set(false_block.successors)
+        merge = true_succs & false_succs
+
+        if merge:
+            ife.exit_addr = min(merge)
+            ife.details['has_else'] = True
+        else:
+            # One branch might fall through directly
+            if false_addr in true_succs:
+                ife.exit_addr = false_addr
+                ife.details['has_else'] = False
+            elif true_addr in false_succs:
+                ife.exit_addr = true_addr
+                ife.details['has_else'] = False
+            else:
+                ife.details['has_else'] = True
+
+        ife.body_addrs = [true_addr, false_addr]
+        ife.details['true_branch'] = true_addr
+        ife.details['false_branch'] = false_addr
+        ife.details['true_insns'] = len(true_block.instructions)
+        ife.details['false_insns'] = len(false_block.instructions)
+
+        structures.append(ife)
+
+    return structures
+
+
+def detect_switches(blocks):
+    """
+    Detect switch/case patterns by looking for:
+    - A cmp+ja (bounds check) followed by indirect jump through a table
+    - Multiple blocks branching from the same source with similar structure
+
+    Returns list of ControlFlowStructure(kind='switch').
+    """
+    sorted_addrs = sorted(blocks.keys())
+    switches = []
+
+    for addr in sorted_addrs:
+        block = blocks[addr]
+        instrs = block.instructions
+
+        # Pattern: cmp reg, N ; ja default ; jmp [reg*4 + table]
+        for i, (m, o) in enumerate(instrs):
+            if m == 'cmp' and i + 1 < len(instrs):
+                next_m, next_o = instrs[i + 1]
+                if next_m == 'ja' or next_m == 'jb':
+                    # Looks like a switch bounds check
+                    sw = ControlFlowStructure('switch', addr)
+                    sw.condition = f"{m} {o}"
+
+                    # Try to extract the case count
+                    parts = o.split(',')
+                    if len(parts) == 2:
+                        try:
+                            val = parts[1].strip()
+                            n = int(val, 16) if val.startswith('0x') else int(val)
+                            sw.details['n_cases'] = n + 1
+                        except ValueError:
+                            sw.details['n_cases'] = '?'
+
+                    sw.details['register'] = parts[0].strip() if parts else '?'
+                    sw.body_addrs = list(block.successors)
+
+                    # Count how many unique targets the successors branch to
+                    all_targets = set()
+                    for s in block.successors:
+                        if s in blocks:
+                            all_targets.update(blocks[s].successors)
+                    sw.details['total_targets'] = len(all_targets)
+
+                    switches.append(sw)
+                    break
+
+    return switches
+
+
+def analyze_control_flow(pe_path, func_name, max_bytes=8192):
+    """
+    Full control flow analysis combining all structure detectors.
+
+    Returns dict with:
+        'function': name
+        'blocks': basic blocks dict
+        'loops': list of loop structures
+        'if_else': list of if/else structures
+        'switches': list of switch structures
+        'call_tree': list of called functions
+        'complexity': cyclomatic complexity estimate
+        'summary': human-readable summary
+    """
+    result = get_function_bytes(pe_path, func_name, max_bytes)
+    if result is None:
+        return None
+
+    code_bytes, rva, va = result
+
+    pe = pefile.PE(pe_path, fast_load=False)
+    import_thunks = _get_import_thunks(pe)
+    pe.close()
+
+    blocks = build_basic_blocks(code_bytes, va, import_thunks)
+
+    loops = detect_loops(blocks)
+    ifs = detect_if_else(blocks)
+    sws = detect_switches(blocks)
+
+    # Build call tree
+    all_calls = []
+    unknown_calls = []
+    for b in blocks.values():
+        for c in b.calls:
+            if isinstance(c, str):
+                all_calls.append(c)
+            else:
+                unknown_calls.append(c)
+
+    # Cyclomatic complexity: E - N + 2P
+    # E = edges, N = nodes, P = connected components (1 for single function)
+    n_nodes = len(blocks)
+    n_edges = sum(len(b.successors) for b in blocks.values())
+    complexity = n_edges - n_nodes + 2
+
+    # Build structured summary
+    summary_lines = []
+    summary_lines.append(f"Function: {func_name}")
+    summary_lines.append(f"Basic blocks: {n_nodes}")
+    summary_lines.append(f"Total instructions: {sum(len(b.instructions) for b in blocks.values())}")
+    summary_lines.append(f"Cyclomatic complexity: {complexity}")
+    summary_lines.append(f"Loops: {len(loops)}")
+    summary_lines.append(f"If/else branches: {len(ifs)}")
+    summary_lines.append(f"Switch/case: {len(sws)}")
+    summary_lines.append(f"API calls: {len(all_calls)}")
+    summary_lines.append(f"Unknown call targets: {len(unknown_calls)}")
+
+    return {
+        'function': func_name,
+        'blocks': blocks,
+        'loops': loops,
+        'if_else': ifs,
+        'switches': sws,
+        'call_tree': all_calls,
+        'unknown_calls': unknown_calls,
+        'complexity': complexity,
+        'n_blocks': n_nodes,
+        'n_edges': n_edges,
+        'summary': '\n'.join(summary_lines),
+    }
+
+
+def format_control_flow(analysis):
+    """
+    Format control flow analysis as a detailed text report.
+    """
+    if analysis is None:
+        return "Function not found."
+
+    lines = []
+    lines.append(f"{'='*70}")
+    lines.append(f"  CONTROL FLOW ANALYSIS: {analysis['function']}")
+    lines.append(f"{'='*70}")
+    lines.append("")
+
+    # Summary
+    lines.append(f"  Blocks: {analysis['n_blocks']}  |  Edges: {analysis['n_edges']}  |  "
+                 f"Complexity: {analysis['complexity']}")
+    lines.append("")
+
+    # Loops
+    if analysis['loops']:
+        lines.append(f"  LOOPS ({len(analysis['loops'])})")
+        lines.append(f"  {'─'*60}")
+        for i, loop in enumerate(analysis['loops']):
+            ltype = loop.details.get('type', 'unknown')
+            n_body = len(loop.body_addrs)
+            n_insns = loop.details.get('body_insns', '?')
+            lines.append(f"    Loop {i}: {ltype} @ 0x{loop.header_addr:08X}")
+            lines.append(f"      Condition: {loop.condition or 'unconditional'}")
+            lines.append(f"      Body: {n_body} blocks, {n_insns} instructions")
+            if loop.exit_addr:
+                lines.append(f"      Exit → 0x{loop.exit_addr:08X}")
+            # Show block addresses in loop body
+            for baddr in loop.body_addrs:
+                if baddr in analysis['blocks']:
+                    b = analysis['blocks'][baddr]
+                    lines.append(f"        Block 0x{baddr:08X}: {len(b.instructions)} insns")
+                    for m, o in b.instructions[:6]:
+                        lines.append(f"          {m:<10} {o}")
+                    if len(b.instructions) > 6:
+                        lines.append(f"          ... +{len(b.instructions)-6} more")
+            lines.append("")
+    else:
+        lines.append("  No loops detected")
+        lines.append("")
+
+    # If/else
+    if analysis['if_else']:
+        lines.append(f"  BRANCHES ({len(analysis['if_else'])})")
+        lines.append(f"  {'─'*60}")
+        for i, ife in enumerate(analysis['if_else']):
+            has_else = ife.details.get('has_else', False)
+            true_insns = ife.details.get('true_insns', '?')
+            false_insns = ife.details.get('false_insns', '?')
+            kind = "if/else" if has_else else "if"
+            lines.append(f"    Branch {i}: {kind} @ 0x{ife.header_addr:08X}")
+            lines.append(f"      Condition: {ife.condition or '?'}")
+            lines.append(f"      True  → 0x{ife.details.get('true_branch', 0):08X} ({true_insns} insns)")
+            lines.append(f"      False → 0x{ife.details.get('false_branch', 0):08X} ({false_insns} insns)")
+            if ife.exit_addr:
+                lines.append(f"      Merge → 0x{ife.exit_addr:08X}")
+            lines.append("")
+    else:
+        lines.append("  No if/else branches detected")
+        lines.append("")
+
+    # Switches
+    if analysis['switches']:
+        lines.append(f"  SWITCH/CASE ({len(analysis['switches'])})")
+        lines.append(f"  {'─'*60}")
+        for i, sw in enumerate(analysis['switches']):
+            n_cases = sw.details.get('n_cases', '?')
+            reg = sw.details.get('register', '?')
+            lines.append(f"    Switch {i} @ 0x{sw.header_addr:08X}")
+            lines.append(f"      Register: {reg}")
+            lines.append(f"      Cases: {n_cases}")
+            lines.append(f"      Total targets: {sw.details.get('total_targets', '?')}")
+            lines.append("")
+    else:
+        lines.append("  No switch/case detected")
+        lines.append("")
+
+    # Call tree
+    if analysis['call_tree']:
+        lines.append(f"  CALL TREE ({len(analysis['call_tree'])} API calls)")
+        lines.append(f"  {'─'*60}")
+        seen = set()
+        for call in analysis['call_tree']:
+            if call not in seen:
+                seen.add(call)
+                count = analysis['call_tree'].count(call)
+                suffix = f" (×{count})" if count > 1 else ""
+                lines.append(f"    → {call}{suffix}")
+        lines.append("")
+
+    if analysis['unknown_calls']:
+        lines.append(f"  UNKNOWN CALL TARGETS ({len(analysis['unknown_calls'])})")
+        lines.append(f"  {'─'*60}")
+        for addr in sorted(set(analysis['unknown_calls'])):
+            lines.append(f"    → 0x{addr:08X}")
+        lines.append("")
+
+    # Full block listing with structure annotations
+    lines.append(f"  ANNOTATED BLOCK LISTING")
+    lines.append(f"  {'─'*60}")
+
+    loop_headers = {l.header_addr for l in analysis['loops']}
+    loop_bodies = {}
+    for l in analysis['loops']:
+        for a in l.body_addrs:
+            loop_bodies[a] = l
+    if_headers = {i.header_addr for i in analysis['if_else']}
+
+    for addr in sorted(analysis['blocks'].keys()):
+        block = analysis['blocks'][addr]
+        annotations = []
+        if addr in loop_headers:
+            loop = loop_bodies.get(addr)
+            ltype = loop.details.get('type', 'loop') if loop else 'loop'
+            annotations.append(f"◆ {ltype.upper()} HEADER")
+        if addr in if_headers:
+            annotations.append("◆ BRANCH")
+        if addr in loop_bodies and addr not in loop_headers:
+            annotations.append("│ loop body")
+
+        ann_str = f"  {'  '.join(annotations)}" if annotations else ""
+        n = len(block.instructions)
+        lines.append(f"    Block 0x{addr:08X} ({n} insns){ann_str}")
+
+        for m, o in block.instructions:
+            prefix = "│   " if addr in loop_bodies else "    "
+            lines.append(f"      {prefix}{m:<10} {o}")
+
+        if block.calls:
+            for c in block.calls:
+                cname = c if isinstance(c, str) else f"0x{c:08X}"
+                lines.append(f"      ↳ calls {cname}")
+
+        if block.successors:
+            succ_str = ', '.join(f"0x{s:08X}" for s in block.successors)
+            lines.append(f"      → {succ_str}")
+        lines.append("")
 
     return '\n'.join(lines)

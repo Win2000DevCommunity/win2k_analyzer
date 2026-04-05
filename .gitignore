@@ -21,4 +21,6 @@ Desktop.ini
 
 # Generated output (keep generated_headers/ tracked for reference)
 *.bak
+*.backup
 *_patched.*
+*_old.py

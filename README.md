@@ -2,9 +2,17 @@
 
 **The ultimate reverse-engineering and binary compatibility toolkit for porting ReactOS components to Windows 2000 SP4.**
 
-Analyze, compare, decompile, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (13 tabs)** and a **full CLI (27 commands)**.
+Analyze, compare, decompile, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (15 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.0 — KernelEx Ultimate PE Patcher:**  All patching techniques from KernelEx (Xeno86, 2006-2008) have been reverse-engineered and reimplemented in Python with modern 2026 capabilities: code blob injection with 4-table fixups, full export/import table rebuild, PE rebase, GenPatch-style C→binary compilation, 5-stage patch pipeline, symbol-aware patching, and more.
+**NEW in v3.1 — Deep Analyzer, Tabbed Output, Symbol Integration:**
+- **Tabbed Output (IDA Pro-style):** Every analysis action opens a new closeable tab. Right-click or middle-click to close. No more losing previous results — compare them side by side.
+- **Deep Analyzer:** IDA Pro / Ghidra-level function discovery without symbols — finds ALL functions (exported + internal) via prologue scanning, builds cross-reference maps, detects calling conventions, profiles dependencies.
+- **Symbol Loader:** Load .map (MSVC/GCC/IDA), .sym, .pdb, .dbg files to enrich disassembly with real function names, arguments, and locals.
+- **Decompiler Modes:** Three output modes — Pseudo-C, Annotated Assembly, and Hex Dump with color highlighting.
+- **XRef Scanner:** Scan entire directories to find every PE that imports/calls a given function.
+- **Progress Dialogs:** All long-running operations show real-time progress with operation name and percentage.
+
+**Previously in v3.0 — KernelEx Ultimate PE Patcher:**  All patching techniques from KernelEx (Xeno86, 2006-2008) have been reverse-engineered and reimplemented in Python with modern 2026 capabilities: code blob injection with 4-table fixups, full export/import table rebuild, PE rebase, GenPatch-style C→binary compilation, 5-stage patch pipeline, symbol-aware patching, and more.
 
 Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, `.scr`
 
@@ -17,14 +25,20 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 ## Table of Contents
 
 - [What Does This Tool Do?](#what-does-this-tool-do)
+- [What's New in v3.1](#whats-new-in-v31)
 - [Features Overview](#features-overview)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Opening the GUI](#opening-the-gui)
+- [Tabbed Output System](#tabbed-output-system)
 - [Using the CLI](#using-the-cli)
 - [CLI Command Reference (All 27 Commands)](#cli-command-reference-all-27-commands)
 - [Patching NT System Internals (.sys / Kernel-Mode Binaries)](#patching-nt-system-internals-sys--kernel-mode-binaries)
-- [GUI Tab Reference (All 13 Tabs)](#gui-tab-reference-all-13-tabs)
+- [GUI Tab Reference (All 15 Tabs)](#gui-tab-reference-all-15-tabs)
+- [Deep Analyzer — IDA Pro-Level Analysis Without Symbols](#deep-analyzer--ida-pro-level-analysis-without-symbols)
+- [Symbol Loader — Enrich Disassembly With Debug Info](#symbol-loader--enrich-disassembly-with-debug-info)
+- [Decompiler Modes — Pseudo-C, Assembly, Hex Dump](#decompiler-modes--pseudo-c-assembly-hex-dump)
+- [XRef Scanner — Find All Callers Across System32](#xref-scanner--find-all-callers-across-system32)
 - [Using with Visual Studio Code](#using-with-visual-studio-code)
 - [Using with GitHub Copilot](#using-with-github-copilot)
 - [Module Architecture](#module-architecture)
@@ -42,11 +56,85 @@ This tool gives you everything in one place:
 
 1. **Analyze** — Extract exports, imports, syscalls, PE headers from any Windows binary
 2. **Compare** — Side-by-side diff of Win2000 vs ReactOS DLLs (exports, imports, syscalls, PE headers)
-3. **Decompile** — Convert x86 assembly to C pseudocode, even **without symbols**
-4. **Detect** — Intelligently find calling convention changes, HAL dispatch differences, macro differences, structure layout changes between NT versions
-5. **Patch** — KernelEx-inspired PE binary patcher with ALL KernelEx techniques: code blob injection with 4-table fixups (abs_ofs, abs_api, rel_api, hook_api), full export table rebuild with sorted merge, PE rebase with relocation fixups, GenPatch-style C/ASM compilation pipeline, calling convention shims, and the full 5-stage patch pipeline (prepare → api_entries → alter_sections → rebuild_tables → process)
-6. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
-7. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+3. **Decompile** — Convert x86 assembly to C pseudocode, annotated assembly, or hex dump — even **without symbols**
+4. **Deep Analyze** — IDA Pro-level function discovery, cross-reference maps, calling convention detection, dependency profiling — all without symbols
+5. **Detect** — Intelligently find calling convention changes, HAL dispatch differences, macro differences, structure layout changes between NT versions
+6. **Patch** — KernelEx-inspired PE binary patcher with ALL KernelEx techniques: code blob injection with 4-table fixups, full export table rebuild, PE rebase, GenPatch-style C/ASM compilation pipeline, calling convention shims, and the full 5-stage patch pipeline
+7. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
+8. **Scan** — System-wide cross-reference scanning: find every PE in a directory that imports or calls a given function
+9. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+
+---
+
+## What's New in v3.1
+
+### Tabbed Output (IDA Pro-style)
+
+Every analysis action in every tab now opens results in a **new closeable tab** instead of overwriting the previous output. This means:
+
+- **No more lost results** — click "Disassemble" five times and you get five tabs, all accessible
+- **Side-by-side comparison** — switch between tabs to compare different function analyses
+- **Close tabs freely** — right-click a tab for Close / Close All Others / Close All, or middle-click to close
+- **Auto-cleanup** — tabs auto-prune when you exceed 20 open tabs (oldest closed first)
+- **Smart tab titles** — tabs show the function name and operation (e.g., "Disasm: NtCreateFile", "HEX: RtlInitUnicodeString")
+
+### Deep Analyzer (Tab 13)
+
+A full IDA Pro / Ghidra-style analysis engine that works **entirely without debug symbols**:
+
+- **Discover ALL functions** — finds exported + internal functions via prologue scanning (`push ebp; mov ebp, esp`)
+- **Function profiling** — calling convention, argument count, stack frame size, API calls, string references
+- **Cross-reference maps** — who calls this function, what does it call, what APIs does it import
+- **Porting dependency analysis** — shows exactly what needs to be ported for a function to work
+- **Deep comparison** — compare function implementations across two PEs (hash, signature, code blocks, API differences)
+- **Batch deep compare** — compare all shared exports with double-click to open side-by-side diff window
+- **Right-click context menu** — on any discovered function: Profile, View Code, XRefs, Dependencies, Compare, Scan System32
+
+### Symbol Loader
+
+Load debug symbols from **6 formats** to enrich disassembly and analysis:
+
+| Format | Source | Example |
+|--------|--------|---------|
+| MSVC .map | `link.exe /MAP` | `ntdll.map` |
+| GCC .map | `ld -Map` | `kernel32.map` |
+| IDA .map | File → Produce → MAP | `hal.map` |
+| Simple .sym | `address<tab>name` per line | `symbols.sym` |
+| PDB | Microsoft debug symbols | `ntdll.pdb` |
+| DBG | COFF debug symbols | `ntoskrnl.dbg` |
+
+When symbols are loaded and the **"Use symbols"** checkbox is checked:
+- Disassembly shows **real function names** instead of `sub_XXXXX`
+- Arguments and local variables are annotated in the output
+- Call targets are resolved to named functions
+- Cross-references use symbol names
+
+### Decompiler Modes (Tab 11)
+
+Three distinct output modes, like IDA Pro and Ghidra:
+
+| Mode | Button | What You See |
+|------|--------|-------------|
+| **Pseudo-C** | 📄 Decompile Export | C-like pseudocode with kernel API recognition, NTSTATUS codes, IRP codes |
+| **Assembly** | 🖥 Disassemble | Annotated x86 assembly with colored `call`/`ret`/`jmp` highlighting |
+| **Hex Dump** | HEX Hex Dump | Raw bytes with address + hex + ASCII columns, color-coded: `CC`(int3)=red, `C3`(ret)=yellow, `E8`(call)=green |
+
+### XRef Scanner (Tab 14)
+
+Scan an entire directory for every PE file that imports or calls a given function:
+
+- Enter a function name (e.g., `NtCreateFile`, `CreateFileW`)
+- Click "Scan All PEs" — scans all `.dll`, `.sys`, `.exe`, `.drv`, `.cpl`, `.ocx`, `.scr` files
+- Results grouped by PE file, showing: import source DLL, IAT address, reference type
+- Essential for understanding which system components depend on a function before patching it
+
+### Progress Dialogs
+
+All long-running operations now show a **real-time progress dialog** with:
+- Operation name (e.g., "Fingerprinting NtCreateFile...")
+- Percentage bar (0–100%)
+- Current item being processed
+- Cancel button for graceful abort
 
 ---
 
@@ -66,29 +154,48 @@ This tool gives you everything in one place:
 | | Generate C header files (.h) for all structures | `gen-headers` | Tab 4 |
 | **DEF Files** | Auto-generate .def files from DLL exports | `gen-def` | Tab 6 |
 | **Decompiler** | Decompile exported functions to C pseudocode | `decompile` | Tab 11 |
+| | **Annotated x86 disassembly with color highlighting** | — | Tab 11 |
+| | **Raw hex dump with CC/C3/E8 color coding** | — | Tab 11 |
 | | Discover functions without symbols (prologue scanning) | `discover-functions` | Tab 11 |
 | | Batch decompile all exports | `batch-decompile` | Tab 11 |
 | **Behavior** | Function fingerprinting and API pattern detection | `behavior` | Tab 10 |
 | | Disassemble exported functions | `disasm` | Tab 10 |
+| | **Symbol-enhanced disassembly** (args, locals, call targets) | — | Tab 10 |
+| | **Scan all exports with progress tracking** | — | Tab 10 |
+| | **Batch compare with real-time progress** | — | Tab 10 |
+| **Deep Analysis** | **Discover ALL functions (exported + internal)** | — | Tab 13 |
+| | **Function profiling (convention, args, APIs, strings)** | — | Tab 13 |
+| | **Cross-reference maps (callers, callees, API imports)** | — | Tab 13 |
+| | **Porting dependency analysis** | — | Tab 13 |
+| | **Deep function comparison (hash, signature, blocks)** | — | Tab 13 |
+| | **Batch deep compare with side-by-side diff window** | — | Tab 13 |
+| **XRef Scanning** | **Scan directory for all callers of a function** | — | Tab 14 |
+| | **Grouped results by PE file with IAT addresses** | — | Tab 14 |
+| **Symbol Loading** | **Load .map / .pdb / .dbg / .sym symbol files** | — | Tab 10, 11, 13 |
+| | **Merge symbols into function discovery and disassembly** | — | Tab 10, 13 |
 | **Compat Analysis** | Deep compatibility analysis between two PE binaries | `compat-analyze` | Tab 12 |
 | | Single PE compatibility profile | `compat-single` | Tab 12 |
 | | Show all known NT 5.0→5.1 differences | `compat-known` | Tab 12 |
 | | Bugcheck code diagnosis with compat hints | `bugcheck` | Tab 12 |
-| **PE Patching** | Quick Win2000 patch (version + syscalls) | `patch-pe --quick` | Tab 13 |
-| | Patch sysenter stubs to int 0x2E | `patch-pe --syscalls` | Tab 13 |
-| | Inject calling convention shims (stdcall↔fastcall) | `patch-pe --shim` | Tab 13 |
-| | Rebase PE to new ImageBase with relocation fixups | `patch-pe --rebase` / `rebase` | Tab 13 |
-| | Strip debug directory from PE | `patch-pe --strip-debug` | Tab 13 |
-| | Grow section, add import, forward export | `patch-pe --grow-section/--add-import/--forward-export` | Tab 13 |
+| **PE Patching** | Quick Win2000 patch (version + syscalls) | `patch-pe --quick` | Tab 15 |
+| | Patch sysenter stubs to int 0x2E | `patch-pe --syscalls` | Tab 15 |
+| | Inject calling convention shims (stdcall↔fastcall) | `patch-pe --shim` | Tab 15 |
+| | Rebase PE to new ImageBase with relocation fixups | `patch-pe --rebase` / `rebase` | Tab 15 |
+| | Strip debug directory from PE | `patch-pe --strip-debug` | Tab 15 |
+| | Grow section, add import, forward export | `patch-pe --grow-section/--add-import/--forward-export` | Tab 15 |
 | | Inject raw code blob with 4-table fixups | `inject-blob` | — |
 | | GenPatch: compile C source & inject into PE | `compile-inject` | — |
 | | Full export table rebuild (add/forward/alias/hook) | Python API | — |
 | | 5-stage KernelEx pipeline (PatchSet) | Python API | — |
 | | Symbol map loading + symbol-aware patching | Python API | — |
-| **PE Inspection** | Inspect all PE tables (EAT, IAT, relocs, sections) | `inspect-pe` | Tab 13 |
+| **PE Inspection** | Inspect all PE tables (EAT, IAT, relocs, sections) | `inspect-pe` | Tab 15 |
 | | Hex dump at RVA | `hex-dump` | — |
 | **Build** | Generate RosBE / MSVC / CMake build scripts | `build-script` | Tab 9 |
 | | ReactOS source tree auto-patcher | — | Tab 8 |
+| **UI Features** | **Tabbed output — each action opens new closeable tab** | — | All tabs |
+| | **Right-click / middle-click to close tabs** | — | All tabs |
+| | **Progress dialogs with operation names + percentage** | — | Tab 10, 13 |
+| | **Dark theme with syntax highlighting** | — | All tabs |
 
 ---
 
@@ -152,7 +259,7 @@ python win2k_gui.py
 
 ## Opening the GUI
 
-The GUI is a standalone Python/Tkinter application with a dark theme and 13 tabs.
+The GUI is a standalone Python/Tkinter application with a dark theme and 15 tabs.
 
 ### From the command line:
 
@@ -185,10 +292,48 @@ Double-click `win2k_gui.py` (if Python is associated with `.py` files).
 | 7 | Syscall Patcher | Generate syscall headers in 4 styles |
 | 8 | ROS Patcher | Auto-patch ReactOS source tree for Win2000 |
 | 9 | Build Scripts | Generate RosBE/MSVC/CMake build scripts |
-| 10 | Behavior Analyzer | Function fingerprinting, API pattern detection |
-| 11 | Decompiler | x86 → C pseudocode decompiler, works without symbols |
+| 10 | Behavior Analyzer | Function fingerprinting, API patterns, symbol-enhanced disassembly |
+| 11 | Decompiler | 3 modes: Pseudo-C / Assembly / Hex Dump, batch decompile, symbol loading |
 | 12 | Compat Analyzer | Deep NT version compatibility detection, bugcheck diagnosis |
-| 13 | PE Patcher | Patch binaries: version, syscalls, calling conventions |
+| 13 | Deep Analyzer | IDA Pro-level function discovery, profiling, XRefs, deep compare |
+| 14 | XRef Scanner | Scan directories for all callers of a function |
+| 15 | PE Patcher | Patch binaries: version, syscalls, calling conventions, rebase |
+
+---
+
+## Tabbed Output System
+
+Every GUI tab uses a **tabbed output** system instead of a single text area. This is the most significant UI change in v3.1:
+
+### How It Works
+
+1. **Click any analysis button** (Disassemble, Decompile, Compare, etc.) → a **new tab** opens with the results
+2. The previous results remain in their own tab — nothing is lost
+3. Tab title shows the operation and function name: `Disasm: NtCreateFile`, `HEX: RtlInitUnicodeString`, `Compare: IoCallDriver`
+
+### Managing Tabs
+
+| Action | How |
+|--------|-----|
+| **Close one tab** | Middle-click the tab, or right-click → Close Tab |
+| **Close all except active** | Right-click → Close All Others |
+| **Close all tabs** | Right-click → Close All, or click the Clear button |
+| **Switch between tabs** | Click the tab header |
+
+### Auto-Pruning
+
+When you open more than **20 tabs**, the oldest tab is automatically closed to prevent memory buildup. You can always re-run any analysis to recreate a tab.
+
+### Example Workflow
+
+```
+1. Load ntdll.dll in Behavior Analyzer (Tab 10)
+2. Disassemble NtCreateFile     → Tab opens: "Disasm: NtCreateFile"
+3. Disassemble NtOpenFile       → Tab opens: "Disasm: NtOpenFile"
+4. Compare NtCreateFile         → Tab opens: "Compare: NtCreateFile"
+5. Detect patterns NtCreateFile → Tab opens: "Patterns: NtCreateFile"
+   Now you have 4 tabs visible — click any to review, middle-click to close
+```
 
 ---
 
@@ -686,12 +831,12 @@ Our compatibility analyzer automatically detects these NT 5.0 vs 5.1 kernel-mode
 
 ---
 
-## GUI Tab Reference (All 13 Tabs)
+## GUI Tab Reference (All 15 Tabs)
 
 ### Tab 1: Exports / Imports
 - Browse to any PE file (.dll, .sys, .exe, .cpl)
 - Click **Analyze Exports** or **Analyze Imports**
-- Results shown in a scrollable table
+- Each analysis opens a **new output tab** with results
 - Save to JSON
 
 ### Tab 2: Syscall Extractor
@@ -739,14 +884,29 @@ Our compatibility analyzer automatically detects these NT 5.0 vs 5.1 kernel-mode
 - Fingerprint any exported function
 - Detect API call patterns, syscall usage
 - Compare function implementations between two DLLs
+- **Symbol-enhanced disassembly** — load .map/.pdb/.dbg/.sym files, check "Use symbols", and disassembly shows real function names, arguments, locals
+- **7 analysis actions**, each opens a new tab:
+  - **Disassemble** — x86 disassembly (symbol-enhanced when checkbox is checked)
+  - **Compare Function** — compare same function between two PEs
+  - **Batch Compare** — compare all shared exports with progress dialog
+  - **Detect Patterns** — find API call sequences and syscall patterns
+  - **Scan All Exports** — fingerprint every export with real-time progress
+  - **Control Flow** — analyze branch structure and code blocks
+  - **Resolve Unknown** — identify unknown call targets
+- **Clickable function names** — click any function name in output to jump to its analysis
+- **History navigation** — Back/Forward buttons to revisit previous analyses
+- **Progress dialogs** — all operations show current function name and percentage
 
 ### Tab 11: Decompiler
-- Decompile any exported function to C pseudocode
+- **Three output modes** for any exported function:
+  - 📄 **Decompile Export** — C pseudocode with kernel API recognition, NTSTATUS codes, IRP major codes, pool tags, IOCTL decoding
+  - 🖥 **Disassemble** — Annotated x86 assembly with color-coded `call` (green), `ret` (yellow), `jmp` (peach), comments (gray)
+  - HEX **Hex Dump** — Raw bytes displayed as: virtual address | hex pairs | ASCII. Color-highlights: `CC`(int3)=red, `C3`(ret)=yellow, `E8`(call)=green. Stops at ret/int3 boundary.
 - Enter function name or RVA (e.g., `0x4AE10`)
 - **Discover Functions** — finds functions without symbols by scanning for prologues
 - **Batch Decompile** — decompile all exports at once
-- Syntax highlighting in output
-- Recognizes: NTSTATUS codes, IRP major codes, kernel APIs, driver structures, pool tags, IOCTL codes
+- **Symbol file loading** — browse .map/.pdb/.dbg/.sym to enrich output
+- Each operation opens a **new tab** with smart title (e.g., "ASM: NtCreateFile", "HEX: RtlInitUnicodeString")
 
 ### Tab 12: Compat Analyzer
 - Load two PE files for deep compatibility analysis
@@ -757,7 +917,40 @@ Our compatibility analyzer automatically detects these NT 5.0 vs 5.1 kernel-mode
 - **Bugcheck Lookup** — enter a BSOD code, get compat-specific diagnosis
 - Color-coded output: red for critical, yellow for warnings
 
-### Tab 13: PE Patcher (KernelEx Ultimate Edition)
+### Tab 13: Deep Analyzer (NEW)
+The most powerful analysis tab — combines IDA Pro-style function discovery with deep binary comparison:
+
+- **Discover All Functions** — scans prologue patterns (`push ebp; mov ebp, esp`) to find ALL functions: exported AND internal. Lists them with addresses, sizes, calling conventions.
+- **Profile** — detailed metadata for selected function: calling convention, argument count, stack frame size, API calls, string references, struct offset accesses
+- **XRefs** — cross-reference map: inbound callers, outbound calls, API imports used
+- **Code** — full annotated disassembly of selected function
+- **Dependencies** — porting dependency analysis: what functions, APIs, and structures need to be available for this function to work
+- **Statistics** — PE-wide stats: hottest functions (most called), largest functions, most API-heavy, calling convention breakdown
+- **Deep Compare** — compare a single function between two PE files: hash match, signature similarity, code block differences, API differences, string differences
+- **Batch Deep Compare** — compare ALL shared exports between two PEs. **Double-click any row** to open a side-by-side diff window
+- **Right-click context menu** on any discovered function:
+  - Select function, Profile, View Code, Show XRefs
+  - Porting Dependencies, Analyze Behavior, Control Flow Analysis
+  - Decompile to C, Deep Compare with File B
+  - Scan System32 for Callers (finds all PEs that import this function)
+
+### Tab 14: XRef Scanner (NEW)
+System-wide cross-reference scanner:
+
+- Enter a function name (e.g., `NtCreateFile`, `CreateFileW`, `ExAllocatePool`)
+- Browse to a directory (e.g., `C:\WINNT\system32`)
+- Click **Scan All PEs** — scans every `.dll`, `.sys`, `.exe`, `.drv`, `.cpl`, `.ocx`, `.scr` file in the directory
+- Results grouped by PE file:
+  ```
+  ── kernel32.dll ──
+    Import: ntdll.dll!NtCreateFile  IAT: 0x7C801234  Type: IAT_IMPORT
+  ── advapi32.dll ──
+    Import: ntdll.dll!NtCreateFile  IAT: 0x77DA5678  Type: IAT_IMPORT
+  Total: 47 PE files reference NtCreateFile
+  ```
+- Essential before patching: know which system components depend on a function
+
+### Tab 15: PE Patcher (KernelEx Ultimate Edition)
 - Load a PE file to patch
 - Checkboxes: Patch version to 5.0, Patch sysenter→int 0x2E, Strip debug info
 - Convention shim entry field (e.g., `IoReadPartitionTable,fastcall,stdcall,4`)
@@ -771,6 +964,242 @@ Our compatibility analyzer automatically detects these NT 5.0 vs 5.1 kernel-mode
 
 ---
 
+## Deep Analyzer — IDA Pro-Level Analysis Without Symbols
+
+The Deep Analyzer (Tab 13) provides the most comprehensive binary analysis available in the tool, comparable to IDA Pro and Ghidra but fully automated and scriptable.
+
+### How to Use: Discover All Functions
+
+1. Open **Tab 13 (Deep Analyzer)**
+2. Browse to any PE file (e.g., `C:\WINNT\system32\ntdll.dll`)
+3. Click **Discover All Functions**
+4. The analyzer scans the entire code section for function prologues (`push ebp; mov ebp, esp` and variations)
+5. Results show: all exported functions + all discovered internal functions, each with:
+   - Virtual Address (VA) and Relative Virtual Address (RVA)
+   - Size in bytes
+   - Detected calling convention (stdcall, cdecl, fastcall, thiscall)
+   - Whether it's an export or internal function
+
+### How to Use: Profile a Function
+
+1. After discovering functions, select one from the list
+2. Click **Profile** (or right-click → Profile)
+3. A new tab opens showing:
+   ```
+   ═══ Function Profile: NtCreateFile ═══
+   Address:    0x77F81234 (RVA: 0x00001234)
+   Size:       156 bytes
+   Convention: stdcall
+   Arguments:  11 (44 bytes)
+   Stack frame: 64 bytes
+   
+   API calls:
+     → RtlInitUnicodeString (ntdll.dll)
+     → ObOpenObjectByName
+     → IoCreateFile
+   
+   String references:
+     "\\Device\\%s"
+     "NtCreateFile"
+   
+   Struct accesses:
+     [ebp+0x08] — Arg1 (FileHandle)
+     [ebp+0x0C] — Arg2 (DesiredAccess)
+   ```
+
+### How to Use: Cross-References
+
+1. Select a function, click **XRefs** (or right-click → Show XRefs)
+2. Shows three sections:
+   - **Inbound callers** — which functions call this one
+   - **Outbound calls** — which functions this one calls
+   - **API imports** — which DLL APIs this function uses
+
+### How to Use: Deep Compare
+
+1. Load File A (e.g., Win2000 ntdll.dll) in the main path
+2. Load File B (e.g., ReactOS ntdll.dll) in the second path
+3. Select a function, click **Deep Compare** (or right-click → Deep Compare with File B)
+4. Results show:
+   - Hash match (identical / different)
+   - Signature similarity percentage
+   - Code block structure differences
+   - API call differences (added, removed, changed)
+   - String reference differences
+
+### How to Use: Batch Deep Compare
+
+1. Load both files, click **Batch Deep Compare**
+2. All shared exports are compared, showing a summary table
+3. **Double-click any row** to open a **side-by-side diff window** showing the full code comparison
+
+### How to Use: Right-Click Context Menu
+
+Right-click any function in the discovered list for quick access:
+- **Select function** → puts name in the function entry box
+- **Profile** / **View Code** / **Show XRefs** / **Porting Dependencies**
+- **Analyze Behavior** / **Control Flow Analysis** / **Decompile to C**
+- **Deep Compare with File B**
+- **Scan System32 for Callers** — finds all PEs in System32 that import this function
+
+---
+
+## Symbol Loader — Enrich Disassembly With Debug Info
+
+The Symbol Loader lets you load debug symbols from multiple sources to significantly improve analysis quality.
+
+### Supported Symbol Formats
+
+| Format | How to Get It | File Extension |
+|--------|--------------|----------------|
+| **MSVC Map** | Compile with `link.exe /MAP` | `.map` |
+| **GCC Map** | Link with `ld -Map=output.map` | `.map` |
+| **IDA Pro Map** | File → Produce File → Create MAP file | `.map` |
+| **Simple Symbols** | Manual: one `address<tab>name` per line | `.sym` |
+| **PDB** | From Microsoft Symbol Server or local build | `.pdb` |
+| **DBG** | From COFF debug builds | `.dbg` |
+
+### How to Load Symbols in Behavior Analyzer (Tab 10)
+
+1. In **Tab 10 (Behavior Analyzer)**, click **Browse** next to the Symbol file field
+2. Select your `.map`, `.pdb`, `.dbg`, or `.sym` file
+3. Check the **☑ Use symbols in disassembly** checkbox
+4. Now click **Disassemble** — the output will show:
+   - Real function names instead of `sub_XXXXX` addresses
+   - Argument names and local variable annotations
+   - Named call targets instead of raw addresses
+   - `(with symbols)` indicator in the status line
+
+### How to Load Symbols in Decompiler (Tab 11)
+
+1. In **Tab 11 (Decompiler)**, browse to a symbol file using the symbol picker
+2. Decompilation and disassembly will use the loaded symbols for function naming
+
+### Without Symbols (Default)
+
+If no symbols are loaded, the analyzer still works using:
+- Export table names (for exported functions)
+- Prologue-based discovery (for internal functions — named as `sub_XXXXXXXX`)
+- Heuristic calling convention detection
+- API call pattern matching
+
+---
+
+## Decompiler Modes — Pseudo-C, Assembly, Hex Dump
+
+The Decompiler tab (Tab 11) offers three distinct views of any function, inspired by IDA Pro and Ghidra.
+
+### Mode 1: Pseudo-C (📄 Decompile Export)
+
+Converts x86 machine code to readable C-like pseudocode:
+
+```c
+// Decompiled: NtCreateFile
+// Address: 0x77F81234 | Size: 156 bytes | Convention: stdcall
+
+NTSTATUS __stdcall NtCreateFile(
+    PHANDLE FileHandle,          /* [ebp+0x08] */
+    ACCESS_MASK DesiredAccess,   /* [ebp+0x0C] */
+    POBJECT_ATTRIBUTES ObjectAttributes  /* [ebp+0x10] */
+)
+{
+    NTSTATUS status;
+    
+    status = ObOpenObjectByName(ObjectAttributes, ...);
+    if (status < 0) {    // NT_ERROR(status)
+        return status;   // STATUS_UNSUCCESSFUL
+    }
+    IoCreateFile(FileHandle, DesiredAccess, ...);
+    return STATUS_SUCCESS;  // 0x00000000
+}
+```
+
+**Recognized patterns:** NTSTATUS codes, IRP major codes (IRP_MJ_CREATE etc.), kernel APIs (80+), pool tags, IOCTL codes, device types, IRQL levels.
+
+### Mode 2: Assembly (🖥 Disassemble)
+
+Annotated x86 disassembly with color-coded instructions:
+
+```asm
+; NtCreateFile
+; Address: 0x77F81234 | Size: 156 bytes
+
+77F81234:  push    ebp                    ; → Function prologue
+77F81235:  mov     ebp, esp
+77F81237:  sub     esp, 0x20
+77F8123A:  push    esi
+77F8123B:  push    edi
+77F8123C:  mov     esi, [ebp+0x10]        ; ObjectAttributes
+77F8123F:  call    ObOpenObjectByName     ; ← API call (green)
+77F81244:  test    eax, eax
+77F81246:  js      short 0x77F81260       ; ← Branch (peach)
+77F81248:  call    IoCreateFile           ; ← API call (green)
+77F8124D:  xor     eax, eax               ; STATUS_SUCCESS
+77F8124F:  ret     0x2C                   ; ← Return (yellow)
+```
+
+**Color coding:** `call` = green, `ret` = yellow, `jmp/jcc` = peach, comments = gray.
+
+### Mode 3: Hex Dump (HEX Hex Dump)
+
+Raw byte view of function code with ASCII representation:
+
+```
+HEX dump: NtCreateFile
+RVA: 0x00001234 | Size: 156 bytes
+
+Address     00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F  ASCII
+──────────  ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──  ──────
+77F81234    55 8B EC 83 EC 20 56 57 8B 75 10 E8 12 34 00 00  U....VW.u..å4..
+77F81244    85 C0 78 1A E8 56 78 00 00 33 C0 C2 2C 00 CC CC  ..x.åVx..3..,...
+```
+
+**Color coding:** `CC` (int3 padding) = red, `C3` (ret) = yellow, `E8` (call) = green.
+
+---
+
+## XRef Scanner — Find All Callers Across System32
+
+The XRef Scanner (Tab 14) answers the critical question: **"Which system DLLs depend on this function?"**
+
+### How to Use
+
+1. Open **Tab 14 (XRef Scanner)**
+2. Enter a function name: `NtCreateFile`
+3. Browse to a directory: `C:\WINNT\system32`
+4. Click **Scan All PEs**
+5. The scanner checks every PE file in the directory for imports of that function
+
+### Understanding the Output
+
+```
+══ Cross-Reference Scan: NtCreateFile ══
+Scanning C:\WINNT\system32 for all callers...
+Scanned 412 PE files
+
+── kernel32.dll ──
+  Import: ntdll.dll!NtCreateFile  IAT: 0x7C801A34  Type: IAT_IMPORT
+
+── advapi32.dll ──
+  Import: ntdll.dll!NtCreateFile  IAT: 0x77DA2F78  Type: IAT_IMPORT
+
+── ws2_32.dll ──
+  Import: ntdll.dll!NtCreateFile  IAT: 0x71AB1234  Type: IAT_IMPORT
+
+... (47 more)
+
+Summary: 50 PE files reference NtCreateFile
+```
+
+### Why This Matters
+
+Before patching or replacing a system function, you need to know:
+- How many DLLs depend on it (impact radius)
+- Whether any DLLs import it by ordinal vs. name
+- Which IAT addresses to verify after patching
+
+---
+
 ## Using with Visual Studio Code
 
 This project works great as a **VS Code workspace**:
@@ -778,7 +1207,7 @@ This project works great as a **VS Code workspace**:
 1. **Open the folder**: `File > Open Folder > win2k_analyzer`
 2. **Run the GUI**: Open terminal (`Ctrl+`` `), type `python win2k_gui.py`
 3. **Run CLI commands**: Use the integrated terminal for any CLI command
-4. **Edit modules**: All 12 Python modules are in the `nt_analyzer/` package — fully documented and modular
+4. **Edit modules**: All 15 Python modules are in the `nt_analyzer/` package — fully documented and modular
 5. **Debug**: Set breakpoints in any module, press F5 to debug
 6. **IntelliSense**: VS Code provides autocomplete for all module functions
 
@@ -876,12 +1305,12 @@ for name, code in functions.items():
 ```
 win2k_analyzer/
 ├── win2k_analyzer.py          # CLI frontend (27 commands)
-├── win2k_gui.py               # GUI frontend (13 tabs, dark theme)
+├── win2k_gui.py               # GUI frontend (15 tabs, dark theme, tabbed output)
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
 │
-├── nt_analyzer/               # Core analysis package
-│   ├── __init__.py            # Package init, version 2.0.0
+├── nt_analyzer/               # Core analysis package (15 modules)
+│   ├── __init__.py            # Package init, version 3.0.0
 │   ├── pe_analyzer.py         # PE export/import/header analysis
 │   ├── syscall_extractor.py   # Syscall number extraction from ntdll stubs
 │   ├── comparator.py          # Side-by-side DLL comparison
@@ -890,15 +1319,21 @@ win2k_analyzer/
 │   ├── syscall_patcher.py     # Syscall header generation (4 styles)
 │   ├── ros_patcher.py         # ReactOS source tree auto-patcher
 │   ├── build_generator.py     # Build script generation (RosBE/MSVC/CMake)
-│   ├── behavior_analyzer.py   # Function fingerprinting & API patterns
+│   ├── behavior_analyzer.py   # Function fingerprinting, API patterns, progress callbacks
 │   ├── decompiler.py          # x86→C decompiler (works without symbols)
 │   ├── compat_analyzer.py     # Deep NT version compatibility detection
-│   └── pe_patcher.py          # KernelEx-inspired PE binary patcher (1900+ lines, 46 methods)
+│   ├── pe_patcher.py          # KernelEx-inspired PE binary patcher (1900+ lines, 46 methods)
+│   ├── deep_analyzer.py       # (NEW) IDA Pro-level function discovery, profiling, XRefs, deep compare
+│   └── symbol_loader.py       # (NEW) Multi-format symbol loader (.map/.pdb/.dbg/.sym)
 │
-└── generated_headers/         # Output: generated C header files
-    ├── peb_win2k.h
-    ├── teb_win2k.h
-    └── kuser_shared_data_win2k.h
+├── generated_headers/         # Output: generated C header files
+│   ├── peb_win2k.h
+│   ├── teb_win2k.h
+│   └── kuser_shared_data_win2k.h
+│
+└── tests/                     # Test suite
+    ├── __init__.py
+    └── test_gui.py            # GUI widget + integration tests
 ```
 
 ---
@@ -941,14 +1376,68 @@ A: CLI: `python win2k_analyzer.py gen-def <dll_path>` or GUI: Tab 6.
 **Q: How do I decompile a kernel function?**
 A: CLI: `python win2k_analyzer.py decompile <pe_file> <function_name>` or GUI: Tab 11, enter function name, click "Decompile Export".
 
+**Q: Can I see assembly instead of C pseudocode?**
+A: Yes. In Tab 11, click **🖥 Disassemble** instead of "Decompile Export". This shows annotated x86 assembly with color-coded call/ret/jmp instructions.
+
+**Q: Can I see a hex dump of a function?**
+A: Yes. In Tab 11, click **HEX Hex Dump**. Shows raw bytes with address, hex pairs, and ASCII columns. Special bytes are color-highlighted: `CC` (int3) = red, `C3` (ret) = yellow, `E8` (call) = green.
+
 **Q: Can I decompile by address instead of name?**
 A: Yes. Use an RVA: `python win2k_analyzer.py decompile ntoskrnl.exe 0x4AE10`
 
 **Q: How do I find functions in a binary without symbols?**
-A: CLI: `python win2k_analyzer.py discover-functions <pe_file> --max 100` or GUI: Tab 11, click "Discover Functions (No Symbols)".
+A: CLI: `python win2k_analyzer.py discover-functions <pe_file> --max 100` or GUI: Tab 11 "Discover Functions", or Tab 13 "Discover All Functions" for the deep analyzer.
 
 **Q: What kernel APIs does the decompiler recognize?**
 A: 80+ kernel APIs including IoCallDriver, KeWaitForSingleObject, ExAllocatePool, ObReferenceObject, RtlInitUnicodeString, MmProbeAndLockPages, and many more. Plus NTSTATUS codes, IRP major codes, pool types, IRQL levels, device types, and IOCTL decoding.
+
+### Deep Analysis
+
+**Q: What is the Deep Analyzer?**
+A: Tab 13 provides IDA Pro-level analysis without symbols. It discovers ALL functions (exported + internal) via prologue scanning, builds cross-reference maps, detects calling conventions, and profiles dependencies. Use it for comprehensive reverse engineering.
+
+**Q: How do I find all internal (non-exported) functions?**
+A: Open Tab 13, load a PE, click "Discover All Functions". The deep analyzer scans for `push ebp; mov ebp, esp` patterns and variations to find all function entry points.
+
+**Q: How do I see who calls a function?**
+A: Tab 13: select a function, click "XRefs" or right-click → Show XRefs. Shows inbound callers, outbound calls, and API imports.
+
+**Q: How do I compare the same function between two PE versions?**
+A: Tab 13: load both files, select a function, click "Deep Compare". Shows hash match, signature similarity, code block differences, API differences.
+
+**Q: How do I find all DLLs in System32 that use a specific function?**
+A: Two ways: Tab 14 (XRef Scanner) — enter function name, browse to System32, click "Scan All PEs". Or: Tab 13 — right-click a function → "Scan System32 for Callers".
+
+**Q: What's the difference between Deep Analyzer (Tab 13) and Behavior Analyzer (Tab 10)?**
+A: Behavior Analyzer (Tab 10) works on individual exported functions with fingerprinting, pattern detection, and comparison. Deep Analyzer (Tab 13) discovers ALL functions including internals, builds a full function map with cross-references, and supports batch deep comparison.
+
+### Symbols
+
+**Q: How do I load symbols?**
+A: In Tab 10 (Behavior) or Tab 11 (Decompiler), browse to a .map, .pdb, .dbg, or .sym file using the symbol file picker. In Tab 10, also check the "Use symbols in disassembly" checkbox.
+
+**Q: What symbol formats are supported?**
+A: MSVC .map (link.exe /MAP), GCC .map (ld -Map), IDA Pro .map, Simple .sym (address+name), PDB (Microsoft debug symbols), DBG (COFF debug).
+
+**Q: Do I need symbols for the tool to work?**
+A: No. All analysis works without symbols. Symbols just enrich the output with real function names and annotations.
+
+**Q: Where can I get symbols for Windows 2000 system files?**
+A: Microsoft's symbol server (`srv*C:\symbols*https://msdl.microsoft.com/download/symbols`) has PDBs for most Windows 2000 SP4 system files. You can also generate .map files by building ReactOS with `/MAP` flag.
+
+### Tabbed Output
+
+**Q: Where did the single output area go?**
+A: Every tab now uses tabbed output. Each analysis action opens a new tab with results instead of overwriting. This means you never lose previous results.
+
+**Q: How do I close tabs?**
+A: Middle-click a tab to close it. Or right-click for options: Close Tab, Close All Others, Close All. The Clear button also closes all tabs.
+
+**Q: What's the maximum number of tabs?**
+A: 20. When you exceed 20, the oldest tab is automatically closed. You can always re-run an analysis.
+
+**Q: Can I compare results from different analyses?**
+A: Yes — that's the main benefit. Click between tabs to see different function analyses side by side.
 
 ### Compatibility
 
@@ -1047,8 +1536,10 @@ Areas that need help:
 - Additional NT version difference rules
 - Testing on more Win2000 system binaries
 - Pre-built patch sets for common ReactOS DLLs
-- PDB symbol loading integration
+- PDB symbol loading improvements (full type info extraction)
 - Binary diff generation between PE versions
+- Additional prologue patterns for deep function discovery
+- Graph visualization for cross-reference maps
 
 ---
 

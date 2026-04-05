@@ -13,5 +13,8 @@ Capabilities:
   - Structure offset hints from debug symbols
   - Deep binary compatibility analysis (NT 5.0 vs 5.1)
   - KernelEx-inspired PE binary patching
+  - Deep function analysis (private/internal function discovery)
+  - System-wide cross-reference scanning
+  - Multi-format symbol loading (.map/.pdb/.dbg/.sym)
 """
-__version__ = "2.0.0"
+__version__ = "3.1.0"

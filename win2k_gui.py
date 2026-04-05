@@ -17,6 +17,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import os
+import re
 import json
 import importlib
 
@@ -47,6 +48,8 @@ def _behavior():        return _lazy('nt_analyzer.behavior_analyzer')
 def _decompiler():      return _lazy('nt_analyzer.decompiler')
 def _compat():          return _lazy('nt_analyzer.compat_analyzer')
 def _pe_patcher():      return _lazy('nt_analyzer.pe_patcher')
+def _sym_loader():      return _lazy('nt_analyzer.symbol_loader')
+def _deep_analyzer():   return _lazy('nt_analyzer.deep_analyzer')
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -342,6 +345,8 @@ class App(tk.Tk):
         self.tab_behavior   = BehaviorTab(self.nb, self)
         self.tab_decompiler = DecompilerTab(self.nb, self)
         self.tab_compat     = CompatAnalyzerTab(self.nb, self)
+        self.tab_deep       = DeepAnalyzerTab(self.nb, self)
+        self.tab_xref       = XRefScannerTab(self.nb, self)
         self.tab_patcher    = PEPatcherTab(self.nb, self)
 
         tabs = [
@@ -357,6 +362,8 @@ class App(tk.Tk):
             (self.tab_behavior,   " Behavior "),
             (self.tab_decompiler, " Decompile "),
             (self.tab_compat,     " Compat "),
+            (self.tab_deep,       " Deep "),
+            (self.tab_xref,       " XRefs "),
             (self.tab_patcher,    " PE Patch "),
         ]
         for tab, text in tabs:
@@ -369,7 +376,7 @@ class App(tk.Tk):
         self.statusbar.pack_propagate(False)
 
         self.status_lbl = ttk.Label(self.statusbar,
-            text="  Ready  \u2022  13 analysis modules loaded  \u2022  All PE types supported: .dll .sys .exe .cpl .drv .ocx .scr",
+            text="  Ready  \u2022  15 analysis modules loaded  \u2022  Deep function analysis  \u2022  System-wide XRef scanning  \u2022  Symbol loading (.map/.pdb/.dbg)",
             style="Status.TLabel")
         self.status_lbl.pack(side="left", padx=10, pady=4)
 
@@ -544,6 +551,165 @@ def make_output(parent):
     return txt
 
 
+def _configure_output_tags(txt):
+    """Apply standard color tags to a ScrolledText widget."""
+    txt.tag_configure("title",   foreground=T["accent"], font=("Consolas", 11, "bold"))
+    txt.tag_configure("ok",      foreground=T["green"])
+    txt.tag_configure("warn",    foreground=T["yellow"])
+    txt.tag_configure("error",   foreground=T["red"])
+    txt.tag_configure("dim",     foreground=T["fg_dim"])
+    txt.tag_configure("peach",   foreground=T["peach"])
+    txt.tag_configure("heading", foreground=T["accent"], font=("Consolas", 10, "bold"))
+
+
+class TabbedOutput(ttk.Frame):
+    """Notebook-based output area with closeable result tabs.
+
+    Acts as a drop-in replacement for a ScrolledText widget by proxying
+    methods to the currently active tab.  Call ``new_tab(title)`` to create
+    a fresh output tab (instead of clearing the single output).
+    """
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self._nb = ttk.Notebook(self)
+        self._nb.grid(row=0, column=0, sticky="nsew")
+        self._tabs = {}          # frame_str -> ScrolledText
+        self._extra_tags = {}    # tag_name -> (args, kwargs)
+        self._extra_binds = []   # (tag, sequence, callback)
+        self._current = None     # active ScrolledText
+        self._counter = 0
+        # Close tabs: middle-click or right-click
+        self._nb.bind("<Button-2>", self._close_clicked)
+        self._nb.bind("<Button-3>", self._show_context)
+        self._ctx = tk.Menu(self._nb, tearoff=0)
+        self._ctx.add_command(label="Close Tab", command=self._close_ctx_tab)
+        self._ctx.add_command(label="Close All Others", command=self._close_others)
+        self._ctx.add_separator()
+        self._ctx.add_command(label="Close All", command=self.close_all)
+
+    # ── public API ────────────────────────────────────────────
+    def new_tab(self, title="Result"):
+        """Create a new output tab and make it active.  Returns the ScrolledText."""
+        self._counter += 1
+        frm = ttk.Frame(self._nb)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(0, weight=1)
+        txt = scrolledtext.ScrolledText(
+            frm, bg=T["bg_dark"], fg=T["fg"], insertbackground=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=8,
+            wrap="none", state="disabled")
+        txt.grid(row=0, column=0, sticky="nsew")
+        _configure_output_tags(txt)
+        # Apply any extra tags / binds registered by the owning tab
+        for tag, kw in self._extra_tags.items():
+            txt.tag_configure(tag, **kw)
+        for tag, seq, cb in self._extra_binds:
+            txt.tag_bind(tag, seq, cb)
+        # Limit number of tabs (auto-close oldest beyond 20)
+        tab_ids = self._nb.tabs()
+        if len(tab_ids) >= 20:
+            oldest = tab_ids[0]
+            self._nb.forget(oldest)
+            self._tabs.pop(oldest, None)
+        self._nb.add(frm, text=f"  {title}  ")
+        self._nb.select(frm)
+        self._tabs[str(frm)] = txt
+        self._current = txt
+        return txt
+
+    def close_all(self):
+        for t in list(self._nb.tabs()):
+            self._nb.forget(t)
+        self._tabs.clear()
+        self._current = None
+
+    # ── extra tag registration (called once in tab __init__) ──
+    def tag_configure(self, tag, **kw):
+        self._extra_tags[tag] = kw
+        if self._current:
+            self._current.tag_configure(tag, **kw)
+
+    def tag_bind(self, tag, sequence, callback):
+        self._extra_binds.append((tag, sequence, callback))
+        if self._current:
+            self._current.tag_bind(tag, sequence, callback)
+
+    # ── ScrolledText proxy (so output_write / output_clear work) ─
+    def _cur(self):
+        sel = self._nb.select()
+        if sel:
+            t = self._tabs.get(sel)
+            if t:
+                self._current = t
+                return t
+        return self._current
+
+    def configure(self, **kw):
+        c = self._cur()
+        if c:
+            c.configure(**kw)
+
+    def config(self, **kw):
+        return self.configure(**kw)
+
+    def insert(self, *a, **kw):
+        c = self._cur()
+        if c:
+            c.insert(*a, **kw)
+
+    def delete(self, *a, **kw):
+        c = self._cur()
+        if c:
+            c.delete(*a, **kw)
+
+    def get(self, *a, **kw):
+        c = self._cur()
+        return c.get(*a, **kw) if c else ""
+
+    def see(self, *a):
+        c = self._cur()
+        if c:
+            c.see(*a)
+
+    # ── internal ──────────────────────────────────────────────
+    def _close_clicked(self, event):
+        try:
+            idx = self._nb.index(f"@{event.x},{event.y}")
+            tab_id = self._nb.tabs()[idx]
+            self._nb.forget(tab_id)
+            self._tabs.pop(tab_id, None)
+        except Exception:
+            pass
+
+    def _show_context(self, event):
+        try:
+            self._ctx_idx = self._nb.index(f"@{event.x},{event.y}")
+            self._ctx.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            pass
+
+    def _close_ctx_tab(self):
+        try:
+            tab_id = self._nb.tabs()[self._ctx_idx]
+            self._nb.forget(tab_id)
+            self._tabs.pop(tab_id, None)
+        except Exception:
+            pass
+
+    def _close_others(self):
+        try:
+            keep = self._nb.tabs()[self._ctx_idx]
+            for t in list(self._nb.tabs()):
+                if t != keep:
+                    self._nb.forget(t)
+                    self._tabs.pop(t, None)
+        except Exception:
+            pass
+
+
 def output_write(txt_widget, content, tag=None):
     """Append text to a read-only ScrolledText."""
     txt_widget.configure(state="normal")
@@ -575,6 +741,43 @@ def run_async(func, callback=None):
     t.start()
 
 
+def make_progress_bar(parent, row):
+    """Create a themed progress bar with start/stop helpers.
+    Returns (frame, progress_bar, start_fn, stop_fn)."""
+    frm = tk.Frame(parent, bg=T["bg"], height=8)
+    frm.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 2))
+    frm.columnconfigure(0, weight=1)
+
+    bar = ttk.Progressbar(frm, mode='indeterminate', length=200)
+    bar.grid(row=0, column=0, sticky="ew")
+    bar.grid_remove()  # hidden by default
+
+    def start():
+        bar.grid()
+        bar.start(12)
+
+    def stop():
+        bar.stop()
+        bar.grid_remove()
+
+    return frm, bar, start, stop
+
+
+def run_with_progress(tab, func, callback):
+    """Run an async operation with the tab's progress bar animated."""
+    if hasattr(tab, '_prog_start'):
+        tab._prog_start()
+
+    def wrapped_callback(result):
+        def finish(r):
+            if hasattr(tab, '_prog_stop'):
+                tab._prog_stop()
+            callback(r)
+        tab.after(0, finish, result)
+
+    run_async(func, wrapped_callback)
+
+
 def make_section_label(parent, text, row=0):
     """Create a styled section divider label."""
     lbl = ttk.Label(parent, text=f"  \u2500\u2500  {text}  \u2500\u2500", style="Section.TLabel")
@@ -587,6 +790,27 @@ def make_button_bar(parent, row=0):
     frm = tk.Frame(parent, bg=T["bg"])
     frm.grid(row=row, column=0, sticky="ew", padx=12, pady=6)
     return frm
+
+
+def make_status_with_progress(parent, default_text, row):
+    """Create status label with an inline indeterminate progress bar.
+    Returns (status_var, start_fn, stop_fn)."""
+    status_var = tk.StringVar(value=default_text)
+    sf = tk.Frame(parent, bg=T["bg"])
+    sf.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 2))
+    sf.columnconfigure(0, weight=1)
+    ttk.Label(sf, textvariable=status_var, foreground=T["fg_dim"]).pack(side="left", padx=4)
+    prog = ttk.Progressbar(sf, mode='indeterminate', length=200)
+
+    def start():
+        prog.pack(side="right", padx=8)
+        prog.start(12)
+
+    def stop():
+        prog.stop()
+        prog.pack_forget()
+
+    return status_var, start, stop
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -612,13 +836,12 @@ class ExportImportTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save JSON",
                    command=self._save_json).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Select a PE file (ntdll.dll, kernel32.dll, hal.dll, win32k.sys, ...)")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=2, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Select a PE file (ntdll.dll, kernel32.dll, hal.dll, win32k.sys, ...)", row=2)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self._last_data = None
 
@@ -628,7 +851,7 @@ class ExportImportTab(ttk.Frame):
             messagebox.showwarning("No file", "Please select a PE file first.\n\nExample: ntdll.dll, kernel32.dll")
             return
         self.status_var.set("\u23F3 Analyzing exports...")
-        output_clear(self.output)
+        self.output.new_tab("Exports")
 
         def work():
             return _pe_analyzer().analyze_exports(path)
@@ -657,7 +880,7 @@ class ExportImportTab(ttk.Frame):
             self.status_var.set(f"\u2705 Done \u2014 {result['total_exports']} exports found")
             self.app.set_status(f"Exports: {result['dll_name']} \u2014 {result['total_exports']} exports")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _run_imports(self):
         path = self._get_dll()
@@ -665,7 +888,7 @@ class ExportImportTab(ttk.Frame):
             messagebox.showwarning("No file", "Please select a PE file first.\n\nExample: ntdll.dll, kernel32.dll")
             return
         self.status_var.set("\u23F3 Analyzing imports...")
-        output_clear(self.output)
+        self.output.new_tab("Imports")
 
         def work():
             return _pe_analyzer().analyze_imports(path)
@@ -689,7 +912,7 @@ class ExportImportTab(ttk.Frame):
             self.status_var.set(f"\u2705 Done \u2014 {len(result)} DLLs, {total} imports")
             self.app.set_status(f"Imports: {len(result)} DLLs, {total} functions")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _save_json(self):
         if not self._last_data:
@@ -724,13 +947,12 @@ class SyscallTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save JSON",
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Select ntdll.dll to extract syscall numbers and mechanisms")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=2, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Select ntdll.dll to extract syscall numbers and mechanisms", row=2)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self._last_data = None
 
@@ -740,7 +962,7 @@ class SyscallTab(ttk.Frame):
             messagebox.showwarning("No file", "Select ntdll.dll first.\n\nThis is the NT user\u2192kernel transition DLL that contains all syscall stubs.")
             return
         self.status_var.set("\u23F3 Extracting syscalls...")
-        output_clear(self.output)
+        self.output.new_tab("Analysis")
 
         def work():
             return _syscall_ext().extract_syscalls(path)
@@ -772,7 +994,7 @@ class SyscallTab(ttk.Frame):
             self.status_var.set(f"\u2705 Done \u2014 {len(result)} syscalls")
             self.app.set_status(f"Syscalls: {len(result)} extracted from {os.path.basename(path)}")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _save(self):
         if not self._last_data:
@@ -824,13 +1046,12 @@ class CompareTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save Report",
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Compare a Win2000 DLL with its ReactOS equivalent")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=4, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Compare a Win2000 DLL with its ReactOS equivalent", row=4)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self._last_report = None
 
@@ -841,7 +1062,7 @@ class CompareTab(ttk.Frame):
             return
         l1, l2 = self.label1_var.get() or "Win2000", self.label2_var.get() or "ReactOS"
         self.status_var.set("\u23F3 Comparing...")
-        output_clear(self.output)
+        self.output.new_tab("Analysis")
 
         def work():
             is_ntdll = 'ntdll' in os.path.basename(p1).lower()
@@ -856,7 +1077,7 @@ class CompareTab(ttk.Frame):
             self._render_report(result)
             self.status_var.set("\u2705 Comparison complete")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _render_report(self, rpt):
         l1, l2 = rpt['label1'], rpt['label2']
@@ -972,11 +1193,10 @@ class StructTab(ttk.Frame):
         ttk.Button(top, text="\U0001F4E6  Export All Headers",
                    command=self._export_all).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Select an NT kernel/user structure to inspect")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=1, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Select an NT kernel/user structure to inspect", row=1)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _show(self):
@@ -986,7 +1206,7 @@ class StructTab(ttk.Frame):
         s = _struct_analyzer().get_known_structure(name)
         if not s:
             return
-        output_clear(self.output)
+        self.output.new_tab("Structures")
         output_write(self.output, f"  {s['name']}  ({s['os']})\n", "title")
         output_write(self.output, f"  Size: 0x{s['size']:X} ({s['size']} bytes)\n\n", "ok")
         output_write(self.output,
@@ -1005,7 +1225,7 @@ class StructTab(ttk.Frame):
         s = _struct_analyzer().get_known_structure(name)
         if not s:
             return
-        output_clear(self.output)
+        self.output.new_tab("Header Gen")
         header = _struct_analyzer().generate_c_header(s)
         output_write(self.output, header)
         self.status_var.set(f"\u2705 Generated C header for {name}")
@@ -1043,13 +1263,12 @@ class PEHeaderTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F50D  Scan Directory", style="Accent.TButton",
                    command=self._run_scan).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Analyze any PE file header or scan a System32 directory")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=3, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Analyze any PE file header or scan a System32 directory", row=3)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _run_header(self):
@@ -1058,7 +1277,7 @@ class PEHeaderTab(ttk.Frame):
             messagebox.showwarning("No file", "Select a PE file.\n\nSupported: .dll .sys .exe .cpl .drv .ocx .scr")
             return
         self.status_var.set("\u23F3 Analyzing...")
-        output_clear(self.output)
+        self.output.new_tab("PE Header")
 
         def work():
             return _pe_analyzer().analyze_pe_header(path)
@@ -1086,7 +1305,7 @@ class PEHeaderTab(ttk.Frame):
                     f"{sec['characteristics']}\n")
             self.status_var.set("\u2705 Done")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _run_scan(self):
         d = self._get_dir()
@@ -1094,7 +1313,7 @@ class PEHeaderTab(ttk.Frame):
             messagebox.showwarning("No directory", "Select a directory to scan.\n\nExample: C:\\WINNT\\System32")
             return
         self.status_var.set("\u23F3 Scanning...")
-        output_clear(self.output)
+        self.output.new_tab("PE Scan")
 
         import glob as gl
 
@@ -1134,7 +1353,7 @@ class PEHeaderTab(ttk.Frame):
                     output_write(self.output, f"  {bn:<28} ERROR: {e}\n", "error")
             self.status_var.set(f"\u2705 Scanned {count} key files out of {len(files)} total")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1163,13 +1382,12 @@ class DefGenTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save .def",
                    command=self._save_def).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Generate .def files from Win2000 DLLs for ReactOS builds")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=3, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Generate .def files from Win2000 DLLs for ReactOS builds", row=3)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self._last_def = None
 
@@ -1179,7 +1397,7 @@ class DefGenTab(ttk.Frame):
             messagebox.showwarning("No file", "Select a Win2000 DLL first.\n\nExample: kernel32.dll, ntdll.dll")
             return
         self.status_var.set("\u23F3 Generating .def...")
-        output_clear(self.output)
+        self.output.new_tab("DEF File")
 
         def work():
             return _def_generator().generate_def_file(path)
@@ -1202,7 +1420,7 @@ class DefGenTab(ttk.Frame):
                                and not l.startswith('LIBRARY') and not l.startswith('EXPORTS'))
             self.status_var.set(f"\u2705 Generated .def with {export_count} entries")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _compare_def(self):
         dll_path = self._get_dll()
@@ -1211,7 +1429,7 @@ class DefGenTab(ttk.Frame):
             messagebox.showwarning("Missing", "Select both Win2000 DLL and ReactOS .def file.")
             return
         self.status_var.set("\u23F3 Comparing...")
-        output_clear(self.output)
+        self.output.new_tab("DEF Compare")
 
         def work():
             return _def_generator().compare_def_with_reactos(dll_path, ros_path)
@@ -1233,7 +1451,7 @@ class DefGenTab(ttk.Frame):
                 output_write(self.output, f"    {m['name']}: Win2K={m['win2k_ordinal']} ROS={m['reactos_ordinal']}\n", "warn")
             self.status_var.set("\u2705 Comparison done")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _save_def(self):
         if not self._last_def:
@@ -1276,13 +1494,12 @@ class SyscallPatchTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save Header",
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Generate syscall number headers from ntdll.dll for use in drivers/tools")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=3, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Generate syscall number headers from ntdll.dll for use in drivers/tools", row=3)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self._last_header = None
 
@@ -1293,18 +1510,18 @@ class SyscallPatchTab(ttk.Frame):
             return
         style = self.style_var.get()
         self.status_var.set(f"\u23F3 Generating {style} header...")
-        output_clear(self.output)
+        self.output.new_tab("Generate")
 
         def work():
-            return _sc_patcher().generate_syscall_header(path, style=style)
+            return _sc_patcher().generate_syscall_header(path, header_style=style)
 
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C Error: {result}")
                 output_write(self.output, f"ERROR: {result}\n", "error")
                 return
-            self._last_header = result
-            for line in result.split('\n'):
+            self._last_header = result['content']
+            for line in result['content'].split('\n'):
                 if line.startswith('//') or line.startswith(';') or line.startswith('#ifndef'):
                     output_write(self.output, line + '\n', "dim")
                 elif '#define' in line:
@@ -1315,7 +1532,7 @@ class SyscallPatchTab(ttk.Frame):
                     output_write(self.output, line + '\n')
             self.status_var.set("\u2705 Header generated")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _save(self):
         if not self._last_header:
@@ -1357,7 +1574,7 @@ class ROSPatchTab(ttk.Frame):
         ttk.Button(btn_frm, text="\u2699  Patch All",
                    command=lambda: self._run_patch('all')).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
         chk_frm = tk.Frame(self, bg=T["bg"])
         chk_frm.grid(row=3, column=0, sticky="w", padx=12, pady=3)
@@ -1368,11 +1585,10 @@ class ROSPatchTab(ttk.Frame):
                         activebackground=T["bg"], activeforeground=T["fg"],
                         font=("Segoe UI", 10)).pack(side="left")
 
-        self.status_var = tk.StringVar(value="\u2022 Patch ReactOS C source for Win2000 compatibility")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=4, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Patch ReactOS C source for Win2000 compatibility", row=4)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _scan(self):
@@ -1381,7 +1597,7 @@ class ROSPatchTab(ttk.Frame):
             messagebox.showwarning("Missing", "Select ReactOS source directory.\n\nExample: C:\\reactos")
             return
         self.status_var.set("\u23F3 Scanning for Win2K compatibility issues...")
-        output_clear(self.output)
+        self.output.new_tab("Scan")
 
         def work():
             patcher = _ros_patcher().ReactOSPatcher(ros_path)
@@ -1407,7 +1623,7 @@ class ROSPatchTab(ttk.Frame):
                 output_write(self.output, "  No issues found!\n", "ok")
             self.status_var.set(f"\u2705 Scan complete: {total} issues found")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _run_patch(self, mode):
         ros_path = self._get_ros()
@@ -1417,7 +1633,7 @@ class ROSPatchTab(ttk.Frame):
         ntdll_path = self._get_ntdll() or None
         dry = self.dryrun_var.get()
         self.status_var.set(f"\u23F3 Patching ({mode}){'  [DRY RUN]' if dry else ''}...")
-        output_clear(self.output)
+        self.output.new_tab("Patch")
 
         def work():
             patcher = _ros_patcher().ReactOSPatcher(ros_path, ntdll_path)
@@ -1452,7 +1668,7 @@ class ROSPatchTab(ttk.Frame):
                 output_write(self.output, f"  {result}\n")
             self.status_var.set(f"\u2705 Patch complete{dry_label}")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1493,13 +1709,12 @@ class BuildGenTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save Script",
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Generate build scripts for compiling ReactOS DLLs targeting Win2000")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=4, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Generate build scripts for compiling ReactOS DLLs targeting Win2000", row=4)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self._last_script = None
 
@@ -1516,7 +1731,7 @@ class BuildGenTab(ttk.Frame):
             messagebox.showwarning("No targets", "Select at least one build target.")
             return
         build = self.build_var.get()
-        output_clear(self.output)
+        self.output.new_tab("Generate")
 
         if build == 'rosbe':
             script = _build_gen().generate_rosbe_script(ros, targets)
@@ -1562,7 +1777,11 @@ class BehaviorTab(ttk.Frame):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(6, weight=1)
+        self.rowconfigure(8, weight=1)
+
+        # ── History state ──
+        self._history = []
+        self._history_idx = -1
 
         _, self._get_a, self.dll_a_var = make_file_picker(
             self, "DLL A (Win2K):", row=0,
@@ -1595,8 +1814,16 @@ class BehaviorTab(ttk.Frame):
                    command=self._patterns).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F50D  Scan All",
                    command=self._scan_all).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F500  Control Flow",
+                   command=self._control_flow).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F517  Resolve Unknown",
+                   command=self._resolve_unknown).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\u25C0 Back",
+                   command=self._history_back).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="Forward \u25B6",
+                   command=self._history_forward).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
         lim_frm = tk.Frame(self, bg=T["bg"])
         lim_frm.grid(row=4, column=0, sticky="w", padx=12, pady=3)
@@ -1605,13 +1832,104 @@ class BehaviorTab(ttk.Frame):
         tk.Entry(lim_frm, textvariable=self.max_var, bg=T["entry_bg"], fg=T["fg"],
                  insertbackground=T["fg"], font=("Consolas", 10), relief="flat",
                  bd=5, width=8).pack(side="left", padx=5)
+        ttk.Label(lim_frm, text="   DLL search dir:").pack(side="left", padx=5)
+        self.dll_dir_var = tk.StringVar()
+        dll_dir_ent = PlaceholderEntry(lim_frm, placeholder="e.g. C:\\WINNT\\System32",
+                                       textvariable=self.dll_dir_var,
+                                       bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                                       font=("Consolas", 10), relief="flat", bd=5, width=25)
+        dll_dir_ent.pack(side="left", padx=5)
+        app.register_placeholder(dll_dir_ent)
+        self._dll_dir_entry = dll_dir_ent
 
-        self.status_var = tk.StringVar(value="\u2022 Compare function behavior between Win2000 and ReactOS binaries")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=5, column=0, sticky="w", padx=16, pady=(0, 2))
+        # ── Symbol & history row ──
+        sym_frm = tk.Frame(self, bg=T["bg"])
+        sym_frm.grid(row=5, column=0, sticky="ew", padx=12, pady=3)
+        ttk.Label(sym_frm, text="Symbols:").pack(side="left", padx=5)
+        self._sym_var = tk.StringVar()
+        sym_ent = PlaceholderEntry(sym_frm, placeholder="Optional: .map / .pdb / .dbg symbol file",
+                                   textvariable=self._sym_var,
+                                   bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                                   font=("Consolas", 10), relief="flat", bd=5, width=40)
+        sym_ent.pack(side="left", padx=5)
+        app.register_placeholder(sym_ent)
+        self._sym_entry = sym_ent
+        ttk.Button(sym_frm, text="Browse",
+                   command=self._browse_symbols).pack(side="left", padx=3)
+        self._use_sym_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sym_frm, text="Use symbols in disassembly",
+                        variable=self._use_sym_var).pack(side="left", padx=10)
+        self._hist_var = tk.StringVar(value="")
+        ttk.Label(sym_frm, textvariable=self._hist_var).pack(side="right", padx=10)
 
-        self.output = make_output(self)
-        self.output.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Compare function behavior between Win2000 and ReactOS binaries", row=6)
+
+        self.output = TabbedOutput(self)
+        self.output.grid(row=8, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        # Clickable function tag
+        self.output.tag_configure("func_link", foreground="#89b4fa", underline=True)
+        self.output.tag_bind("func_link", "<Button-1>", self._on_func_click)
+        self.output.tag_bind("func_link", "<Enter>",
+                             lambda e: self.output.configure(cursor="hand2"))
+        self.output.tag_bind("func_link", "<Leave>",
+                             lambda e: self.output.configure(cursor=""))
+
+    # ── Symbol browsing ──
+    def _browse_symbols(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Symbol files", "*.map *.pdb *.dbg *.sym"), ("All", "*.*")])
+        if path:
+            self._sym_entry.set_value(path)
+
+    # ── History system ──
+    def _save_to_history(self, title):
+        self.output.configure(state="normal")
+        text = self.output.get("1.0", "end-1c")
+        self.output.configure(state="disabled")
+        if self._history_idx < len(self._history) - 1:
+            self._history = self._history[:self._history_idx + 1]
+        self._history.append((title, text))
+        self._history_idx = len(self._history) - 1
+        self._update_hist_label()
+
+    def _history_back(self):
+        if self._history_idx > 0:
+            self._history_idx -= 1
+            title, text = self._history[self._history_idx]
+            output_clear(self.output)
+            output_write(self.output, text)
+            self.status_var.set(f"\u25C0 {title}")
+            self._update_hist_label()
+
+    def _history_forward(self):
+        if self._history_idx < len(self._history) - 1:
+            self._history_idx += 1
+            title, text = self._history[self._history_idx]
+            output_clear(self.output)
+            output_write(self.output, text)
+            self.status_var.set(f"\u25B6 {title}")
+            self._update_hist_label()
+
+    def _update_hist_label(self):
+        n = len(self._history)
+        if n > 0:
+            self._hist_var.set(f"History: {self._history_idx + 1}/{n}")
+        else:
+            self._hist_var.set("")
+
+    # ── Click-on-function handler ──
+    def _on_func_click(self, event):
+        idx = self.output.index(f"@{event.x},{event.y}")
+        line_start = self.output.index(f"{idx} linestart")
+        line_end = self.output.index(f"{idx} lineend")
+        line_text = self.output.get(line_start, line_end).strip()
+        # Extract function name: first non-whitespace token
+        parts = line_text.split()
+        if parts:
+            func_name = parts[0]
+            self._func_entry.set_value(func_name)
+            self._disasm()
 
     def _get_func(self):
         return self._func_entry.get_value()
@@ -1622,35 +1940,74 @@ class BehaviorTab(ttk.Frame):
         if not path or not func:
             messagebox.showwarning("Missing", "Select DLL A and enter a function name.\n\nExample: NtCreateFile")
             return
-        self.status_var.set(f"\u23F3 Disassembling {func}...")
-        output_clear(self.output)
+        use_sym = self._use_sym_var.get()
+        sym_path = self._sym_entry.get_value() if use_sym else None
+        self.output.new_tab(f"Disasm: {func}")
 
-        def work():
-            return _behavior().disassemble_function(path, func)
+        def work(progress_cb):
+            progress_cb(f"Loading PE: {os.path.basename(path)}", 10)
+            if use_sym and sym_path:
+                progress_cb(f"Loading symbols\u2026", 20)
+                syms = _sym_loader().load_symbols(sym_path)
+                progress_cb(f"Building function map\u2026", 30)
+                fm = _deep_analyzer().PEFunctionMap(path, progress_callback=progress_cb)
+                fm.discover_all_functions()
+                fm.analyze_all_functions()
+                # Merge symbols
+                if isinstance(syms, tuple):
+                    sym_list, _ = syms
+                else:
+                    sym_list = syms
+                if isinstance(sym_list, dict):
+                    for va, name in sym_list.items():
+                        if va in fm.functions and name:
+                            fm.functions[va].name = name
+                elif isinstance(sym_list, list):
+                    for sym in sym_list:
+                        va = sym.get('address', 0)
+                        name = sym.get('name', '')
+                        if va in fm.functions and name:
+                            fm.functions[va].name = name
+                progress_cb(f"Disassembling {func} with symbols\u2026", 70)
+                code = _deep_analyzer().disassemble_function_full(fm, func)
+                fm.close()
+                return ('deep', code)
+            else:
+                progress_cb(f"Disassembling {func}\u2026", 30)
+                result = _behavior().disassemble_function(path, func)
+                progress_cb("Formatting output\u2026", 90)
+                return ('basic', result)
 
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C Error: {result}")
                 output_write(self.output, f"ERROR: {result}\n", "error")
                 return
-            if result is None:
+            mode, code = result
+            if code is None:
                 output_write(self.output, f"  Function '{func}' not found in the DLL exports.\n", "error")
                 self.status_var.set("\u274C Function not found")
                 return
-            for line in result.split('\n'):
+            for line in code.split('\n'):
                 if line.startswith(';'):
                     output_write(self.output, line + '\n', "dim")
                 elif '; \u2192' in line:
                     output_write(self.output, line + '\n', "peach")
-                elif 'call' in line or 'int' in line:
+                elif '; arg' in line:
+                    output_write(self.output, line + '\n', "ok")
+                elif '; local_' in line:
+                    output_write(self.output, line + '\n', "warn")
+                elif 'call' in line.lower() or 'int' in line:
                     output_write(self.output, line + '\n', "ok")
                 elif 'ret' in line or 'retn' in line:
                     output_write(self.output, line + '\n', "warn")
                 else:
                     output_write(self.output, line + '\n')
-            self.status_var.set(f"\u2705 Disassembly of {func} complete")
+            sym_note = " (with symbols)" if mode == 'deep' else ""
+            self._save_to_history(f"Disasm: {func}")
+            self.status_var.set(f"\u2705 Disassembly of {func} complete{sym_note}")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress_dialog(self.app, f"Disassembling {func}\u2026", work, done)
 
     def _compare_one(self):
         pa = self._get_a()
@@ -1659,11 +2016,14 @@ class BehaviorTab(ttk.Frame):
         if not pa or not pb or not func:
             messagebox.showwarning("Missing", "Select both DLLs and enter a function name.")
             return
-        self.status_var.set(f"\u23F3 Comparing {func}...")
-        output_clear(self.output)
+        self.output.new_tab(f"Compare: {func}")
 
-        def work():
-            return _behavior().compare_functions(pa, pb, func)
+        def work(progress_cb):
+            progress_cb(f"Fingerprinting {func} in {os.path.basename(pa)}\u2026", 20)
+            progress_cb(f"Fingerprinting {func} in {os.path.basename(pb)}\u2026", 50)
+            result = _behavior().compare_functions(pa, pb, func)
+            progress_cb("Computing similarity\u2026", 90)
+            return result
 
         def done(result):
             if isinstance(result, Exception):
@@ -1684,9 +2044,10 @@ class BehaviorTab(ttk.Frame):
                     output_write(self.output, f"  {line}\n", "warn")
                 else:
                     output_write(self.output, f"  {line}\n")
+            self._save_to_history(f"Compare: {func}")
             self.status_var.set(f"\u2705 Comparison: {result.similarity:.1f}% similar")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress_dialog(self.app, f"Comparing {func}\u2026", work, done)
 
     def _batch(self):
         pa = self._get_a()
@@ -1698,11 +2059,11 @@ class BehaviorTab(ttk.Frame):
             max_funcs = int(self.max_var.get())
         except ValueError:
             max_funcs = 100
-        self.status_var.set("\u23F3 Batch comparing all shared exports...")
-        output_clear(self.output)
+        self.output.new_tab("Batch")
 
-        def work():
-            results = _behavior().batch_compare(pa, pb)
+        def work(progress_cb):
+            progress_cb("Enumerating shared exports\u2026", 5)
+            results = _behavior().batch_compare(pa, pb, progress_callback=progress_cb)
             return results[:max_funcs]
 
         def done(results):
@@ -1729,9 +2090,10 @@ class BehaviorTab(ttk.Frame):
                     notes = f"stub 0x{r.fp_a.syscall_number:X}"
                 line = f"  {r.func_name:<48} {pct:>6.1f}% {ba:<10} {bb:<10} {notes}\n"
                 output_write(self.output, line, tag)
+            self._save_to_history("Batch Compare")
             self.status_var.set(f"\u2705 Compared {len(results)} functions")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress_dialog(self.app, "Batch comparing exports\u2026", work, done)
 
     def _patterns(self):
         path = self._get_a()
@@ -1739,11 +2101,14 @@ class BehaviorTab(ttk.Frame):
         if not path or not func:
             messagebox.showwarning("Missing", "Select DLL A and enter a function name.")
             return
-        self.status_var.set(f"\u23F3 Detecting patterns for {func}...")
-        output_clear(self.output)
+        self.output.new_tab(f"Patterns: {func}")
 
-        def work():
-            return _behavior().detect_api_patterns(path, func)
+        def work(progress_cb):
+            progress_cb(f"Loading PE: {os.path.basename(path)}", 10)
+            progress_cb(f"Fingerprinting {func}\u2026", 30)
+            result = _behavior().detect_api_patterns(path, func)
+            progress_cb("Analyzing patterns\u2026", 80)
+            return result
 
         def done(result):
             if isinstance(result, Exception):
@@ -1771,9 +2136,29 @@ class BehaviorTab(ttk.Frame):
                 output_write(self.output, f"\n  API calls ({len(fp.api_calls)}):\n", "heading")
                 for call in fp.api_calls:
                     output_write(self.output, f"    \u2192 {call}\n", "peach")
+
+            # Show basic blocks detail
+            output_write(self.output, f"\n  {'='*65}\n", "dim")
+            output_write(self.output, f"  BASIC BLOCKS ({fp.block_count} blocks, {fp.total_insns} instructions)\n\n", "heading")
+            for idx, (addr, block) in enumerate(sorted(fp.blocks.items())):
+                n_insns = len(block.instructions)
+                succ_str = ""
+                if block.successors:
+                    succ_str = f"  \u2192 {', '.join(f'0x{s:08X}' for s in block.successors)}"
+                output_write(self.output, f"  Block {idx} @ 0x{addr:08X} ({n_insns} insns){succ_str}\n", "heading")
+                for mnem, op_norm in block.instructions:
+                    output_write(self.output, f"      {mnem:<10} {op_norm}\n", "dim")
+                if block.calls:
+                    for c in block.calls:
+                        cname = c if isinstance(c, str) else f"0x{c:08X}"
+                        output_write(self.output, f"      \u21B3 calls {cname}\n", "peach")
+                if block.normalized_hash:
+                    output_write(self.output, f"      hash: {block.normalized_hash[:16]}\n", "dim")
+                output_write(self.output, "\n")
+            self._save_to_history(f"Patterns: {func}")
             self.status_var.set(f"\u2705 Pattern analysis complete for {func}")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress_dialog(self.app, f"Detecting patterns: {func}\u2026", work, done)
 
     def _scan_all(self):
         path = self._get_a()
@@ -1784,11 +2169,10 @@ class BehaviorTab(ttk.Frame):
             max_funcs = int(self.max_var.get())
         except ValueError:
             max_funcs = 100
-        self.status_var.set("\u23F3 Scanning all exports for behavior patterns...")
-        output_clear(self.output)
+        self.output.new_tab("Scan All")
 
-        def work():
-            return _behavior().scan_all_exports(path, max_funcs)
+        def work(progress_cb):
+            return _behavior().scan_all_exports(path, max_funcs, progress_callback=progress_cb)
 
         def done(result):
             if isinstance(result, Exception):
@@ -1796,18 +2180,176 @@ class BehaviorTab(ttk.Frame):
                 output_write(self.output, f"ERROR: {result}\n", "error")
                 return
             output_write(self.output, "  EXPORT BEHAVIOR SCAN\n\n", "title")
+            output_write(self.output, "  Click any function name to disassemble it.\n\n", "dim")
             total = 0
             for category, funcs in sorted(result.items(), key=lambda x: -len(x[1])):
                 output_write(self.output, f"  [{category}] \u2014 {len(funcs)} functions\n", "heading")
-                for fname, fdesc in funcs[:20]:
-                    output_write(self.output, f"    {fname:<48} {fdesc}\n")
-                if len(funcs) > 20:
-                    output_write(self.output, f"    ... +{len(funcs)-20} more\n", "dim")
+                for fname, fdesc in funcs:
+                    # Insert function name as clickable link, then description
+                    output_write(self.output, "    ")
+                    output_write(self.output, f"{fname:<48}", "func_link")
+                    output_write(self.output, f" {fdesc}\n")
                 output_write(self.output, "\n")
                 total += len(funcs)
+            self._save_to_history("Scan All")
             self.status_var.set(f"\u2705 Scanned: {total} functions in {len(result)} categories")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress_dialog(self.app, "Scanning all exports\u2026", work, done)
+
+    def _control_flow(self):
+        """Full control flow structure analysis — loops, if/else, switches."""
+        path = self._get_a()
+        func = self._get_func()
+        if not path or not func:
+            messagebox.showwarning("Missing", "Select DLL A and enter a function name.")
+            return
+        self.output.new_tab(f"Flow: {func}")
+
+        def work(progress_cb):
+            progress_cb(f"Loading PE: {os.path.basename(path)}", 10)
+            progress_cb(f"Building control flow graph for {func}\u2026", 30)
+            result = _behavior().analyze_control_flow(path, func)
+            progress_cb("Detecting loops, branches, switches\u2026", 80)
+            return result
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(self.output, f"  Function '{func}' not found.\n", "error")
+                self.status_var.set("\u274C Not found")
+                return
+            report = _behavior().format_control_flow(result)
+            for line in report.split('\n'):
+                if line.strip().startswith('='):
+                    output_write(self.output, line + '\n', "dim")
+                elif 'CONTROL FLOW' in line or 'LOOPS' in line or 'BRANCHES' in line \
+                        or 'SWITCH' in line or 'CALL TREE' in line or 'ANNOTATED' in line \
+                        or 'UNKNOWN' in line:
+                    output_write(self.output, line + '\n', "title")
+                elif line.strip().startswith('\u2500'):
+                    output_write(self.output, line + '\n', "dim")
+                elif line.strip().startswith('Loop ') or line.strip().startswith('Branch ') \
+                        or line.strip().startswith('Switch '):
+                    output_write(self.output, line + '\n', "heading")
+                elif line.strip().startswith('\u25C6'):
+                    output_write(self.output, line + '\n', "warn")
+                elif '\u21B3 calls' in line or '\u2192' in line:
+                    output_write(self.output, line + '\n', "peach")
+                elif 'Complexity' in line or 'Blocks' in line:
+                    output_write(self.output, line + '\n', "ok")
+                elif line.strip().startswith('Block 0x'):
+                    output_write(self.output, line + '\n', "heading")
+                elif line.strip().startswith('Condition:'):
+                    output_write(self.output, line + '\n', "warn")
+                else:
+                    output_write(self.output, line + '\n')
+            n_loops = len(result['loops'])
+            n_ifs = len(result['if_else'])
+            n_sws = len(result['switches'])
+            self._save_to_history(f"ControlFlow: {func}")
+            self.status_var.set(
+                f"\u2705 {func}: complexity={result['complexity']}, "
+                f"{n_loops} loops, {n_ifs} branches, {n_sws} switches, "
+                f"{len(result['call_tree'])} API calls")
+
+        run_with_progress_dialog(self.app, f"Control flow: {func}\u2026", work, done)
+
+    def _resolve_unknown(self):
+        """KernelEx-style: resolve unknown call targets by scanning nearby DLLs."""
+        path = self._get_a()
+        func = self._get_func()
+        if not path or not func:
+            messagebox.showwarning("Missing", "Select DLL A and enter a function name.")
+            return
+        dll_dir = self._dll_dir_entry.get_value()
+        if not dll_dir:
+            # Default to same directory as the PE
+            dll_dir = os.path.dirname(path)
+        if not dll_dir or not os.path.isdir(dll_dir):
+            messagebox.showwarning("Missing", "Enter a valid DLL search directory.\n\n"
+                                   "This is used to resolve unknown call targets\n"
+                                   "(like KernelEx's SearchPath approach).\n\n"
+                                   "Example: C:\\WINNT\\System32")
+            return
+        self.output.new_tab(f"Resolve: {func}")
+
+        def work(progress_cb):
+            import pefile as _pf
+            progress_cb(f"Analyzing control flow for {func}\u2026", 10)
+            analysis = _behavior().analyze_control_flow(path, func)
+            if analysis is None:
+                return None
+            unknown = analysis.get('unknown_calls', [])
+            if not unknown:
+                return {'analysis': analysis, 'resolved': {}, 'message': 'No unknown call targets found'}
+            progress_cb(f"Found {len(unknown)} unknown targets, loading PE\u2026", 40)
+            pe = _pf.PE(path, fast_load=True)
+            img_base = pe.OPTIONAL_HEADER.ImageBase
+            pe.close()
+            progress_cb(f"Scanning DLLs in {os.path.basename(dll_dir)}\u2026", 60)
+            resolved = _sym_loader().resolve_from_dlls(unknown, [dll_dir], img_base)
+            progress_cb("Formatting results\u2026", 95)
+            return {'analysis': analysis, 'resolved': resolved, 'unknown': unknown}
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(self.output, f"  Function '{func}' not found.\n", "error")
+                self.status_var.set("\u274C Not found")
+                return
+
+            resolved = result.get('resolved', {})
+            unknown = result.get('unknown', [])
+            analysis = result.get('analysis', {})
+
+            output_write(self.output, "  UNKNOWN FUNCTION RESOLUTION\n", "title")
+            output_write(self.output, f"  (KernelEx-style DLL export scanning)\n\n", "dim")
+            output_write(self.output, f"  Function: {func}\n")
+            output_write(self.output, f"  DLL search path: {dll_dir}\n")
+            output_write(self.output, f"  Total call targets: {len(analysis.get('call_tree', []))}\n")
+            output_write(self.output, f"  Unknown targets: {len(unknown)}\n")
+            output_write(self.output, f"  Resolved: {len(resolved)}\n\n")
+
+            if resolved:
+                output_write(self.output, f"  RESOLVED ({len(resolved)})\n", "heading")
+                output_write(self.output, f"  {'─'*60}\n", "dim")
+                for addr in sorted(resolved.keys()):
+                    name = resolved[addr]
+                    output_write(self.output, f"    0x{addr:08X}  \u2192  ", "dim")
+                    output_write(self.output, f"{name}\n", "ok")
+                output_write(self.output, "\n")
+
+            still_unknown = [a for a in unknown if a not in resolved]
+            if still_unknown:
+                output_write(self.output, f"  STILL UNKNOWN ({len(still_unknown)})\n", "heading")
+                output_write(self.output, f"  {'─'*60}\n", "dim")
+                for addr in sorted(still_unknown):
+                    output_write(self.output, f"    0x{addr:08X}  (internal / not exported)\n", "warn")
+                output_write(self.output, "\n")
+
+            if analysis.get('call_tree'):
+                output_write(self.output, f"  KNOWN API CALLS ({len(analysis['call_tree'])})\n", "heading")
+                output_write(self.output, f"  {'─'*60}\n", "dim")
+                seen = set()
+                for call in analysis['call_tree']:
+                    if call not in seen:
+                        seen.add(call)
+                        output_write(self.output, f"    \u2192 {call}\n", "peach")
+
+            total_resolved = len(resolved)
+            total_unknown = len(still_unknown)
+            self._save_to_history(f"Resolve: {func}")
+            self.status_var.set(
+                f"\u2705 Resolved {total_resolved}/{len(unknown)} unknown targets "
+                f"({total_unknown} still unknown)")
+
+        run_with_progress_dialog(self.app, f"Resolving unknown calls in {func}\u2026", work, done)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1819,7 +2361,7 @@ class DecompilerTab(ttk.Frame):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(5, weight=1)
+        self.rowconfigure(6, weight=1)
 
         _, self._get_pe, self.pe_var = make_file_picker(
             self, "PE File:", row=0,
@@ -1842,6 +2384,10 @@ class DecompilerTab(ttk.Frame):
         btn_frm = make_button_bar(self, row=2)
         ttk.Button(btn_frm, text="\U0001F4BB  Decompile Export", style="Accent.TButton",
                    command=self._decompile_one).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F5A5  Disassemble",
+                   command=self._disasm_one).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="HEX  Hex Dump",
+                   command=self._hexdump_one).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F50D  Discover Functions",
                    command=self._discover).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F4CA  Batch Decompile",
@@ -1849,7 +2395,7 @@ class DecompilerTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save Output",
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
         lim_frm = tk.Frame(self, bg=T["bg"])
         lim_frm.grid(row=3, column=0, sticky="w", padx=12, pady=3)
@@ -1858,16 +2404,87 @@ class DecompilerTab(ttk.Frame):
         tk.Entry(lim_frm, textvariable=self.max_var, bg=T["entry_bg"], fg=T["fg"],
                  insertbackground=T["fg"], font=("Consolas", 10), relief="flat",
                  bd=5, width=8).pack(side="left", padx=5)
+        self.expand_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(lim_frm, text="Expand called functions (inline decompile)",
+                        variable=self.expand_var).pack(side="left", padx=15)
 
-        self.status_var = tk.StringVar(value="\u2022 Decompile PE exports to C pseudocode \u2014 recognizes kernel APIs, NTSTATUS, IRP codes")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=4, column=0, sticky="w", padx=16, pady=(0, 2))
+        # Symbol loading row
+        sym_frm = tk.Frame(self, bg=T["bg"])
+        sym_frm.grid(row=4, column=0, sticky="ew", padx=12, pady=3)
+        sym_frm.columnconfigure(1, weight=1)
+        ttk.Label(sym_frm, text="Symbols:", width=16, anchor="e").grid(row=0, column=0, padx=(0, 8))
+        self._sym_var = tk.StringVar()
+        self._sym_entry = PlaceholderEntry(
+            sym_frm, placeholder="e.g.  ntdll.map, ntoskrnl.pdb, symbols.sym",
+            textvariable=self._sym_var,
+            bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=5)
+        self._sym_entry.grid(row=0, column=1, sticky="ew")
+        app.register_placeholder(self._sym_entry)
 
-        self.output = make_output(self)
-        self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        def _browse_sym():
+            path = filedialog.askopenfilename(
+                filetypes=[("Symbol files", "*.map;*.pdb;*.dbg;*.sym;*.txt"),
+                           ("MAP files", "*.map"), ("PDB files", "*.pdb"),
+                           ("DBG files", "*.dbg"), ("All", "*.*")])
+            if path:
+                self._sym_entry.set_value(path)
+        ttk.Button(sym_frm, text="Browse \u2026", command=_browse_sym).grid(
+            row=0, column=2, padx=(8, 0))
+        ttk.Button(sym_frm, text="\U0001F4E5  Load Symbols", command=self._load_symbols).grid(
+            row=0, column=3, padx=(8, 0))
+
+        self._loaded_symbols = {}
+        self._sym_meta = {}
+        self.sym_status_var = tk.StringVar(value="")
+        ttk.Label(sym_frm, textvariable=self.sym_status_var, foreground=T["green"],
+                  font=("Segoe UI", 9)).grid(row=0, column=4, padx=(8, 0))
+
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Decompile PE exports to C pseudocode \u2014 recognizes kernel APIs, NTSTATUS, IRP codes", row=5)
+
+        self.output = TabbedOutput(self)
+        self.output.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _get_func(self):
         return self._func_entry.get_value()
+
+    def _load_symbols(self):
+        """Load a symbol file (.map, .pdb, .dbg, .sym)."""
+        sym_path = self._sym_entry.get_value()
+        if not sym_path:
+            messagebox.showwarning("No file", "Enter or browse for a symbol file.\n\n"
+                                   "Supported: .map (MSVC/GCC/IDA), .pdb, .dbg, .sym")
+            return
+        if not os.path.isfile(sym_path):
+            messagebox.showerror("Not found", f"File not found:\n{sym_path}")
+            return
+
+        self.status_var.set(f"\u23F3 Loading symbols from {os.path.basename(sym_path)}...")
+
+        def work():
+            return _sym_loader().load_symbols(sym_path)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                return
+            symbols, meta = result
+            self._loaded_symbols = _sym_loader().merge_symbols(self._loaded_symbols, symbols)
+            self._sym_meta = meta
+            n = meta.get('total_symbols', 0)
+            fmt = meta.get('format', '?')
+            err = meta.get('error', '')
+            if err:
+                self.sym_status_var.set(f"\u26A0 {err}")
+                self.status_var.set(f"\u26A0 {err}")
+            else:
+                self.sym_status_var.set(f"\u2705 {n} symbols ({fmt})")
+                self.status_var.set(
+                    f"\u2705 Loaded {n} symbols from {os.path.basename(sym_path)} "
+                    f"[{fmt}] — total: {len(self._loaded_symbols)}")
+
+        run_with_progress(self, work, done)
 
     def _decompile_one(self):
         path = self._get_pe()
@@ -1876,15 +2493,18 @@ class DecompilerTab(ttk.Frame):
             messagebox.showwarning("Missing", "Select a PE file and enter a function name or RVA.\n\nExamples:\n  NtCreateFile\n  0x0004AE10")
             return
         self.status_var.set(f"\u23F3 Decompiling {func}...")
-        output_clear(self.output)
+        self.output.new_tab("Decompile")
 
         if func.startswith('0x') or func.startswith('0X'):
             func_val = int(func, 16)
         else:
             func_val = func
 
+        expand = self.expand_var.get()
+        syms = self._loaded_symbols if self._loaded_symbols else None
+
         def work():
-            return _decompiler().decompile(path, func_val)
+            return _decompiler().decompile(path, func_val, symbols=syms, expand_calls=expand)
 
         def done(result):
             if isinstance(result, Exception):
@@ -1898,7 +2518,112 @@ class DecompilerTab(ttk.Frame):
             self._colorize(result)
             self.status_var.set(f"\u2705 Decompiled {func}")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
+
+    def _disasm_one(self):
+        """Disassemble a function showing annotated x86 assembly."""
+        path = self._get_pe()
+        func = self._get_func()
+        if not path or not func:
+            messagebox.showwarning("Missing", "Select PE and enter function name/RVA.")
+            return
+        syms = self._loaded_symbols if self._loaded_symbols else None
+        self.output.new_tab(f"ASM: {func}")
+
+        def work():
+            return _behavior().disassemble_function(path, func)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(self.output, f"  Function '{func}' not found.\n", "error")
+                self.status_var.set("\u274C Not found")
+                return
+            for line in result.split('\n'):
+                if line.startswith(';'):
+                    output_write(self.output, line + '\n', "dim")
+                elif '; \u2192' in line:
+                    output_write(self.output, line + '\n', "peach")
+                elif 'call' in line.lower():
+                    output_write(self.output, line + '\n', "ok")
+                elif 'ret' in line or 'retn' in line:
+                    output_write(self.output, line + '\n', "warn")
+                elif 'jmp' in line or line.strip().startswith('j'):
+                    output_write(self.output, line + '\n', "peach")
+                else:
+                    output_write(self.output, line + '\n')
+            self.status_var.set(f"\u2705 Assembly: {func}")
+
+        run_with_progress(self, work, done)
+
+    def _hexdump_one(self):
+        """Show raw hex dump of a function's machine code."""
+        path = self._get_pe()
+        func = self._get_func()
+        if not path or not func:
+            messagebox.showwarning("Missing", "Select PE and enter function name/RVA.")
+            return
+        self.output.new_tab(f"HEX: {func}")
+
+        def work():
+            import pefile
+            pe = pefile.PE(path, fast_load=False)
+            rva = None
+            if isinstance(func, str) and (func.startswith('0x') or func.startswith('0X')):
+                rva = int(func, 16)
+            elif hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if exp.name and exp.name.decode('ascii', errors='replace') == func:
+                        rva = exp.address
+                        break
+            if rva is None:
+                pe.close()
+                return None
+            img_base = pe.OPTIONAL_HEADER.ImageBase
+            va = img_base + rva
+            offset = pe.get_offset_from_rva(rva)
+            data = pe.get_data(rva, min(4096, len(pe.__data__) - offset))
+            pe.close()
+            return (data, va, rva)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(self.output, f"  Function '{func}' not found.\n", "error")
+                self.status_var.set("\u274C Not found")
+                return
+            data, va, rva = result
+            output_write(self.output, f"  HEX DUMP: {func}\n", "title")
+            output_write(self.output, f"  RVA: 0x{rva:08X}  VA: 0x{va:08X}  Size: {len(data)} bytes\n\n", "dim")
+            output_write(self.output, f"  {'Offset':<12} {'Hex':<50} {'ASCII'}\n", "heading")
+            output_write(self.output, f"  {'\u2500'*12} {'\u2500'*50} {'\u2500'*16}\n", "dim")
+            for i in range(0, min(len(data), 2048), 16):
+                chunk = data[i:i+16]
+                hex_str = ' '.join(f'{b:02X}' for b in chunk)
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                addr = va + i
+                # Colorize: highlight CC (int3), C3 (ret), E8 (call)
+                tag = None
+                if b'\xC3' in chunk:
+                    tag = "warn"
+                elif b'\xE8' in chunk:
+                    tag = "ok"
+                elif b'\xCC' in chunk:
+                    tag = "error"
+                output_write(self.output, f"  {addr:08X}     {hex_str:<50s} {ascii_str}\n", tag)
+                if b'\xC3' in chunk or b'\xCC' in chunk:
+                    # Likely end of function
+                    if i > 32:
+                        break
+            self.status_var.set(f"\u2705 Hex dump: {func} ({min(len(data), 2048)} bytes)")
+
+        run_with_progress(self, work, done)
 
     def _discover(self):
         path = self._get_pe()
@@ -1910,7 +2635,7 @@ class DecompilerTab(ttk.Frame):
         except ValueError:
             mx = 50
         self.status_var.set(f"\u23F3 Discovering functions (max {mx})...")
-        output_clear(self.output)
+        self.output.new_tab("Discover")
 
         def work():
             return _decompiler().decompile_no_symbols(path, max_funcs=mx)
@@ -1926,7 +2651,7 @@ class DecompilerTab(ttk.Frame):
                 output_write(self.output, "\n")
             self.status_var.set(f"\u2705 Discovered {len(result)} functions")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _batch(self):
         path = self._get_pe()
@@ -1938,10 +2663,11 @@ class DecompilerTab(ttk.Frame):
         except ValueError:
             mx = 100
         self.status_var.set(f"\u23F3 Batch decompiling exports (max {mx})...")
-        output_clear(self.output)
+        self.output.new_tab("Batch")
 
         def work():
-            return _decompiler().batch_decompile(path, max_funcs=mx)
+            syms = self._loaded_symbols if self._loaded_symbols else None
+            return _decompiler().batch_decompile(path, max_funcs=mx, symbols=syms)
 
         def done(result):
             if isinstance(result, Exception):
@@ -1954,7 +2680,7 @@ class DecompilerTab(ttk.Frame):
                 output_write(self.output, "\n")
             self.status_var.set(f"\u2705 Decompiled {len(result)} exports")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _save(self):
         content = self.output.get("1.0", "end-1c")
@@ -2034,13 +2760,12 @@ class CompatAnalyzerTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Save Report",
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 Deep NT version compatibility analysis \u2014 detects syscall, calling convention, and structure differences")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=4, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Deep NT version compatibility analysis \u2014 detects syscall, calling convention, and structure differences", row=4)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _analyze_both(self):
@@ -2050,7 +2775,7 @@ class CompatAnalyzerTab(ttk.Frame):
             return
         la, lb = self.label_a_var.get(), self.label_b_var.get()
         self.status_var.set("\u23F3 Analyzing compatibility...")
-        output_clear(self.output)
+        self.output.new_tab("Compat Analysis")
 
         def work():
             return _compat().compare_compat(pa, pb, la, lb)
@@ -2066,7 +2791,7 @@ class CompatAnalyzerTab(ttk.Frame):
             warnings = sum(1 for i in report.issues if i.severity == "warning")
             self.status_var.set(f"\u2705 Done: {critical} critical, {warnings} warnings")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _analyze_single(self):
         pa = self._get_a()
@@ -2075,7 +2800,7 @@ class CompatAnalyzerTab(ttk.Frame):
             return
         la = self.label_a_var.get()
         self.status_var.set("\u23F3 Analyzing single PE...")
-        output_clear(self.output)
+        self.output.new_tab("Single Analysis")
 
         def work():
             return _compat().analyze_single_pe(pa, la)
@@ -2107,10 +2832,10 @@ class CompatAnalyzerTab(ttk.Frame):
                 output_write(self.output, f"  {s['name']:<10} vsize=0x{s['vsize']:X}  raw=0x{s['rsize']:X}\n")
             self.status_var.set("\u2705 Done")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _show_known(self):
-        output_clear(self.output)
+        self.output.new_tab("Known APIs")
         diffs = _compat().get_known_differences()
         output_write(self.output, "KNOWN NT 5.0 \u2192 5.1 DIFFERENCES\n", "title")
         output_write(self.output, "\n\u2500\u2500 Calling Convention Changes \u2500\u2500\n", "heading")
@@ -2136,7 +2861,7 @@ class CompatAnalyzerTab(ttk.Frame):
         code = askstring("Bugcheck Lookup", "Enter bugcheck code (hex):\n\nExample: 0xA5, 0x7F, 0x0A", parent=self)
         if not code:
             return
-        output_clear(self.output)
+        self.output.new_tab("Bugcheck")
         result = _compat().diagnose_bugcheck(code)
         output_write(self.output, f"Bugcheck: {result['code']}\n", "title")
         output_write(self.output, f"Name: {result.get('name', 'Unknown')}\n", "warn")
@@ -2185,7 +2910,1256 @@ class CompatAnalyzerTab(ttk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Tab 13: PE Patcher (KernelEx Ultimate Edition)
+#  Progress Dialog — Modal dialog with percentage and current-item display
+# ══════════════════════════════════════════════════════════════════════════
+
+class ProgressDialog(tk.Toplevel):
+    """Modal progress dialog with percentage, current operation, and cancel."""
+
+    def __init__(self, parent, title="Analyzing..."):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("520x180")
+        self.resizable(False, False)
+        self.configure(bg=T["bg"])
+        self.transient(parent)
+        self.grab_set()
+        self.cancelled = False
+
+        # Center on parent
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width() // 2 - 260
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - 90
+        self.geometry(f"+{px}+{py}")
+
+        self.op_var = tk.StringVar(value="Initializing...")
+        self.item_var = tk.StringVar(value="")
+        self.pct_var = tk.IntVar(value=0)
+
+        ttk.Label(self, textvariable=self.op_var,
+                  font=("Segoe UI", 11, "bold")).pack(padx=20, pady=(18, 4), anchor="w")
+
+        self.bar = ttk.Progressbar(self, mode='determinate',
+                                    maximum=100, variable=self.pct_var, length=480)
+        self.bar.pack(padx=20, pady=6)
+
+        self.item_lbl = ttk.Label(self, textvariable=self.item_var,
+                                   foreground=T["fg_dim"], font=("Consolas", 9))
+        self.item_lbl.pack(padx=20, anchor="w")
+
+        btn_frm = tk.Frame(self, bg=T["bg"])
+        btn_frm.pack(pady=(8, 12))
+        self.pct_lbl = ttk.Label(btn_frm, text="0%", font=("Segoe UI", 10, "bold"))
+        self.pct_lbl.pack(side="left", padx=(0, 20))
+        ttk.Button(btn_frm, text="Cancel", command=self._cancel).pack(side="left")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def update_progress(self, message, pct, item=""):
+        """Thread-safe progress update. Call from any thread."""
+        def _update():
+            self.op_var.set(message)
+            self.pct_var.set(min(int(pct), 100))
+            self.pct_lbl.configure(text=f"{min(int(pct), 100)}%")
+            if item:
+                self.item_var.set(item)
+        try:
+            self.after(0, _update)
+        except tk.TclError:
+            pass
+
+    def _cancel(self):
+        self.cancelled = True
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+    def close(self):
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+def run_with_progress_dialog(parent, title, work_fn, done_fn):
+    """Run work_fn(progress_callback) in a thread with a modal progress dialog.
+    progress_callback(message, pct) updates the dialog.
+    done_fn(result) is called on the main thread when done."""
+    dlg = ProgressDialog(parent, title)
+
+    def progress_cb(message, pct):
+        if dlg.cancelled:
+            return
+        dlg.update_progress(message, pct)
+
+    def runner():
+        try:
+            result = work_fn(progress_cb)
+        except Exception as e:
+            result = e
+        def finish():
+            dlg.close()
+            done_fn(result)
+        try:
+            parent.after(0, finish)
+        except tk.TclError:
+            pass
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Tab 13: Deep Function Analyzer
+# ══════════════════════════════════════════════════════════════════════════
+
+class DeepAnalyzerTab(ttk.Frame):
+    """Deep analysis: discover ALL functions (exported + internal),
+    profile each one, browse cross-references, view code, and port."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, style="TFrame")
+        self.app = app
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(10, weight=1)
+        self._func_map = None
+        self._history = []       # list of (title, output_text) for back/forward
+        self._history_idx = -1
+
+        _, self._get_pe, self.pe_var = make_file_picker(
+            self, "PE File:", row=0,
+            placeholder=EXAMPLES["pe"], app=app)
+
+        # Function filter / search
+        func_frm = tk.Frame(self, bg=T["bg"])
+        func_frm.grid(row=1, column=0, sticky="ew", padx=12, pady=5)
+        func_frm.columnconfigure(1, weight=1)
+        ttk.Label(func_frm, text="Function:", width=16, anchor="e").grid(row=0, column=0, padx=(0, 8))
+        self.func_var = tk.StringVar()
+        ent = PlaceholderEntry(func_frm, placeholder="e.g.  NtCreateFile, sub_77F81234",
+                               textvariable=self.func_var,
+                               bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                               font=("Consolas", 10), relief="flat", bd=5)
+        ent.grid(row=0, column=1, sticky="ew")
+        app.register_placeholder(ent)
+        self._func_entry = ent
+
+        # Buttons row 1: Main actions
+        btn_frm = make_button_bar(self, row=2)
+        ttk.Button(btn_frm, text="\U0001F50D  Discover All Functions", style="Accent.TButton",
+                   command=self._discover).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4CB  Profile",
+                   command=self._profile).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F517  XRefs",
+                   command=self._show_xrefs).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4BB  Code",
+                   command=self._show_code).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4E6  Dependencies",
+                   command=self._show_deps).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4CA  Statistics",
+                   command=self._statistics).pack(side="left", padx=5)
+
+        # Buttons row 2: Compare + navigation
+        btn_frm2 = make_button_bar(self, row=3)
+        ttk.Button(btn_frm2, text="\u2194  Deep Compare",
+                   command=self._deep_compare).pack(side="left", padx=5)
+        ttk.Button(btn_frm2, text="\U0001F4CA  Batch Compare",
+                   command=self._batch_deep).pack(side="left", padx=5)
+        ttk.Button(btn_frm2, text="\u25C0 Back",
+                   command=self._history_back).pack(side="left", padx=(20, 3))
+        ttk.Button(btn_frm2, text="Forward \u25B6",
+                   command=self._history_forward).pack(side="left", padx=3)
+        ttk.Button(btn_frm2, text="\u2716  Clear",
+                   command=lambda: self.output.close_all()).pack(side="left", padx=(20, 5))
+
+        # Compare with file picker
+        _, self._get_pe_b, self.pe_b_var = make_file_picker(
+            self, "Compare with:", row=4,
+            placeholder=EXAMPLES["ros_dll"], app=app)
+
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Deep analysis: discover internal functions, profile, XRefs, code, dependencies", row=5)
+
+        # Options row
+        opt_frm = tk.Frame(self, bg=T["bg"])
+        opt_frm.grid(row=6, column=0, sticky="w", padx=12, pady=3)
+        ttk.Label(opt_frm, text="Max functions:").pack(side="left", padx=5)
+        self.max_var = tk.StringVar(value="3000")
+        tk.Entry(opt_frm, textvariable=self.max_var, bg=T["entry_bg"], fg=T["fg"],
+                 insertbackground=T["fg"], font=("Consolas", 10), relief="flat",
+                 bd=5, width=8).pack(side="left", padx=5)
+        self.show_internal_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_frm, text="Show internal (private) functions",
+                        variable=self.show_internal_var).pack(side="left", padx=15)
+        self._hist_var = tk.StringVar(value="")
+        ttk.Label(opt_frm, textvariable=self._hist_var, foreground=T["fg_dim"]).pack(side="right", padx=15)
+
+        # Symbol file (optional)
+        sym_frm = tk.Frame(self, bg=T["bg"])
+        sym_frm.grid(row=7, column=0, sticky="ew", padx=12, pady=3)
+        ttk.Label(sym_frm, text="Symbols:", foreground=T["fg_dim"]).pack(side="left", padx=5)
+        self.sym_var = tk.StringVar()
+        sym_ent = PlaceholderEntry(sym_frm, placeholder="optional \u2014 .map / .pdb / .dbg for better names",
+                                   textvariable=self.sym_var,
+                                   bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                                   font=("Consolas", 10), relief="flat", bd=5)
+        sym_ent.pack(side="left", fill="x", expand=True, padx=5)
+        app.register_placeholder(sym_ent)
+        self._sym_entry = sym_ent
+        ttk.Button(sym_frm, text="Browse\u2026", command=self._browse_symbols).pack(side="left", padx=5)
+        ttk.Button(sym_frm, text="Load", command=self._load_symbols).pack(side="left", padx=3)
+
+        self.output = TabbedOutput(self)
+        self.output.grid(row=10, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        # Right-click context menu on output
+        self._context_menu = tk.Menu(self.output, tearoff=0,
+                                      bg=T["bg_light"], fg=T["fg"],
+                                      activebackground=T["accent"],
+                                      activeforeground=T["bg_dark"],
+                                      font=("Segoe UI", 10))
+        self.output.bind("<Button-3>", self._on_right_click)
+
+    def _get_func(self):
+        return self._func_entry.get_value()
+
+    def _browse_symbols(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Symbol files", "*.map *.pdb *.dbg *.sym"), ("All", "*.*")])
+        if path:
+            self._sym_entry.set_value(path)
+
+    def _load_symbols(self):
+        sym_path = self._sym_entry.get_value()
+        if not sym_path:
+            messagebox.showwarning("Missing", "Browse to a symbol file first.")
+            return
+        if not self._func_map:
+            messagebox.showwarning("Missing", "Run 'Discover All Functions' first.")
+            return
+        self.status_var.set("\u23F3 Loading symbols\u2026")
+        def work():
+            syms = _sym_loader().load_symbols(sym_path)
+            merged = 0
+            for sym in syms:
+                va = sym.get('address', 0)
+                name = sym.get('name', '')
+                if va in self._func_map.functions and name:
+                    self._func_map.functions[va].name = name
+                    self._func_map._va_to_name[va] = name
+                    merged += 1
+            return merged
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                return
+            self.status_var.set(f"\u2705 Loaded symbols: {result} functions renamed")
+        run_with_progress(self, work, done)
+
+    # \u2500\u2500 History system \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _save_to_history(self, title):
+        """Save current output to history."""
+        self.output.configure(state="normal")
+        text = self.output.get("1.0", "end-1c")
+        self.output.configure(state="disabled")
+        if self._history_idx < len(self._history) - 1:
+            self._history = self._history[:self._history_idx + 1]
+        self._history.append((title, text))
+        self._history_idx = len(self._history) - 1
+        self._update_hist_label()
+
+    def _history_back(self):
+        if self._history_idx > 0:
+            self._history_idx -= 1
+            title, text = self._history[self._history_idx]
+            output_clear(self.output)
+            output_write(self.output, text)
+            self.status_var.set(f"\u25C0 {title}")
+            self._update_hist_label()
+
+    def _history_forward(self):
+        if self._history_idx < len(self._history) - 1:
+            self._history_idx += 1
+            title, text = self._history[self._history_idx]
+            output_clear(self.output)
+            output_write(self.output, text)
+            self.status_var.set(f"\u25B6 {title}")
+            self._update_hist_label()
+
+    def _update_hist_label(self):
+        n = len(self._history)
+        if n > 0:
+            self._hist_var.set(f"History: {self._history_idx + 1}/{n}")
+        else:
+            self._hist_var.set("")
+
+    # \u2500\u2500 Right-click context menu \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _on_right_click(self, event):
+        try:
+            idx = self.output.index(f"@{event.x},{event.y}")
+            line = self.output.get(f"{idx} linestart", f"{idx} lineend").strip()
+        except tk.TclError:
+            line = ""
+        func_name = self._extract_func_name(line)
+        menu = self._context_menu
+        menu.delete(0, "end")
+        if func_name:
+            menu.add_command(label=f"\u25B8 Select: {func_name}",
+                             command=lambda fn=func_name: self._select_function(fn))
+            menu.add_separator()
+            menu.add_command(label="\U0001F4CB  Profile Function",
+                             command=lambda fn=func_name: self._action_on(fn, 'profile'))
+            menu.add_command(label="\U0001F4BB  View Code (Disassembly)",
+                             command=lambda fn=func_name: self._action_on(fn, 'code'))
+            menu.add_command(label="\U0001F517  Show Cross-References",
+                             command=lambda fn=func_name: self._action_on(fn, 'xrefs'))
+            menu.add_command(label="\U0001F4E6  Porting Dependencies",
+                             command=lambda fn=func_name: self._action_on(fn, 'deps'))
+            menu.add_separator()
+            menu.add_command(label="\U0001F9EC  Analyze Behavior",
+                             command=lambda fn=func_name: self._action_on(fn, 'behavior'))
+            menu.add_command(label="\U0001F500  Control Flow Analysis",
+                             command=lambda fn=func_name: self._action_on(fn, 'control_flow'))
+            menu.add_command(label="\U0001F4DC  Decompile to C",
+                             command=lambda fn=func_name: self._action_on(fn, 'decompile'))
+            menu.add_separator()
+            menu.add_command(label="\u2194  Deep Compare with File B",
+                             command=lambda fn=func_name: self._action_on(fn, 'deep_compare'))
+            menu.add_command(label="\U0001F50D  Scan System32 for Callers",
+                             command=lambda fn=func_name: self._action_on(fn, 'system_xref'))
+        else:
+            menu.add_command(label="(no function detected)", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="Copy Output", command=self._copy_output)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _extract_func_name(self, line):
+        """Extract a function name from a text line."""
+        line = line.strip()
+        if not line:
+            return None
+        m = re.match(r'^(\w+)\s+(EXPORT|internal|syscall|thunk)', line)
+        if m:
+            return m.group(1)
+        m = re.match(r'^[\u2192\u2190\u25B8]\s*(\S+)', line)
+        if m:
+            name = m.group(1)
+            return name.split('!')[-1] if '!' in name else name
+        m = re.search(r'\b(sub_[0-9A-Fa-f]{6,8})\b', line)
+        if m:
+            return m.group(1)
+        m = re.match(r'^([A-Z][a-zA-Z0-9_]+)', line)
+        if m and len(m.group(1)) >= 3:
+            return m.group(1)
+        return None
+
+    def _select_function(self, func_name):
+        self._func_entry.set_value(func_name)
+
+    def _action_on(self, func_name, action):
+        self._func_entry.set_value(func_name)
+        actions = {
+            'profile': self._profile, 'code': self._show_code,
+            'xrefs': self._show_xrefs, 'deps': self._show_deps,
+            'behavior': lambda: self._cross_tab_behavior(func_name),
+            'control_flow': lambda: self._cross_tab_control_flow(func_name),
+            'decompile': lambda: self._cross_tab_decompile(func_name),
+            'deep_compare': self._deep_compare,
+            'system_xref': lambda: self._cross_tab_system_xref(func_name),
+        }
+        fn = actions.get(action)
+        if fn:
+            fn()
+
+    def _copy_output(self):
+        self.output.configure(state="normal")
+        text = self.output.get("1.0", "end-1c")
+        self.output.configure(state="disabled")
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set("Copied to clipboard")
+
+    # \u2500\u2500 Cross-tab actions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _cross_tab_behavior(self, func_name):
+        pe_path = self._get_pe()
+        if not pe_path:
+            return
+        self.status_var.set(f"\u23F3 Analyzing behavior of {func_name}\u2026")
+        self.output.new_tab("Behavior")
+        def work():
+            return _behavior().detect_api_patterns(pe_path, func_name)
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(self.output, f"  Function '{func_name}' not found in exports.\n", "error")
+                self.status_var.set("\u274C Not found (must be exported for behavior analysis)")
+                return
+            output_write(self.output, f"  BEHAVIOR PATTERNS: {func_name}\n\n", "title")
+            fp = result['fingerprint']
+            output_write(self.output, f"  Instructions: {fp.total_insns}  |  Blocks: {fp.block_count}\n")
+            if fp.syscall_number is not None:
+                output_write(self.output, f"  Syscall: 0x{fp.syscall_number:X}\n", "ok")
+            for ptype, pdesc in result['patterns']:
+                output_write(self.output, f"    [{ptype}] {pdesc}\n", "peach")
+            if fp.api_calls:
+                output_write(self.output, f"\n  API calls ({len(fp.api_calls)}):\n", "heading")
+                for call in fp.api_calls:
+                    output_write(self.output, f"    \u2192 {call}\n", "peach")
+            self._save_to_history(f"Behavior: {func_name}")
+            self.status_var.set(f"\u2705 Behavior: {func_name}")
+        run_with_progress(self, work, done)
+
+    def _cross_tab_control_flow(self, func_name):
+        pe_path = self._get_pe()
+        if not pe_path:
+            return
+        self.status_var.set(f"\u23F3 Control flow of {func_name}\u2026")
+        self.output.new_tab("Control Flow")
+        def work():
+            return _behavior().analyze_control_flow(pe_path, func_name)
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(self.output, f"  Function '{func_name}' not found.\n", "error")
+                return
+            report = _behavior().format_control_flow(result)
+            for line in report.split('\n'):
+                output_write(self.output, line + '\n')
+            self._save_to_history(f"ControlFlow: {func_name}")
+            self.status_var.set(f"\u2705 Control flow: {func_name}")
+        run_with_progress(self, work, done)
+
+    def _cross_tab_decompile(self, func_name):
+        pe_path = self._get_pe()
+        if not pe_path:
+            return
+        self.status_var.set(f"\u23F3 Decompiling {func_name}\u2026")
+        self.output.new_tab("Decompile")
+        def work():
+            dec = _decompiler().X86Decompiler(pe_path)
+            return dec.decompile(func_name)
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            output_write(self.output, f"  // Decompiled: {func_name}\n\n", "title")
+            output_write(self.output, result + '\n')
+            self._save_to_history(f"Decompile: {func_name}")
+            self.status_var.set(f"\u2705 Decompiled: {func_name}")
+        run_with_progress(self, work, done)
+
+    def _cross_tab_system_xref(self, func_name):
+        scan_dir = r"C:\WINNT\System32"
+        if not os.path.isdir(scan_dir):
+            scan_dir = r"C:\Windows\System32"
+        if not os.path.isdir(scan_dir):
+            messagebox.showwarning("Missing", "Cannot find System32 directory.")
+            return
+        self.output.new_tab("System XRef")
+        pe_exts = {'.dll', '.sys', '.exe', '.drv', '.cpl', '.ocx', '.scr'}
+        pe_files = [os.path.join(scan_dir, f) for f in os.listdir(scan_dir)
+                    if os.path.splitext(f)[1].lower() in pe_exts]
+        def work(progress_cb):
+            return _deep_analyzer().scan_system_xrefs_detailed(
+                func_name, pe_files, progress_callback=progress_cb)
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            output_write(self.output, f"  SYSTEM-WIDE XREF: {func_name}\n", "title")
+            output_write(self.output, f"  {len(result)} PE files reference {func_name}\n\n", "ok")
+            hdr = f"  {'PE File':<40} {'Import From':<30} {'IAT Address':<16} {'Type'}\n"
+            output_write(self.output, hdr, "heading")
+            sep = f"  {'\u2500'*40} {'\u2500'*30} {'\u2500'*16} {'\u2500'*10}\n"
+            output_write(self.output, sep, "dim")
+            for xref in result:
+                iat = f"0x{xref.caller_va:08X}" if xref.caller_va else "N/A"
+                output_write(self.output,
+                    f"  {xref.caller_name:<40} {xref.callee_name:<30} {iat:<16} {xref.xref_type}\n")
+            self._save_to_history(f"SystemXRef: {func_name}")
+            self.status_var.set(f"\u2705 Found {len(result)} references to {func_name}")
+        run_with_progress_dialog(self.app, f"Scanning for {func_name}\u2026", work, done)
+
+    # \u2500\u2500 New analysis methods \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _show_code(self):
+        """Show full annotated disassembly of a function."""
+        func_name = self._get_func()
+        if not func_name:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+        if not self._func_map:
+            pe_path = self._get_pe()
+            if not pe_path:
+                messagebox.showwarning("Missing", "Run 'Discover All Functions' first, or select a PE file.")
+                return
+            self.status_var.set(f"\u23F3 Loading {func_name}\u2026")
+            def work(progress_cb):
+                fm = _deep_analyzer().PEFunctionMap(pe_path, progress_callback=progress_cb)
+                fm.discover_all_functions()
+                fm.analyze_all_functions()
+                fm.build_xrefs()
+                return fm
+            def done(result):
+                if isinstance(result, Exception):
+                    self.status_var.set(f"\u274C Error: {result}")
+                    return
+                self._func_map = result
+                self._show_code_impl(func_name)
+            run_with_progress_dialog(self.app, "Loading PE\u2026", work, done)
+            return
+        self._show_code_impl(func_name)
+
+    def _show_code_impl(self, func_name):
+        self.output.new_tab("Code")
+        code = _deep_analyzer().disassemble_function_full(self._func_map, func_name)
+        if code is None:
+            output_write(self.output, f"  Function '{func_name}' not found.\n", "error")
+            self.status_var.set("\u274C Not found")
+            return
+        for line in code.split('\n'):
+            if line.startswith(';'):
+                output_write(self.output, line + '\n', "dim")
+            elif '; \u2192' in line:
+                output_write(self.output, line + '\n', "peach")
+            elif '; arg' in line:
+                output_write(self.output, line + '\n', "ok")
+            elif '; local_' in line:
+                output_write(self.output, line + '\n', "warn")
+            elif 'call' in line.lower():
+                output_write(self.output, line + '\n', "ok")
+            elif line.split() and len(line.split()) > 1 and line.split()[1].startswith('ret'):
+                output_write(self.output, line + '\n', "warn")
+            else:
+                output_write(self.output, line + '\n')
+        self._save_to_history(f"Code: {func_name}")
+        self.status_var.set(f"\u2705 Code: {func_name}")
+
+    def _show_deps(self):
+        """Show porting dependencies for a function."""
+        func_name = self._get_func()
+        if not func_name:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+        if not self._func_map:
+            messagebox.showwarning("Missing", "Run 'Discover All Functions' first.")
+            return
+        self.output.new_tab("Dependencies")
+        deps = _deep_analyzer().get_function_dependencies(self._func_map, func_name)
+        if not deps:
+            output_write(self.output, f"  Function '{func_name}' not found.\n", "error")
+            self.status_var.set("\u274C Not found")
+            return
+        report = _deep_analyzer().format_dependencies(deps)
+        for line in report.split('\n'):
+            if '\u26A0' in line:
+                output_write(self.output, line + '\n', "warn")
+            elif '\u2713' in line:
+                output_write(self.output, line + '\n', "ok")
+            elif 'PORTING' in line or 'SUMMARY' in line:
+                output_write(self.output, line + '\n', "title")
+            elif line.strip().startswith('\u2192'):
+                output_write(self.output, line + '\n', "peach")
+            elif line.strip().startswith('\u2190'):
+                output_write(self.output, line + '\n', "warn")
+            elif '\u2500' in line or '=' * 10 in line:
+                output_write(self.output, line + '\n', "dim")
+            elif any(h in line for h in ('API IMPORTS', 'INTERNAL CALLS', 'STRUCTURE',
+                                          'DATA REF', 'STRING REF', 'CALLERS', 'SUB-DEP')):
+                output_write(self.output, line + '\n', "heading")
+            else:
+                output_write(self.output, line + '\n')
+        self._save_to_history(f"Dependencies: {func_name}")
+        self.status_var.set(f"\u2705 Dependencies: {func_name}")
+
+    # \u2500\u2500 Core operations \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _discover(self):
+        """Discover ALL functions in the PE — exports + internal via prologue scan."""
+        pe_path = self._get_pe()
+        if not pe_path:
+            messagebox.showwarning("Missing", "Select a PE file.")
+            return
+        self.output.new_tab("Discover")
+
+        def work(progress_cb):
+            fm = _deep_analyzer().PEFunctionMap(pe_path, progress_callback=progress_cb)
+            fm.discover_all_functions()
+            progress_cb("Analyzing all functions...", 30)
+            try:
+                max_f = int(self.max_var.get())
+            except ValueError:
+                max_f = 3000
+            fm.analyze_all_functions(max_functions=max_f)
+            progress_cb("Building cross-references...", 75)
+            fm.build_xrefs()
+            progress_cb("Done", 100)
+            return fm
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            self._func_map = result
+            fm = result
+            funcs = fm.functions
+            n_exp = sum(1 for f in funcs.values() if f.is_exported)
+            n_int = sum(1 for f in funcs.values() if not f.is_exported)
+            n_sys = sum(1 for f in funcs.values() if f.is_syscall_stub)
+            n_thunk = sum(1 for f in funcs.values() if f.is_thunk)
+
+            output_write(self.output, f"  DEEP FUNCTION DISCOVERY: {os.path.basename(pe_path)}\n", "title")
+            output_write(self.output, f"  {'='*65}\n\n", "dim")
+            output_write(self.output, f"  Total functions found: {len(funcs)}\n", "ok")
+            output_write(self.output, f"    Exported (public):  {n_exp}\n", "ok")
+            output_write(self.output, f"    Internal (private): {n_int}\n", "warn")
+            output_write(self.output, f"    Syscall stubs:      {n_sys}\n")
+            output_write(self.output, f"    Thunks/forwarders:  {n_thunk}\n")
+            output_write(self.output, f"    Cross-references:   {len(fm.xrefs)}\n")
+            output_write(self.output, f"\n  {'\u2500'*65}\n", "dim")
+            output_write(self.output, "  Right-click any function for actions (profile, code, xrefs, decompile\u2026)\n\n", "dim")
+
+            show_int = self.show_internal_var.get()
+            output_write(self.output, f"\n  {'Name':<40} {'Type':<10} {'Conv':<10} "
+                         f"{'Args':<6} {'Size':<8} {'Blocks':<8} {'Callers':<8} {'Calls'}\n", "heading")
+            output_write(self.output, f"  {'\u2500'*40} {'\u2500'*10} {'\u2500'*10} "
+                         f"{'\u2500'*6} {'\u2500'*8} {'\u2500'*8} {'\u2500'*8} {'\u2500'*8}\n", "dim")
+
+            for va, func in funcs.items():
+                if not show_int and not func.is_exported:
+                    continue
+                ftype = "EXPORT" if func.is_exported else "internal"
+                if func.is_syscall_stub:
+                    ftype = f"syscall"
+                elif func.is_thunk:
+                    ftype = "thunk"
+                tag = "ok" if func.is_exported else "dim"
+                line = (f"  {func.name:<40} {ftype:<10} {func.calling_convention:<10} "
+                        f"{func.n_args:<6} {func.size:<8} {func.n_basic_blocks:<8} "
+                        f"{len(func.called_by):<8} {len(func.calls_out)}\n")
+                output_write(self.output, line, tag)
+
+            self._save_to_history(f"Discover: {os.path.basename(pe_path)}")
+            self.status_var.set(f"\u2705 Found {len(funcs)} functions "
+                               f"({n_exp} exported, {n_int} internal, {len(fm.xrefs)} xrefs)")
+
+        run_with_progress_dialog(self.app, f"Analyzing {os.path.basename(pe_path)}...", work, done)
+
+    def _profile(self):
+        """Show detailed profile of a single function."""
+        func_name = self._get_func()
+        if not func_name:
+            messagebox.showwarning("Missing", "Enter a function name (e.g. NtCreateFile, sub_77F81234).")
+            return
+
+        if self._func_map:
+            func = self._func_map.find_function_by_name(func_name)
+            if func:
+                self.output.new_tab("Profile")
+                report = _deep_analyzer().format_function_profile_with_map(func, self._func_map)
+                for line in report.split('\n'):
+                    if line.strip().startswith('='):
+                        output_write(self.output, line + '\n', "dim")
+                    elif 'API IMPORTS' in line or 'INTERNAL CALLS' in line or 'CALLED BY' in line \
+                            or 'STRING REF' in line or 'STRUCTURE' in line or 'DATA REF' in line:
+                        output_write(self.output, line + '\n', "heading")
+                    elif line.strip().startswith('\u2192'):
+                        output_write(self.output, line + '\n', "peach")
+                    elif line.strip().startswith('\u2190'):
+                        output_write(self.output, line + '\n', "warn")
+                    elif 'EXPORTED' in line or 'INTERNAL' in line:
+                        output_write(self.output, line + '\n', "title")
+                    else:
+                        output_write(self.output, line + '\n')
+                self._save_to_history(f"Profile: {func_name}")
+                self.status_var.set(f"\u2705 Profile: {func_name}")
+                return
+
+        # No cached map — analyze just this function from PE
+        pe_path = self._get_pe()
+        if not pe_path:
+            messagebox.showwarning("Missing", "Run 'Discover All Functions' first, or select a PE file.")
+            return
+        self.status_var.set(f"\u23F3 Profiling {func_name}...")
+        self.output.new_tab(f"Profile: {func_name}")
+
+        def work(progress_cb):
+            fm = _deep_analyzer().PEFunctionMap(pe_path, progress_callback=progress_cb)
+            fm.discover_all_functions()
+            func = fm.find_function_by_name(func_name)
+            if func:
+                fm.analyze_function(func.va)
+                fm.build_xrefs()
+            return (fm, func)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            fm, func = result
+            self._func_map = fm
+            if not func:
+                output_write(self.output, f"  Function '{func_name}' not found.\n", "error")
+                self.status_var.set("\u274C Function not found")
+                return
+            report = _deep_analyzer().format_function_profile_with_map(func, fm)
+            for line in report.split('\n'):
+                output_write(self.output, line + '\n')
+            self._save_to_history(f"Profile: {func_name}")
+            self.status_var.set(f"\u2705 Profile: {func_name}")
+
+        run_with_progress_dialog(self.app, f"Profiling {func_name}...", work, done)
+
+    def _show_xrefs(self):
+        """Show all cross-references for a function."""
+        func_name = self._get_func()
+        if not func_name:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+        if not self._func_map:
+            messagebox.showwarning("Missing", "Run 'Discover All Functions' first.")
+            return
+
+        func = self._func_map.find_function_by_name(func_name)
+        if not func:
+            self.output.new_tab("XRefs")
+            output_write(self.output, f"  Function '{func_name}' not found.\n", "error")
+            return
+
+        self.output.new_tab("XRefs")
+        output_write(self.output, f"  CROSS-REFERENCES: {func_name}\n", "title")
+        output_write(self.output, f"  {'='*65}\n\n", "dim")
+
+        # Inbound: who calls this function
+        callers = self._func_map.get_callers_of(func.va)
+        output_write(self.output, f"  CALLERS ({len(callers)})  \u2014  who calls {func_name}:\n", "heading")
+        output_write(self.output, f"  {'\u2500'*60}\n", "dim")
+        if callers:
+            for xref in callers:
+                output_write(self.output, f"    \u2190 {xref.caller_name}  ({xref.xref_type})\n", "warn")
+        else:
+            output_write(self.output, "    (no callers found in this PE)\n", "dim")
+
+        # Outbound: what does this function call
+        callees = self._func_map.get_callees_of(func.va)
+        output_write(self.output, f"\n  CALLEES ({len(callees)})  \u2014  what {func_name} calls:\n", "heading")
+        output_write(self.output, f"  {'\u2500'*60}\n", "dim")
+        if callees:
+            for xref in callees:
+                output_write(self.output, f"    \u2192 {xref.callee_name}  ({xref.xref_type})\n", "peach")
+        else:
+            output_write(self.output, "    (no outbound calls)\n", "dim")
+
+        # API imports
+        if func.api_imports:
+            output_write(self.output, f"\n  API IMPORTS ({len(func.api_imports)}):\n", "heading")
+            output_write(self.output, f"  {'\u2500'*60}\n", "dim")
+            for api in sorted(set(func.api_imports)):
+                output_write(self.output, f"    \u2192 {api}\n", "ok")
+
+        self._save_to_history(f"XRefs: {func_name}")
+        self.status_var.set(f"\u2705 XRefs: {len(callers)} callers, {len(callees)} callees")
+
+    def _statistics(self):
+        """Show statistics about the analyzed PE."""
+        if not self._func_map:
+            messagebox.showwarning("Missing", "Run 'Discover All Functions' first.")
+            return
+        fm = self._func_map
+        funcs = fm.functions
+
+        self.output.new_tab("Statistics")
+        output_write(self.output, f"  DEEP ANALYSIS STATISTICS\n", "title")
+        output_write(self.output, f"  {'='*65}\n\n", "dim")
+
+        # Basic counts
+        n_exp = sum(1 for f in funcs.values() if f.is_exported)
+        n_int = sum(1 for f in funcs.values() if not f.is_exported)
+        n_sys = sum(1 for f in funcs.values() if f.is_syscall_stub)
+        n_thunk = sum(1 for f in funcs.values() if f.is_thunk)
+        output_write(self.output, f"  Functions: {len(funcs)} total  ({n_exp} exported, {n_int} internal)\n")
+        output_write(self.output, f"  Syscall stubs: {n_sys}  |  Thunks: {n_thunk}\n")
+        output_write(self.output, f"  Cross-references: {len(fm.xrefs)}\n\n")
+
+        # Calling convention breakdown
+        conv_counts = {}
+        for f in funcs.values():
+            c = f.calling_convention or "unknown"
+            conv_counts[c] = conv_counts.get(c, 0) + 1
+        output_write(self.output, f"  CALLING CONVENTIONS:\n", "heading")
+        for conv, cnt in sorted(conv_counts.items(), key=lambda x: -x[1]):
+            output_write(self.output, f"    {conv:<12} {cnt}\n")
+
+        # Most-called functions (hotspots)
+        output_write(self.output, f"\n  TOP 20 MOST-CALLED FUNCTIONS (hotspots):\n", "heading")
+        output_write(self.output, f"  {'\u2500'*60}\n", "dim")
+        by_callers = sorted(funcs.values(), key=lambda f: len(f.called_by), reverse=True)
+        for f in by_callers[:20]:
+            if not f.called_by:
+                break
+            tag = "ok" if f.is_exported else "warn"
+            output_write(self.output, f"    {f.name:<45} {len(f.called_by)} callers\n", tag)
+
+        # Largest functions
+        output_write(self.output, f"\n  TOP 20 LARGEST FUNCTIONS (most complex):\n", "heading")
+        output_write(self.output, f"  {'\u2500'*60}\n", "dim")
+        by_size = sorted(funcs.values(), key=lambda f: f.n_instructions, reverse=True)
+        for f in by_size[:20]:
+            output_write(self.output, f"    {f.name:<45} {f.n_instructions} insns, "
+                         f"{f.n_basic_blocks} blocks\n")
+
+        # Functions with most API calls
+        output_write(self.output, f"\n  TOP 20 MOST API-HEAVY FUNCTIONS:\n", "heading")
+        output_write(self.output, f"  {'\u2500'*60}\n", "dim")
+        by_api = sorted(funcs.values(), key=lambda f: len(f.api_imports), reverse=True)
+        for f in by_api[:20]:
+            if not f.api_imports:
+                break
+            output_write(self.output, f"    {f.name:<45} {len(f.api_imports)} API calls\n", "peach")
+
+        self._save_to_history("Statistics")
+        self.status_var.set(f"\u2705 Statistics for {len(funcs)} functions")
+
+    def _deep_compare(self):
+        """Deep compare a single function between two PEs."""
+        func_name = self._get_func()
+        pe_a = self._get_pe()
+        pe_b = self._get_pe_b()
+        if not func_name or not pe_a or not pe_b:
+            messagebox.showwarning("Missing",
+                                  "Select both PE files and enter a function name.")
+            return
+        self.output.new_tab("Deep Compare")
+
+        def work(progress_cb):
+            return _deep_analyzer().deep_compare_function(
+                pe_a, pe_b, func_name, progress_callback=progress_cb)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            report = _deep_analyzer().format_deep_compare(result)
+            for line in report.split('\n'):
+                if 'MATCH' in line:
+                    output_write(self.output, line + '\n', "ok")
+                elif 'MISMATCH' in line or 'DIFFERENT' in line:
+                    output_write(self.output, line + '\n', "error")
+                elif line.strip().startswith('\u2796'):
+                    output_write(self.output, line + '\n', "error")
+                elif line.strip().startswith('\u2795'):
+                    output_write(self.output, line + '\n', "ok")
+                elif '\u2500' in line or '=' * 10 in line:
+                    output_write(self.output, line + '\n', "dim")
+                elif 'SIGNATURE' in line or 'CODE' in line or 'API CALL' in line \
+                        or 'STRING' in line or 'STRUCTURE' in line or 'INTERNAL' in line:
+                    output_write(self.output, line + '\n', "heading")
+                else:
+                    output_write(self.output, line + '\n')
+            status = "\u2705 IDENTICAL" if result.hash_match else f"\u26A0 {result.block_similarity:.1f}% similar"
+            self._save_to_history(f"Compare: {func_name}")
+            self.status_var.set(f"{status} \u2014 {func_name}")
+
+        run_with_progress_dialog(self.app,
+                                 f"Deep comparing {func_name}...", work, done)
+
+    def _batch_deep(self):
+        """Batch deep compare all shared exports between two PEs."""
+        pe_a = self._get_pe()
+        pe_b = self._get_pe_b()
+        if not pe_a or not pe_b:
+            messagebox.showwarning("Missing", "Select both PE files.")
+            return
+        self.output.new_tab("Batch Deep")
+        self._batch_results = None
+        self._batch_fm_a = None
+        self._batch_fm_b = None
+
+        def work(progress_cb):
+            progress_cb("Loading PE A...", 5)
+            fm_a = _deep_analyzer().PEFunctionMap(pe_a, progress_callback=progress_cb)
+            fm_a.discover_all_functions()
+            fm_a.analyze_all_functions()
+            fm_a.build_xrefs()
+
+            progress_cb("Loading PE B...", 50)
+            fm_b = _deep_analyzer().PEFunctionMap(pe_b, progress_callback=progress_cb)
+            fm_b.discover_all_functions()
+            fm_b.analyze_all_functions()
+            fm_b.build_xrefs()
+
+            exports_a = {f.name: f for f in fm_a.functions.values() if f.is_exported}
+            exports_b = {f.name: f for f in fm_b.functions.values() if f.is_exported}
+            shared = sorted(set(exports_a.keys()) & set(exports_b.keys()))
+
+            results = []
+            for idx, name in enumerate(shared):
+                fa = exports_a[name]
+                fb = exports_b[name]
+                r = _deep_analyzer().DeepCompareResult(
+                    func_name=name,
+                    file_a=os.path.basename(pe_a),
+                    file_b=os.path.basename(pe_b),
+                )
+                r.n_args_a = fa.n_args
+                r.n_args_b = fb.n_args
+                r.conv_a = fa.calling_convention
+                r.conv_b = fb.calling_convention
+                r.sig_match = (fa.n_args == fb.n_args and
+                               fa.calling_convention == fb.calling_convention)
+                r.hash_match = (fa.normalized_hash == fb.normalized_hash)
+                r.insn_count_a = fa.n_instructions
+                r.insn_count_b = fb.n_instructions
+                max_i = max(fa.n_instructions, fb.n_instructions, 1)
+                min_i = min(fa.n_instructions, fb.n_instructions)
+                r.block_similarity = (min_i / max_i) * 100
+                r.apis_only_a = sorted(set(fa.api_imports) - set(fb.api_imports))
+                r.apis_only_b = sorted(set(fb.api_imports) - set(fa.api_imports))
+                r.apis_common = sorted(set(fa.api_imports) & set(fb.api_imports))
+                r.strings_only_a = sorted(set(s for _, s in fa.string_refs) - set(s for _, s in fb.string_refs))
+                r.strings_only_b = sorted(set(s for _, s in fb.string_refs) - set(s for _, s in fa.string_refs))
+                r.structs_only_a = sorted(set(fa.struct_accesses) - set(fb.struct_accesses))
+                r.structs_only_b = sorted(set(fb.struct_accesses) - set(fa.struct_accesses))
+                r.internal_calls_a = len(fa.calls_out)
+                r.internal_calls_b = len(fb.calls_out)
+                results.append(r)
+                if idx % 20 == 0:
+                    progress_cb(f"Comparing {name}...", 50 + int(50 * idx / max(len(shared), 1)))
+
+            return (fm_a, fm_b, results)
+
+        def done(payload):
+            if isinstance(payload, Exception):
+                self.status_var.set(f"\u274C Error: {payload}")
+                output_write(self.output, f"ERROR: {payload}\n", "error")
+                return
+            fm_a, fm_b, results = payload
+            self._batch_fm_a = fm_a
+            self._batch_fm_b = fm_b
+            self._batch_results = results
+
+            ba = os.path.basename(pe_a)
+            bb = os.path.basename(pe_b)
+            output_write(self.output, f"  BATCH DEEP FUNCTION COMPARISON\n", "title")
+            output_write(self.output, f"  A: {ba}   B: {bb}\n", "dim")
+            output_write(self.output, f"  {'='*100}\n", "dim")
+            output_write(self.output, "  Double-click any function to open side-by-side diff window\n\n", "dim")
+
+            output_write(self.output,
+                f"  {'Function':<40} {'Sig':<6} {'Sim%':<8} {'ArgsA':<7} {'ArgsB':<7} "
+                f"{'APIsA':<7} {'APIsB':<7} {'CallsA':<8} {'CallsB':<8} {'Code'}\n", "heading")
+            output_write(self.output,
+                f"  {'\u2500'*40} {'\u2500'*6} {'\u2500'*8} {'\u2500'*7} {'\u2500'*7} "
+                f"{'\u2500'*7} {'\u2500'*7} {'\u2500'*8} {'\u2500'*8} {'\u2500'*6}\n", "dim")
+
+            identical = 0
+            sig_mismatch = 0
+            for r in results:
+                sig = "\u2705" if r.sig_match else "\u274C"
+                code = "SAME" if r.hash_match else "DIFF"
+                tag = "ok" if r.hash_match else ("warn" if r.block_similarity >= 50 else "error")
+                if r.hash_match:
+                    identical += 1
+                if not r.sig_match:
+                    sig_mismatch += 1
+                total_apis_a = len(r.apis_only_a) + len(r.apis_common)
+                total_apis_b = len(r.apis_only_b) + len(r.apis_common)
+                line = (f"  {r.func_name:<40} {sig:<6} {r.block_similarity:>6.1f}% "
+                        f"{r.n_args_a:<7} {r.n_args_b:<7} "
+                        f"{total_apis_a:<7} {total_apis_b:<7} "
+                        f"{r.internal_calls_a:<8} {r.internal_calls_b:<8} {code}\n")
+                output_write(self.output, line, tag)
+
+            output_write(self.output, f"\n  {'='*100}\n", "dim")
+            output_write(self.output,
+                f"  Total: {len(results)} functions  |  "
+                f"Identical: {identical}  |  "
+                f"Signature mismatches: {sig_mismatch}\n", "title")
+
+            self._save_to_history("Batch Compare")
+            self.status_var.set(f"\u2705 Compared {len(results)} functions "
+                               f"({identical} identical, {sig_mismatch} sig mismatches)")
+
+            # Bind double-click on the output
+            self.output.bind("<Double-Button-1>", self._on_batch_dblclick)
+
+        run_with_progress_dialog(self.app, "Batch deep comparison...", work, done)
+
+    def _on_batch_dblclick(self, event):
+        """Open side-by-side diff window for the double-clicked function."""
+        if not self._batch_results:
+            return
+        try:
+            idx = self.output.index(f"@{event.x},{event.y}")
+            line = self.output.get(f"{idx} linestart", f"{idx} lineend").strip()
+        except tk.TclError:
+            return
+        func_name = self._extract_func_name(line)
+        if not func_name:
+            return
+        result = None
+        for r in self._batch_results:
+            if r.func_name == func_name:
+                result = r
+                break
+        if not result:
+            return
+        self._open_diff_window(func_name, result)
+
+    def _open_diff_window(self, func_name, result):
+        """Open a Toplevel window showing side-by-side disassembly diff."""
+        fm_a = self._batch_fm_a
+        fm_b = self._batch_fm_b
+        if not fm_a or not fm_b:
+            return
+
+        func_a = fm_a.find_function_by_name(func_name)
+        func_b = fm_b.find_function_by_name(func_name)
+
+        da = _deep_analyzer()
+        lines_a = da.get_disassembly_lines(fm_a, func_a) if func_a else []
+        lines_b = da.get_disassembly_lines(fm_b, func_b) if func_b else []
+
+        win = tk.Toplevel(self.app)
+        win.title(f"Deep Diff: {func_name}")
+        win.geometry("1400x800")
+        win.configure(bg=T["bg"])
+
+        # Header
+        hdr = tk.Frame(win, bg=T["bg_light"])
+        hdr.pack(fill="x", padx=5, pady=5)
+        sig_match = "\u2705 MATCH" if result.sig_match else "\u274C MISMATCH"
+        code_match = "\u2705 IDENTICAL" if result.hash_match else f"\u26A0 {result.block_similarity:.1f}% similar"
+        tk.Label(hdr, text=f"  {func_name}", font=("Consolas", 14, "bold"),
+                 bg=T["bg_light"], fg=T["accent"]).pack(side="left", padx=10)
+        tk.Label(hdr, text=f"Signature: {sig_match}   Code: {code_match}",
+                 font=("Segoe UI", 10), bg=T["bg_light"], fg=T["fg"]).pack(side="left", padx=20)
+
+        # Info panel
+        info = tk.Frame(win, bg=T["bg"])
+        info.pack(fill="x", padx=10, pady=3)
+        total_a = len(result.apis_only_a) + len(result.apis_common)
+        total_b = len(result.apis_only_b) + len(result.apis_common)
+        info_text = (
+            f"  A: {result.file_a}  ({result.conv_a}, {result.n_args_a} args, "
+            f"{result.insn_count_a} insns, {result.internal_calls_a} calls, {total_a} APIs)\n"
+            f"  B: {result.file_b}  ({result.conv_b}, {result.n_args_b} args, "
+            f"{result.insn_count_b} insns, {result.internal_calls_b} calls, {total_b} APIs)"
+        )
+        tk.Label(info, text=info_text, font=("Consolas", 9), bg=T["bg"],
+                 fg=T["fg_dim"], justify="left", anchor="w").pack(fill="x")
+
+        # Paned window: left = File A, right = File B
+        pw = tk.PanedWindow(win, orient="horizontal", bg=T["bg"],
+                            sashwidth=4, sashrelief="flat")
+        pw.pack(fill="both", expand=True, padx=5, pady=5)
+
+        def make_code_panel(parent, title):
+            frm = tk.Frame(parent, bg=T["bg"])
+            tk.Label(frm, text=title, font=("Consolas", 10, "bold"),
+                     bg=T["bg"], fg=T["accent"]).pack(anchor="w", padx=5)
+            txt = tk.Text(frm, bg=T["bg"], fg=T["fg"],
+                          font=("Consolas", 9), wrap="none",
+                          insertbackground=T["fg"], relief="flat", bd=5,
+                          selectbackground=T["accent"],
+                          selectforeground=T["bg_dark"])
+            sb_y = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
+            sb_x = ttk.Scrollbar(frm, orient="horizontal", command=txt.xview)
+            txt.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+            sb_y.pack(side="right", fill="y")
+            sb_x.pack(side="bottom", fill="x")
+            txt.pack(fill="both", expand=True)
+            txt.tag_configure("match", foreground=T.get("fg", "#cdd6f4"))
+            txt.tag_configure("diff", foreground="#f38ba8", background="#302030")
+            txt.tag_configure("call_match", foreground="#a6e3a1")
+            txt.tag_configure("call_diff", foreground="#fab387", background="#302030")
+            return frm, txt
+
+        frm_a, txt_a = make_code_panel(pw, f"\u25C0  {result.file_a}")
+        frm_b, txt_b = make_code_panel(pw, f"{result.file_b}  \u25B6")
+        pw.add(frm_a, stretch="always")
+        pw.add(frm_b, stretch="always")
+
+        # Normalize instructions for diffing
+        def normalize(mnemonic, op_str):
+            return f"{mnemonic} {re.sub(r'0x[0-9a-fA-F]+', '<N>', op_str)}"
+
+        norm_a = [normalize(m, o) for _, m, o, _ in lines_a]
+        norm_b = [normalize(m, o) for _, m, o, _ in lines_b]
+        norm_set_b = set(norm_b)
+        norm_set_a = set(norm_a)
+
+        def fill_panel(txt_widget, lines_list, norm_list, other_set):
+            txt_widget.configure(state="normal")
+            for i, (addr, mnemonic, op_str, annot) in enumerate(lines_list):
+                norm = norm_list[i]
+                is_call = mnemonic in ('call', 'jmp')
+                if norm in other_set:
+                    tag = "call_match" if is_call else "match"
+                else:
+                    tag = "call_diff" if is_call else "diff"
+                annot_str = f"  ; {annot}" if annot else ""
+                line = f"0x{addr:08X}:  {mnemonic:<10} {op_str:<40}{annot_str}\n"
+                txt_widget.insert("end", line, tag)
+            txt_widget.configure(state="disabled")
+
+        fill_panel(txt_a, lines_a, norm_a, norm_set_b)
+        fill_panel(txt_b, lines_b, norm_b, norm_set_a)
+
+        # Synchronized scrolling via mousewheel
+        def on_wheel_a(event):
+            txt_b.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        def on_wheel_b(event):
+            txt_a.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        txt_a.bind("<MouseWheel>", on_wheel_a)
+        txt_b.bind("<MouseWheel>", on_wheel_b)
+
+        # Bottom differences summary
+        diff_frm = tk.Frame(win, bg=T["bg_light"])
+        diff_frm.pack(fill="x", padx=5, pady=5)
+        diff_parts = []
+        if result.apis_only_a:
+            diff_parts.append(f"APIs only in A: {', '.join(result.apis_only_a[:5])}")
+        if result.apis_only_b:
+            diff_parts.append(f"APIs only in B: {', '.join(result.apis_only_b[:5])}")
+        if result.strings_only_a:
+            diff_parts.append(f"Strings only in A: {', '.join(result.strings_only_a[:3])}")
+        if result.strings_only_b:
+            diff_parts.append(f"Strings only in B: {', '.join(result.strings_only_b[:3])}")
+        if result.structs_only_a:
+            diff_parts.append(f"Struct offsets only in A: {', '.join(f'+0x{o:03X}' for o in result.structs_only_a[:5])}")
+        if result.structs_only_b:
+            diff_parts.append(f"Struct offsets only in B: {', '.join(f'+0x{o:03X}' for o in result.structs_only_b[:5])}")
+        if not diff_parts:
+            diff_parts.append("No API/string/struct differences detected")
+        diff_text = "  DIFFERENCES:  " + "  |  ".join(diff_parts)
+        tk.Label(diff_frm, text=diff_text, font=("Consolas", 9),
+                 bg=T["bg_light"], fg=T["fg"], wraplength=1350,
+                 justify="left", anchor="w").pack(fill="x", padx=5, pady=3)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Tab 14: System-Wide XRef Scanner
+# ══════════════════════════════════════════════════════════════════════════
+
+class XRefScannerTab(ttk.Frame):
+    """Scan all PE files in a directory (e.g. System32) for references to a function."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, style="TFrame")
+        self.app = app
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(5, weight=1)
+
+        # Function name to search for
+        func_frm = tk.Frame(self, bg=T["bg"])
+        func_frm.grid(row=0, column=0, sticky="ew", padx=12, pady=5)
+        func_frm.columnconfigure(1, weight=1)
+        ttk.Label(func_frm, text="Function name:", width=16, anchor="e").grid(row=0, column=0, padx=(0, 8))
+        self.func_var = tk.StringVar()
+        ent = PlaceholderEntry(func_frm, placeholder="e.g.  CreateFileW, NtCreateFile, RtlInitUnicodeString",
+                               textvariable=self.func_var,
+                               bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                               font=("Consolas", 10), relief="flat", bd=5)
+        ent.grid(row=0, column=1, sticky="ew")
+        app.register_placeholder(ent)
+        self._func_entry = ent
+
+        # Directory to scan
+        _, self._get_dir, self.dir_var = make_dir_picker(
+            self, "Scan directory:", row=1,
+            placeholder=EXAMPLES["scan_dir"], app=app)
+
+        # Buttons
+        btn_frm = make_button_bar(self, row=2)
+        ttk.Button(btn_frm, text="\U0001F50D  Scan All PEs", style="Accent.TButton",
+                   command=self._scan).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\u2716  Clear",
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
+
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Scan entire directories for all callers of a function", row=3)
+
+        # Info label
+        info_frm = tk.Frame(self, bg=T["bg"])
+        info_frm.grid(row=4, column=0, sticky="w", padx=12, pady=3)
+        ttk.Label(info_frm, text="Scans .dll .sys .exe .drv .cpl .ocx .scr files for import references",
+                  foreground=T["fg_dim"]).pack(side="left")
+
+        self.output = TabbedOutput(self)
+        self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    def _get_func(self):
+        return self._func_entry.get_value()
+
+    def _scan(self):
+        func_name = self._get_func()
+        scan_dir = self._get_dir()
+        if not func_name:
+            messagebox.showwarning("Missing", "Enter a function name to search for.")
+            return
+        if not scan_dir or not os.path.isdir(scan_dir):
+            messagebox.showwarning("Missing", "Select a directory to scan (e.g. C:\\WINNT\\System32).")
+            return
+        self.output.new_tab("Scan")
+
+        pe_exts = {'.dll', '.sys', '.exe', '.drv', '.cpl', '.ocx', '.scr'}
+        pe_files = [os.path.join(scan_dir, f) for f in os.listdir(scan_dir)
+                    if os.path.splitext(f)[1].lower() in pe_exts]
+
+        def work(progress_cb):
+            return _deep_analyzer().scan_system_xrefs_detailed(
+                func_name, pe_files, progress_callback=progress_cb)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            output_write(self.output, f"  SYSTEM-WIDE XREF SCAN: {func_name}\n", "title")
+            output_write(self.output, f"  Directory: {scan_dir}\n", "dim")
+            output_write(self.output, f"  {'='*80}\n\n", "dim")
+            output_write(self.output, f"  {len(result)} PE files reference {func_name}:\n\n", "ok")
+
+            # Group by source file
+            by_file = {}
+            for xref in result:
+                by_file.setdefault(xref.caller_name, []).append(xref)
+
+            output_write(self.output,
+                f"  {'PE File':<40} {'Import From':<30} {'IAT Address':<16} {'Type'}\n", "heading")
+            output_write(self.output,
+                f"  {'\u2500'*40} {'\u2500'*30} {'\u2500'*16} {'\u2500'*10}\n", "dim")
+
+            for pe_name in sorted(by_file.keys()):
+                xrefs = by_file[pe_name]
+                for xref in xrefs:
+                    iat = f"0x{xref.caller_va:08X}" if xref.caller_va else "N/A"
+                    output_write(self.output,
+                        f"  {pe_name:<40} {xref.callee_name:<30} {iat:<16} {xref.xref_type}\n")
+
+            if not result:
+                output_write(self.output, f"  No references to '{func_name}' found in {scan_dir}\n", "dim")
+
+            self.status_var.set(f"\u2705 Found {len(result)} references to {func_name} "
+                               f"in {len(by_file)} PE files")
+
+        run_with_progress_dialog(self.app,
+                                 f"Scanning for {func_name}...", work, done)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Tab 15: PE Patcher (KernelEx Ultimate Edition)
 # ══════════════════════════════════════════════════════════════════════════
 
 class PEPatcherTab(ttk.Frame):
@@ -2269,13 +4243,12 @@ class PEPatcherTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4CD  Rebase",
                    command=self._rebase).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
-                   command=lambda: output_clear(self.output)).pack(side="left", padx=5)
+                   command=lambda: self.output.close_all()).pack(side="left", padx=5)
 
-        self.status_var = tk.StringVar(value="\u2022 KernelEx-inspired PE patcher \u2014 version stamp, syscall, shim, rebase, blob inject")
-        ttk.Label(self, textvariable=self.status_var, foreground=T["fg_dim"]).grid(
-            row=5, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 KernelEx-inspired PE patcher \u2014 version stamp, syscall, shim, rebase, blob inject", row=5)
 
-        self.output = make_output(self)
+        self.output = TabbedOutput(self)
         self.output.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _browse_out(self):
@@ -2300,7 +4273,7 @@ class PEPatcherTab(ttk.Frame):
             return
         output = self._get_out()
         self.status_var.set("\u23F3 Applying Win2000 quick patch...")
-        output_clear(self.output)
+        self.output.new_tab("Quick Patch")
 
         def work():
             return _pe_patcher().patch_pe_for_win2000(pe_path, output)
@@ -2319,7 +4292,7 @@ class PEPatcherTab(ttk.Frame):
                 output_write(self.output, "\n\u274C Patch had errors!\n", "error")
                 self.status_var.set("\u274C Patch failed")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _custom_patch(self):
         pe_path = self._get_pe()
@@ -2328,7 +4301,7 @@ class PEPatcherTab(ttk.Frame):
             return
         output = self._get_out()
         self.status_var.set("\u23F3 Applying custom patches...")
-        output_clear(self.output)
+        self.output.new_tab("Custom Patch")
 
         chk_ver = self.chk_version.get()
         chk_sys = self.chk_syscalls.get()
@@ -2370,7 +4343,7 @@ class PEPatcherTab(ttk.Frame):
                     output_write(self.output, f"  {e}\n", "error")
                 self.status_var.set("\u274C Patch failed")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _patch_syscalls(self):
         pe_path = self._get_pe()
@@ -2379,7 +4352,7 @@ class PEPatcherTab(ttk.Frame):
             return
         output = self._get_out()
         self.status_var.set("\u23F3 Patching syscall stubs...")
-        output_clear(self.output)
+        self.output.new_tab("Syscall Patch")
 
         def work():
             return _pe_patcher().patch_syscall_stubs(pe_path, output)
@@ -2394,7 +4367,7 @@ class PEPatcherTab(ttk.Frame):
                 output_write(self.output, f"\n\u2705 Saved to: {result.output_path}\n", "ok")
             self.status_var.set("\u2705 Done")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _inspect_tables(self):
         pe_path = self._get_pe()
@@ -2402,7 +4375,7 @@ class PEPatcherTab(ttk.Frame):
             messagebox.showwarning("Missing", "Select a PE file.")
             return
         self.status_var.set("\u23F3 Inspecting PE tables...")
-        output_clear(self.output)
+        self.output.new_tab("Tables")
 
         def work():
             return _pe_patcher().inspect_pe_tables(pe_path)
@@ -2450,7 +4423,7 @@ class PEPatcherTab(ttk.Frame):
             self.status_var.set(f"\u2705 Inspection: {len(tables['exports'])} exports, "
                               f"{len(tables['imports'])} imports, {len(relocs)} relocs")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
     def _rebase(self):
         pe_path = self._get_pe()
@@ -2463,7 +4436,7 @@ class PEPatcherTab(ttk.Frame):
             return
         output = self._get_out()
         self.status_var.set("\u23F3 Rebasing...")
-        output_clear(self.output)
+        self.output.new_tab("Result")
 
         def work():
             return _pe_patcher().rebase_pe(pe_path, int(rebase, 16), output)
@@ -2478,7 +4451,7 @@ class PEPatcherTab(ttk.Frame):
                 output_write(self.output, f"\n\u2705 Rebased file saved to: {result.output_path}\n", "ok")
             self.status_var.set("\u2705 Done")
 
-        run_async(work, lambda r: self.after(0, done, r))
+        run_with_progress(self, work, done)
 
 
 # ══════════════════════════════════════════════════════════════════════════

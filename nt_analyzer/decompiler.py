@@ -233,6 +233,76 @@ KERNEL_API_SIGNATURES = {
                               ("PCLIENT_ID", "ClientId"), ("PKSTART_ROUTINE", "StartRoutine"), ("PVOID", "StartContext")]),
     "PsTerminateSystemThread": ("NTSTATUS", [("NTSTATUS", "ExitStatus")]),
     "IoGetCurrentProcess": ("PEPROCESS", []),
+    "IoCreateFile":        ("NTSTATUS", [("PHANDLE", "FileHandle"), ("ACCESS_MASK", "DesiredAccess"),
+                             ("POBJECT_ATTRIBUTES", "ObjectAttributes"), ("PIO_STATUS_BLOCK", "IoStatusBlock"),
+                             ("PLARGE_INTEGER", "AllocationSize"), ("ULONG", "FileAttributes"),
+                             ("ULONG", "ShareAccess"), ("ULONG", "CreateDisposition"),
+                             ("ULONG", "CreateOptions"), ("PVOID", "EaBuffer"), ("ULONG", "EaLength"),
+                             ("CREATE_FILE_TYPE", "CreateFileType"), ("PVOID", "InternalParameters"),
+                             ("ULONG", "Options")]),
+    "NtOpenFile":          ("NTSTATUS", [("PHANDLE", "FileHandle"), ("ACCESS_MASK", "DesiredAccess"),
+                             ("POBJECT_ATTRIBUTES", "ObjectAttributes"), ("PIO_STATUS_BLOCK", "IoStatusBlock"),
+                             ("ULONG", "ShareAccess"), ("ULONG", "OpenOptions")]),
+    "NtClose":             ("NTSTATUS", [("HANDLE", "Handle")]),
+    "NtReadFile":          ("NTSTATUS", [("HANDLE", "FileHandle"), ("HANDLE", "Event"),
+                             ("PIO_APC_ROUTINE", "ApcRoutine"), ("PVOID", "ApcContext"),
+                             ("PIO_STATUS_BLOCK", "IoStatusBlock"), ("PVOID", "Buffer"),
+                             ("ULONG", "Length"), ("PLARGE_INTEGER", "ByteOffset"), ("PULONG", "Key")]),
+    "NtWriteFile":         ("NTSTATUS", [("HANDLE", "FileHandle"), ("HANDLE", "Event"),
+                             ("PIO_APC_ROUTINE", "ApcRoutine"), ("PVOID", "ApcContext"),
+                             ("PIO_STATUS_BLOCK", "IoStatusBlock"), ("PVOID", "Buffer"),
+                             ("ULONG", "Length"), ("PLARGE_INTEGER", "ByteOffset"), ("PULONG", "Key")]),
+    "NtDeviceIoControlFile": ("NTSTATUS", [("HANDLE", "FileHandle"), ("HANDLE", "Event"),
+                             ("PIO_APC_ROUTINE", "ApcRoutine"), ("PVOID", "ApcContext"),
+                             ("PIO_STATUS_BLOCK", "IoStatusBlock"), ("ULONG", "IoControlCode"),
+                             ("PVOID", "InputBuffer"), ("ULONG", "InputBufferLength"),
+                             ("PVOID", "OutputBuffer"), ("ULONG", "OutputBufferLength")]),
+    "NtQueryInformationFile": ("NTSTATUS", [("HANDLE", "FileHandle"),
+                             ("PIO_STATUS_BLOCK", "IoStatusBlock"), ("PVOID", "FileInformation"),
+                             ("ULONG", "Length"), ("FILE_INFORMATION_CLASS", "FileInformationClass")]),
+    "NtSetInformationFile": ("NTSTATUS", [("HANDLE", "FileHandle"),
+                             ("PIO_STATUS_BLOCK", "IoStatusBlock"), ("PVOID", "FileInformation"),
+                             ("ULONG", "Length"), ("FILE_INFORMATION_CLASS", "FileInformationClass")]),
+    "NtQuerySystemInformation": ("NTSTATUS", [("SYSTEM_INFORMATION_CLASS", "SystemInformationClass"),
+                             ("PVOID", "SystemInformation"), ("ULONG", "SystemInformationLength"),
+                             ("PULONG", "ReturnLength")]),
+    "NtQueryInformationProcess": ("NTSTATUS", [("HANDLE", "ProcessHandle"),
+                             ("PROCESSINFOCLASS", "ProcessInformationClass"),
+                             ("PVOID", "ProcessInformation"), ("ULONG", "ProcessInformationLength"),
+                             ("PULONG", "ReturnLength")]),
+    "NtQueryInformationThread": ("NTSTATUS", [("HANDLE", "ThreadHandle"),
+                             ("THREADINFOCLASS", "ThreadInformationClass"),
+                             ("PVOID", "ThreadInformation"), ("ULONG", "ThreadInformationLength"),
+                             ("PULONG", "ReturnLength")]),
+    "NtAllocateVirtualMemory": ("NTSTATUS", [("HANDLE", "ProcessHandle"),
+                             ("PVOID*", "BaseAddress"), ("ULONG_PTR", "ZeroBits"),
+                             ("PSIZE_T", "RegionSize"), ("ULONG", "AllocationType"),
+                             ("ULONG", "Protect")]),
+    "NtFreeVirtualMemory": ("NTSTATUS", [("HANDLE", "ProcessHandle"),
+                             ("PVOID*", "BaseAddress"), ("PSIZE_T", "RegionSize"),
+                             ("ULONG", "FreeType")]),
+    "NtOpenKey":           ("NTSTATUS", [("PHANDLE", "KeyHandle"), ("ACCESS_MASK", "DesiredAccess"),
+                             ("POBJECT_ATTRIBUTES", "ObjectAttributes")]),
+    "NtQueryValueKey":     ("NTSTATUS", [("HANDLE", "KeyHandle"), ("PUNICODE_STRING", "ValueName"),
+                             ("KEY_VALUE_INFORMATION_CLASS", "KeyValueInformationClass"),
+                             ("PVOID", "KeyValueInformation"), ("ULONG", "Length"),
+                             ("PULONG", "ResultLength")]),
+    "NtSetValueKey":       ("NTSTATUS", [("HANDLE", "KeyHandle"), ("PUNICODE_STRING", "ValueName"),
+                             ("ULONG", "TitleIndex"), ("ULONG", "Type"),
+                             ("PVOID", "Data"), ("ULONG", "DataSize")]),
+    "MmMapIoSpace":        ("PVOID", [("PHYSICAL_ADDRESS", "PhysicalAddress"), ("SIZE_T", "NumberOfBytes"),
+                             ("MEMORY_CACHING_TYPE", "CacheType")]),
+    "MmUnmapIoSpace":      ("VOID", [("PVOID", "BaseAddress"), ("SIZE_T", "NumberOfBytes")]),
+    "IoAllocateIrp":       ("PIRP", [("CCHAR", "StackSize"), ("BOOLEAN", "ChargeQuota")]),
+    "IoFreeIrp":           ("VOID", [("PIRP", "Irp")]),
+    "IoGetDeviceObjectPointer": ("NTSTATUS", [("PUNICODE_STRING", "ObjectName"),
+                             ("ACCESS_MASK", "DesiredAccess"), ("PFILE_OBJECT*", "FileObject"),
+                             ("PDEVICE_OBJECT*", "DeviceObject")]),
+    "KeInitializeMutex":   ("VOID", [("PRKMUTEX", "Mutex"), ("ULONG", "Level")]),
+    "KeReleaseMutex":      ("LONG", [("PRKMUTEX", "Mutex"), ("BOOLEAN", "Wait")]),
+    "KeDelayExecutionThread": ("NTSTATUS", [("KPROCESSOR_MODE", "WaitMode"),
+                             ("BOOLEAN", "Alertable"), ("PLARGE_INTEGER", "Interval")]),
+    "DbgPrint":            ("ULONG", [("PCSTR", "Format")]),
 }
 
 POOL_TYPES = {0: "NonPagedPool", 1: "PagedPool", 2: "NonPagedPoolMustSucceed",
@@ -875,6 +945,23 @@ class X86Decompiler:
     # ── Type inference ───────────────────────────────────────────────────
 
     def _infer_types(self, info):
+        # If the function being decompiled has a known signature, apply it
+        sig = KERNEL_API_SIGNATURES.get(info.name)
+        if sig:
+            ret_type, params = sig
+            info.return_type = ret_type
+            # Rename parameters to match the known signature
+            for i, (ptype, pname) in enumerate(params):
+                if i < len(info.params):
+                    info.params[i].var_type = ptype
+                    info.params[i].name = pname
+                else:
+                    info.params.append(StackVar(
+                        offset=8 + i * 4, size=4,
+                        name=pname, var_type=ptype,
+                    ))
+            return
+
         for api in info.called_apis:
             if 'CompleteRequest' in api:
                 info.return_type = "NTSTATUS"
@@ -952,6 +1039,8 @@ class X86Decompiler:
 
         loop_headers = {h for h, _ in loops}
         self.tracker.reset()
+        # Track indices of push-comment lines so calls can remove them
+        self._push_line_indices = []
 
         for block_addr in sorted(blocks_dict.keys()):
             block = blocks_dict[block_addr]
@@ -1003,10 +1092,14 @@ class X86Decompiler:
                     nv = int(op.strip(), 16)
                     tag = _decode_pool_tag(nv)
                     if tag:
-                        return DecompiledLine(addr, indent, f"// push '{tag}'", comment=f"tag 0x{nv:08X}")
+                        line = DecompiledLine(addr, indent, f"// push '{tag}'", comment=f"tag 0x{nv:08X}")
+                        self._push_line_indices.append(len(info.lines))
+                        return line
                 except ValueError:
                     pass
-            return DecompiledLine(addr, indent, f"// push {val}", comment="arg")
+            line = DecompiledLine(addr, indent, f"// push {val}", comment="arg")
+            self._push_line_indices.append(len(info.lines))
+            return line
 
         # ── MOV ──────────────────────────────────────────────────────────
         if m == 'mov':
@@ -1249,14 +1342,37 @@ class X86Decompiler:
                 else:
                     args.append(f"/* {pt} {pn} */")
             self.tracker.consume_call_args(n)
+            # Remove consumed push-comment lines from output
+            self._remove_push_lines(info, n)
             call = f"{func_name}({', '.join(args)})"
             if ret_type != "VOID":
                 return DecompiledLine(insn.address, indent, f"eax = {call};", comment=f"-> {ret_type}")
             return DecompiledLine(insn.address, indent, f"{call};")
 
-        self.tracker.stack_args.clear()
-        return DecompiledLine(insn.address, indent, f"eax = {func_name}(...);",
-                             comment="imported" if not func_name.startswith('sub_') else "")
+        # Unknown function — still collect pushed args
+        n_pushed = len(self.tracker.stack_args)
+        if n_pushed > 0:
+            pushed = self.tracker.peek_call_args(n_pushed)
+            args = [str(p[0]) for p in pushed]
+            self.tracker.consume_call_args(n_pushed)
+            self._remove_push_lines(info, n_pushed)
+            call = f"{func_name}({', '.join(args)})"
+        else:
+            call = f"{func_name}()"
+
+        is_import = not func_name.startswith('sub_')
+        return DecompiledLine(insn.address, indent, f"eax = {call};",
+                             comment="imported" if is_import else "")
+
+    def _remove_push_lines(self, info, n_args):
+        """Remove the last n_args push-comment lines from info.lines."""
+        to_remove = min(n_args, len(self._push_line_indices))
+        indices = self._push_line_indices[-to_remove:]
+        self._push_line_indices = self._push_line_indices[:-to_remove]
+        # Mark lines as None (removing by index shifting is complex)
+        for idx in indices:
+            if idx < len(info.lines):
+                info.lines[idx] = None
 
     # ── Struct field check ───────────────────────────────────────────────
 
@@ -1423,12 +1539,27 @@ class X86Decompiler:
 #  High-level API
 # ══════════════════════════════════════════════════════════════════════════
 
-def decompile(pe_path, func_name_or_rva, symbols=None):
+def decompile(pe_path, func_name_or_rva, symbols=None, expand_calls=False):
     dec = X86Decompiler(pe_path, symbols)
     info = dec.decompile_from_pe(pe_path, func_name_or_rva)
     if info is None:
         return None
-    return format_pseudocode(info)
+    result = format_pseudocode(info)
+
+    if expand_calls and info.called_apis:
+        # Inline-expand any called functions that are exports in the same PE
+        expanded = []
+        for api_name in sorted(set(info.called_apis)):
+            # Try to decompile it from the same PE (internal exports only)
+            sub_info = dec.decompile_from_pe(pe_path, api_name)
+            if sub_info:
+                expanded.append(f"\n{'─'*60}")
+                expanded.append(f"/* ── Expanded: {api_name} (called by {info.name}) ── */")
+                expanded.append(format_pseudocode(sub_info))
+        if expanded:
+            result += "\n" + "\n".join(expanded)
+
+    return result
 
 
 def decompile_no_symbols(pe_path, max_funcs=50):
