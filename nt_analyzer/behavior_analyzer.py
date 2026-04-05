@@ -529,22 +529,26 @@ def detect_api_patterns(pe_path, func_name):
 def scan_all_exports(pe_path, max_functions=500, progress_callback=None):
     """
     Scan all exports in a PE and categorize them by behavioral pattern.
-    Returns dict of pattern_type → list of function names.
+    Returns dict of pattern_type → list of (func_name, pdesc, info_dict).
+    info_dict contains: rva, va, size, api_calls, struct_offsets, block_count, insn_count.
     progress_callback(message, pct) is called per function if provided.
     """
     pe = pefile.PE(pe_path, fast_load=False)
+    image_base = pe.OPTIONAL_HEADER.ImageBase
     exports = []
     if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
         for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
             if exp.name:
-                exports.append(exp.name.decode('ascii', errors='replace'))
+                name = exp.name.decode('ascii', errors='replace')
+                rva = exp.address
+                exports.append((name, rva, rva + image_base))
     pe.close()
 
     total = min(len(exports), max_functions)
     categories = defaultdict(list)
     scanned = 0
 
-    for func_name in exports:
+    for func_name, rva, va in exports:
         if scanned >= max_functions:
             break
         if progress_callback:
@@ -552,8 +556,33 @@ def scan_all_exports(pe_path, max_functions=500, progress_callback=None):
             progress_callback(f"Scanning {func_name} ({scanned+1}/{total})", pct)
         result = detect_api_patterns(pe_path, func_name)
         if result:
+            fp = result.get('fingerprint')
+            # Gather struct-like offset accesses from the fingerprint
+            struct_offsets = []
+            func_size = 0
+            if fp:
+                func_size = sum(len(b.instructions) for b in fp.blocks.values())
+                # Detect structure accesses: [reg+offset] patterns
+                for b in fp.blocks.values():
+                    for mnem, op in b.instructions:
+                        if '+' in op and ('[' in op or 'ptr' in op.lower()):
+                            # Extract offset from e.g. [ebp+0x08] or [esi+0x1c]
+                            import re as _re
+                            m = _re.search(r'\[(?:e[abcds][xip]|esi|edi)\s*\+\s*(0x[0-9a-fA-F]+|\d+)\]', op)
+                            if m:
+                                ofs = m.group(1)
+                                if ofs not in struct_offsets:
+                                    struct_offsets.append(ofs)
+            info = {
+                'rva': rva,
+                'va': va,
+                'block_count': fp.block_count if fp else 0,
+                'insn_count': fp.total_insns if fp else 0,
+                'api_calls': fp.api_calls if fp else [],
+                'struct_offsets': struct_offsets,
+            }
             for ptype, pdesc in result['patterns']:
-                categories[ptype].append((func_name, pdesc))
+                categories[ptype].append((func_name, pdesc, info))
         scanned += 1
 
     return dict(categories)

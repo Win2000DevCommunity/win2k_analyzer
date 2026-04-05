@@ -669,6 +669,14 @@ class TabbedOutput(ttk.Frame):
         c = self._cur()
         return c.get(*a, **kw) if c else ""
 
+    def index(self, *a, **kw):
+        c = self._cur()
+        return c.index(*a, **kw) if c else "1.0"
+
+    def tag_ranges(self, *a, **kw):
+        c = self._cur()
+        return c.tag_ranges(*a, **kw) if c else ()
+
     def see(self, *a):
         c = self._cur()
         if c:
@@ -725,6 +733,76 @@ def output_clear(txt_widget):
     txt_widget.configure(state="normal")
     txt_widget.delete("1.0", "end")
     txt_widget.configure(state="disabled")
+
+
+def _extract_func_from_click(event, output_widget):
+    """Extract the function name under a func_link tag click.
+    Works with both TabbedOutput and plain ScrolledText.
+    Returns the stripped function name or None."""
+    try:
+        if isinstance(output_widget, TabbedOutput):
+            txt = output_widget._cur()
+        else:
+            txt = output_widget
+        if not txt:
+            return None
+        idx = txt.index(f"@{event.x},{event.y}")
+        if "func_link" not in txt.tag_names(idx):
+            return None
+        r = txt.tag_prevrange("func_link", f"{idx}+1c")
+        if not r:
+            return None
+        return txt.get(r[0], r[1]).strip()
+    except Exception:
+        return None
+
+
+def setup_func_link(output_widget, pe_path_getter, app_ref):
+    """Register func_link tag on a TabbedOutput so clicking a function name
+    opens a Disassembly tab with the result.
+
+    pe_path_getter: callable returning the PE file path
+    app_ref: the main Win2KAnalyzerApp for after() and target tab lookup
+    """
+    output_widget.tag_configure("func_link", foreground="#89b4fa", underline=True)
+
+    def on_click(event):
+        func_name = _extract_func_from_click(event, output_widget)
+        if not func_name:
+            return
+        pe_path = pe_path_getter()
+        if not pe_path:
+            return
+        # Disassemble inline in the same TabbedOutput
+        output_widget.new_tab(f"Disasm: {func_name}")
+        def work():
+            return _behavior().disassemble_function(pe_path, func_name)
+        def done(result):
+            if isinstance(result, Exception):
+                output_write(output_widget, f"ERROR: {result}\n", "error")
+                return
+            output_write(output_widget, f"  DISASSEMBLY: {func_name}\n\n", "title")
+            for line in result.splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith(';'):
+                    output_write(output_widget, line + "\n", "dim")
+                elif '\u2192' in line or stripped[:5].startswith('call'):
+                    output_write(output_widget, line + "\n", "ok")
+                elif stripped.startswith(('ret', 'retn')):
+                    output_write(output_widget, line + "\n", "warn")
+                elif stripped.startswith('j'):
+                    output_write(output_widget, line + "\n", "peach")
+                else:
+                    output_write(output_widget, line + "\n")
+        def callback(result):
+            app_ref.after(0, done, result)
+        run_async(work, callback)
+
+    output_widget.tag_bind("func_link", "<Button-1>", on_click)
+    output_widget.tag_bind("func_link", "<Enter>",
+                           lambda e: output_widget.configure(cursor="hand2"))
+    output_widget.tag_bind("func_link", "<Leave>",
+                           lambda e: output_widget.configure(cursor=""))
 
 
 def run_async(func, callback=None):
@@ -843,6 +921,7 @@ class ExportImportTab(ttk.Frame):
 
         self.output = TabbedOutput(self)
         self.output.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        setup_func_link(self.output, self._get_dll, app)
         self._last_data = None
 
     def _run_exports(self):
@@ -870,13 +949,20 @@ class ExportImportTab(ttk.Frame):
             for exp in result['exports']:
                 name = exp['name'] or "(ordinal only)"
                 fwd = exp['forwarded_to'] or ''
-                line = f"  {exp['ordinal']:<8} {name:<50} {hex(exp['rva']):<12} {fwd}\n"
+                ord_s = f"  {exp['ordinal']:<8} "
+                rva_s = f" {hex(exp['rva']):<12} {fwd}\n"
                 if fwd:
-                    output_write(self.output, line, "peach")
+                    output_write(self.output, ord_s)
+                    output_write(self.output, f"{name:<50}", "peach")
+                    output_write(self.output, rva_s, "peach")
                 elif not exp['name']:
-                    output_write(self.output, line, "dim")
+                    output_write(self.output, ord_s)
+                    output_write(self.output, f"{name:<50}", "dim")
+                    output_write(self.output, rva_s, "dim")
                 else:
-                    output_write(self.output, line)
+                    output_write(self.output, ord_s)
+                    output_write(self.output, f"{name:<50}", "func_link")
+                    output_write(self.output, rva_s)
             self.status_var.set(f"\u2705 Done \u2014 {result['total_exports']} exports found")
             self.app.set_status(f"Exports: {result['dll_name']} \u2014 {result['total_exports']} exports")
 
@@ -1099,7 +1185,9 @@ class CompareTab(ttk.Frame):
             for m in mismatches[:30]:
                 ov1 = m.get(f'ordinal_{l1}', '?')
                 ov2 = m.get(f'ordinal_{l2}', '?')
-                output_write(self.output, f"      {m['name']}: {ov1} \u2192 {ov2}\n", "warn")
+                output_write(self.output, "      ")
+                output_write(self.output, m['name'], "func_link")
+                output_write(self.output, f": {ov1} \u2192 {ov2}\n", "warn")
             if len(mismatches) > 30:
                 output_write(self.output, f"      ... +{len(mismatches)-30} more\n", "dim")
 
@@ -1108,13 +1196,17 @@ class CompareTab(ttk.Frame):
         if only1:
             output_write(self.output, f"\n    Only in {l1} ({len(only1)} \u2014 MUST be added to {l2}):\n", "error")
             for name in only1[:40]:
-                output_write(self.output, f"      \u2717 {name}\n", "error")
+                output_write(self.output, "      \u2717 ")
+                output_write(self.output, name, "func_link")
+                output_write(self.output, "\n")
             if len(only1) > 40:
                 output_write(self.output, f"      ... +{len(only1)-40} more\n", "dim")
         if only2:
             output_write(self.output, f"\n    Only in {l2} ({len(only2)} \u2014 extra, safe):\n", "dim")
             for name in only2[:20]:
-                output_write(self.output, f"      + {name}\n", "dim")
+                output_write(self.output, "      + ")
+                output_write(self.output, name, "func_link")
+                output_write(self.output, "\n")
             if len(only2) > 20:
                 output_write(self.output, f"      ... +{len(only2)-20} more\n", "dim")
 
@@ -1920,14 +2012,23 @@ class BehaviorTab(ttk.Frame):
 
     # ── Click-on-function handler ──
     def _on_func_click(self, event):
-        idx = self.output.index(f"@{event.x},{event.y}")
-        line_start = self.output.index(f"{idx} linestart")
-        line_end = self.output.index(f"{idx} lineend")
-        line_text = self.output.get(line_start, line_end).strip()
-        # Extract function name: first non-whitespace token
-        parts = line_text.split()
-        if parts:
-            func_name = parts[0]
+        txt = self.output._cur()
+        if not txt:
+            return
+        try:
+            idx = txt.index(f"@{event.x},{event.y}")
+            # Get text covered by the func_link tag at click position
+            tags = txt.tag_names(idx)
+            if "func_link" not in tags:
+                return
+            # Walk back/forward to find the extent of the func_link tag
+            r = txt.tag_prevrange("func_link", f"{idx}+1c")
+            if not r:
+                return
+            func_name = txt.get(r[0], r[1]).strip()
+        except Exception:
+            return
+        if func_name:
             self._func_entry.set_value(func_name)
             self._disasm()
 
@@ -2184,11 +2285,36 @@ class BehaviorTab(ttk.Frame):
             total = 0
             for category, funcs in sorted(result.items(), key=lambda x: -len(x[1])):
                 output_write(self.output, f"  [{category}] \u2014 {len(funcs)} functions\n", "heading")
-                for fname, fdesc in funcs:
-                    # Insert function name as clickable link, then description
+                for entry in funcs:
+                    # Support both old (name, desc) and new (name, desc, info) format
+                    if len(entry) >= 3:
+                        fname, fdesc, info = entry[0], entry[1], entry[2]
+                    else:
+                        fname, fdesc = entry[0], entry[1]
+                        info = {}
+                    # Function name as clickable link
                     output_write(self.output, "    ")
-                    output_write(self.output, f"{fname:<48}", "func_link")
-                    output_write(self.output, f" {fdesc}\n")
+                    output_write(self.output, f"{fname}", "func_link")
+                    # Addresses
+                    rva = info.get('rva')
+                    va = info.get('va')
+                    if rva is not None:
+                        output_write(self.output, f"  RVA:0x{rva:08X}  VA:0x{va:08X}", "dim")
+                    # Description (blocks, instructions)
+                    output_write(self.output, f"\n        {fdesc}", "")
+                    # Struct offset accesses
+                    struct_ofs = info.get('struct_offsets', [])
+                    if struct_ofs:
+                        output_write(self.output,
+                            f"  structs:[{','.join(struct_ofs[:8])}]", "peach")
+                    # API calls
+                    apis = info.get('api_calls', [])
+                    if apis:
+                        shown = apis[:6]
+                        more = f" +{len(apis)-6}" if len(apis) > 6 else ""
+                        output_write(self.output,
+                            f"\n        calls: {', '.join(shown)}{more}", "dim")
+                    output_write(self.output, "\n")
                 output_write(self.output, "\n")
                 total += len(funcs)
             self._save_to_history("Scan All")
@@ -2445,6 +2571,7 @@ class DecompilerTab(ttk.Frame):
 
         self.output = TabbedOutput(self)
         self.output.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        setup_func_link(self.output, self._get_pe, app)
 
     def _get_func(self):
         return self._func_entry.get_value()
@@ -2647,6 +2774,8 @@ class DecompilerTab(ttk.Frame):
                 return
             for name, code in result.items():
                 output_write(self.output, f"{'='*70}\n", "dim")
+                output_write(self.output, f"  {name}", "func_link")
+                output_write(self.output, "\n", "dim")
                 self._colorize(code)
                 output_write(self.output, "\n")
             self.status_var.set(f"\u2705 Discovered {len(result)} functions")
@@ -2676,6 +2805,8 @@ class DecompilerTab(ttk.Frame):
                 return
             for name, code in result.items():
                 output_write(self.output, f"{'='*70}\n", "dim")
+                output_write(self.output, f"  {name}", "func_link")
+                output_write(self.output, "\n", "dim")
                 self._colorize(code)
                 output_write(self.output, "\n")
             self.status_var.set(f"\u2705 Decompiled {len(result)} exports")
@@ -2767,6 +2898,7 @@ class CompatAnalyzerTab(ttk.Frame):
 
         self.output = TabbedOutput(self)
         self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        setup_func_link(self.output, self._get_a, app)
 
     def _analyze_both(self):
         pa, pb = self._get_a(), self._get_b()
@@ -3112,6 +3244,7 @@ class DeepAnalyzerTab(ttk.Frame):
 
         self.output = TabbedOutput(self)
         self.output.grid(row=10, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        setup_func_link(self.output, self._get_pe, app)
 
         # Right-click context menu on output
         self._context_menu = tk.Menu(self.output, tearoff=0,
@@ -3542,10 +3675,11 @@ class DeepAnalyzerTab(ttk.Frame):
                 elif func.is_thunk:
                     ftype = "thunk"
                 tag = "ok" if func.is_exported else "dim"
-                line = (f"  {func.name:<40} {ftype:<10} {func.calling_convention:<10} "
+                output_write(self.output, f"  {func.name:<40}", "func_link")
+                rest = (f" {ftype:<10} {func.calling_convention:<10} "
                         f"{func.n_args:<6} {func.size:<8} {func.n_basic_blocks:<8} "
                         f"{len(func.called_by):<8} {len(func.calls_out)}\n")
-                output_write(self.output, line, tag)
+                output_write(self.output, rest, tag)
 
             self._save_to_history(f"Discover: {os.path.basename(pe_path)}")
             self.status_var.set(f"\u2705 Found {len(funcs)} functions "
