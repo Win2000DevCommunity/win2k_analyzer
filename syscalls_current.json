@@ -1,0 +1,2431 @@
+{
+  "source_file": "ntdll.dll",
+  "total_syscalls": 485,
+  "syscalls": {
+    "0": {
+      "name": "NtAccessCheck",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "1": {
+      "name": "NtWorkerFactoryWorkerReady",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "2": {
+      "name": "NtAcceptConnectPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "3": {
+      "name": "NtMapUserPhysicalPagesScatter",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "4": {
+      "name": "NtWaitForSingleObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "5": {
+      "name": "NtCallbackReturn",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "6": {
+      "name": "NtReadFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "7": {
+      "name": "NtDeviceIoControlFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "8": {
+      "name": "NtWriteFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "9": {
+      "name": "NtRemoveIoCompletion",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "10": {
+      "name": "NtReleaseSemaphore",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "11": {
+      "name": "NtReplyWaitReceivePort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "12": {
+      "name": "NtReplyPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "13": {
+      "name": "NtSetInformationThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "14": {
+      "name": "NtSetEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "15": {
+      "name": "NtClose",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "16": {
+      "name": "NtQueryObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "17": {
+      "name": "NtQueryInformationFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "18": {
+      "name": "NtOpenKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "19": {
+      "name": "NtEnumerateValueKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "20": {
+      "name": "NtFindAtom",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "21": {
+      "name": "NtQueryDefaultLocale",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "22": {
+      "name": "NtQueryKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "23": {
+      "name": "NtQueryValueKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "24": {
+      "name": "NtAllocateVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "25": {
+      "name": "NtQueryInformationProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "26": {
+      "name": "NtWaitForMultipleObjects32",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "27": {
+      "name": "NtWriteFileGather",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "28": {
+      "name": "NtSetInformationProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "29": {
+      "name": "NtCreateKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "30": {
+      "name": "NtFreeVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "31": {
+      "name": "NtImpersonateClientOfPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "32": {
+      "name": "NtReleaseMutant",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "33": {
+      "name": "NtQueryInformationToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "34": {
+      "name": "NtRequestWaitReplyPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "35": {
+      "name": "NtQueryVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "36": {
+      "name": "NtOpenThreadToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "37": {
+      "name": "NtQueryInformationThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "38": {
+      "name": "NtOpenProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "39": {
+      "name": "NtSetInformationFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "40": {
+      "name": "NtMapViewOfSection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "41": {
+      "name": "NtAccessCheckAndAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "42": {
+      "name": "NtUnmapViewOfSection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "43": {
+      "name": "NtReplyWaitReceivePortEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "44": {
+      "name": "NtTerminateProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "45": {
+      "name": "NtSetEventBoostPriority",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "46": {
+      "name": "NtReadFileScatter",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "47": {
+      "name": "NtOpenThreadTokenEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "48": {
+      "name": "NtOpenProcessTokenEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "49": {
+      "name": "NtQueryPerformanceCounter",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "50": {
+      "name": "NtEnumerateKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "51": {
+      "name": "NtOpenFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "52": {
+      "name": "NtDelayExecution",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "53": {
+      "name": "NtQueryDirectoryFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "54": {
+      "name": "NtQuerySystemInformation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "55": {
+      "name": "NtOpenSection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "56": {
+      "name": "NtQueryTimer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "57": {
+      "name": "NtFsControlFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "58": {
+      "name": "NtWriteVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "59": {
+      "name": "NtCloseObjectAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "60": {
+      "name": "NtDuplicateObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "61": {
+      "name": "NtQueryAttributesFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "62": {
+      "name": "NtClearEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "63": {
+      "name": "NtReadVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "64": {
+      "name": "NtOpenEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "65": {
+      "name": "NtAdjustPrivilegesToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "66": {
+      "name": "NtDuplicateToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "67": {
+      "name": "NtContinue",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "68": {
+      "name": "NtQueryDefaultUILanguage",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "69": {
+      "name": "NtQueueApcThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "70": {
+      "name": "NtYieldExecution",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "71": {
+      "name": "NtAddAtom",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "72": {
+      "name": "NtCreateEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "73": {
+      "name": "NtQueryVolumeInformationFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "74": {
+      "name": "NtCreateSection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "75": {
+      "name": "NtFlushBuffersFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "76": {
+      "name": "NtApphelpCacheControl",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "77": {
+      "name": "NtCreateProcessEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "78": {
+      "name": "NtCreateThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "79": {
+      "name": "NtIsProcessInJob",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "80": {
+      "name": "NtProtectVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "81": {
+      "name": "NtQuerySection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "82": {
+      "name": "NtResumeThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "83": {
+      "name": "NtTerminateThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "84": {
+      "name": "NtReadRequestData",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "85": {
+      "name": "NtCreateFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "86": {
+      "name": "NtQueryEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "87": {
+      "name": "NtWriteRequestData",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "88": {
+      "name": "NtOpenDirectoryObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "89": {
+      "name": "NtAccessCheckByTypeAndAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "91": {
+      "name": "NtWaitForMultipleObjects",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "92": {
+      "name": "NtSetInformationObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "93": {
+      "name": "NtCancelIoFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "94": {
+      "name": "NtTraceEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "95": {
+      "name": "NtPowerInformation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "96": {
+      "name": "NtSetValueKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "97": {
+      "name": "NtCancelTimer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "98": {
+      "name": "NtSetTimer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "99": {
+      "name": "NtAccessCheckByType",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "100": {
+      "name": "NtAccessCheckByTypeResultList",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "101": {
+      "name": "NtAccessCheckByTypeResultListAndAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "102": {
+      "name": "NtAccessCheckByTypeResultListAndAuditAlarmByHandle",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "103": {
+      "name": "NtAcquireCrossVmMutant",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "104": {
+      "name": "NtAcquireProcessActivityReference",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "105": {
+      "name": "NtAddAtomEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "106": {
+      "name": "NtAddBootEntry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "107": {
+      "name": "NtAddDriverEntry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "108": {
+      "name": "NtAdjustGroupsToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "109": {
+      "name": "NtAdjustTokenClaimsAndDeviceGroups",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "110": {
+      "name": "NtAlertResumeThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "111": {
+      "name": "NtAlertThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "112": {
+      "name": "NtAlertThreadByThreadId",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "113": {
+      "name": "NtAllocateLocallyUniqueId",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "114": {
+      "name": "NtAllocateReserveObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "115": {
+      "name": "NtAllocateUserPhysicalPages",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "116": {
+      "name": "NtAllocateUserPhysicalPagesEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "117": {
+      "name": "NtAllocateUuids",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "118": {
+      "name": "NtAllocateVirtualMemoryEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "119": {
+      "name": "NtAlpcAcceptConnectPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "120": {
+      "name": "NtAlpcCancelMessage",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "121": {
+      "name": "NtAlpcConnectPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "122": {
+      "name": "NtAlpcConnectPortEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "123": {
+      "name": "NtAlpcCreatePort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "124": {
+      "name": "NtAlpcCreatePortSection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "125": {
+      "name": "NtAlpcCreateResourceReserve",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "126": {
+      "name": "NtAlpcCreateSectionView",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "127": {
+      "name": "NtAlpcCreateSecurityContext",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "128": {
+      "name": "NtAlpcDeletePortSection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "129": {
+      "name": "NtAlpcDeleteResourceReserve",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "130": {
+      "name": "NtAlpcDeleteSectionView",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "131": {
+      "name": "NtAlpcDeleteSecurityContext",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "132": {
+      "name": "NtAlpcDisconnectPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "133": {
+      "name": "NtAlpcImpersonateClientContainerOfPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "134": {
+      "name": "NtAlpcImpersonateClientOfPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "135": {
+      "name": "NtAlpcOpenSenderProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "136": {
+      "name": "NtAlpcOpenSenderThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "137": {
+      "name": "NtAlpcQueryInformation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "138": {
+      "name": "NtAlpcQueryInformationMessage",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "139": {
+      "name": "NtAlpcRevokeSecurityContext",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "140": {
+      "name": "NtAlpcSendWaitReceivePort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "141": {
+      "name": "NtAlpcSetInformation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "142": {
+      "name": "NtAreMappedFilesTheSame",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "143": {
+      "name": "NtAssignProcessToJobObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "144": {
+      "name": "NtAssociateWaitCompletionPacket",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "145": {
+      "name": "NtCallEnclave",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "146": {
+      "name": "NtCancelIoFileEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "147": {
+      "name": "NtCancelSynchronousIoFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "148": {
+      "name": "NtCancelTimer2",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "149": {
+      "name": "NtCancelWaitCompletionPacket",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "150": {
+      "name": "NtChangeProcessState",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "151": {
+      "name": "NtChangeThreadState",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "152": {
+      "name": "NtCommitComplete",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "153": {
+      "name": "NtCommitEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "154": {
+      "name": "NtCommitRegistryTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "155": {
+      "name": "NtCommitTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "156": {
+      "name": "NtCompactKeys",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "157": {
+      "name": "NtCompareObjects",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "158": {
+      "name": "NtCompareSigningLevels",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "159": {
+      "name": "NtCompareTokens",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "160": {
+      "name": "NtCompleteConnectPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "161": {
+      "name": "NtCompressKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "162": {
+      "name": "NtConnectPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "163": {
+      "name": "NtContinueEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "164": {
+      "name": "NtConvertBetweenAuxiliaryCounterAndPerformanceCounter",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "165": {
+      "name": "NtCopyFileChunk",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "166": {
+      "name": "NtCreateCpuPartition",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "167": {
+      "name": "NtCreateCrossVmEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "168": {
+      "name": "NtCreateCrossVmMutant",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "169": {
+      "name": "NtCreateDebugObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "170": {
+      "name": "NtCreateDirectoryObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "171": {
+      "name": "NtCreateDirectoryObjectEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "172": {
+      "name": "NtCreateEnclave",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "173": {
+      "name": "NtCreateEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "174": {
+      "name": "NtCreateEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "175": {
+      "name": "NtCreateIRTimer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "176": {
+      "name": "NtCreateIoCompletion",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "177": {
+      "name": "NtCreateIoRing",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "178": {
+      "name": "NtCreateJobObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "179": {
+      "name": "NtCreateJobSet",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "180": {
+      "name": "NtCreateKeyTransacted",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "181": {
+      "name": "NtCreateKeyedEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "182": {
+      "name": "NtCreateLowBoxToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "183": {
+      "name": "NtCreateMailslotFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "184": {
+      "name": "NtCreateMutant",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "185": {
+      "name": "NtCreateNamedPipeFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "186": {
+      "name": "NtCreatePagingFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "187": {
+      "name": "NtCreatePartition",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "188": {
+      "name": "NtCreatePort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "189": {
+      "name": "NtCreatePrivateNamespace",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "190": {
+      "name": "NtCreateProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "191": {
+      "name": "NtCreateProcessStateChange",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "192": {
+      "name": "NtCreateProfile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "193": {
+      "name": "NtCreateProfileEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "194": {
+      "name": "NtCreateRegistryTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "195": {
+      "name": "NtCreateResourceManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "196": {
+      "name": "NtCreateSectionEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "197": {
+      "name": "NtCreateSemaphore",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "198": {
+      "name": "NtCreateSymbolicLinkObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "199": {
+      "name": "NtCreateThreadEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "200": {
+      "name": "NtCreateThreadStateChange",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "201": {
+      "name": "NtCreateTimer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "202": {
+      "name": "NtCreateTimer2",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "203": {
+      "name": "NtCreateToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "204": {
+      "name": "NtCreateTokenEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "205": {
+      "name": "NtCreateTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "206": {
+      "name": "NtCreateTransactionManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "207": {
+      "name": "NtCreateUserProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "208": {
+      "name": "NtCreateWaitCompletionPacket",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "209": {
+      "name": "NtCreateWaitablePort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "210": {
+      "name": "NtCreateWnfStateName",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "211": {
+      "name": "NtCreateWorkerFactory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "212": {
+      "name": "NtDebugActiveProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "213": {
+      "name": "NtDebugContinue",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "214": {
+      "name": "NtDeleteAtom",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "215": {
+      "name": "NtDeleteBootEntry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "216": {
+      "name": "NtDeleteDriverEntry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "217": {
+      "name": "NtDeleteFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "218": {
+      "name": "NtDeleteKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "219": {
+      "name": "NtDeleteObjectAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "220": {
+      "name": "NtDeletePrivateNamespace",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "221": {
+      "name": "NtDeleteValueKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "222": {
+      "name": "NtDeleteWnfStateData",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "223": {
+      "name": "NtDeleteWnfStateName",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "224": {
+      "name": "NtDirectGraphicsCall",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "225": {
+      "name": "NtDisableLastKnownGood",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "226": {
+      "name": "NtDisplayString",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "227": {
+      "name": "NtDrawText",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "228": {
+      "name": "NtEnableLastKnownGood",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "229": {
+      "name": "NtEnumerateBootEntries",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "230": {
+      "name": "NtEnumerateDriverEntries",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "231": {
+      "name": "NtEnumerateSystemEnvironmentValuesEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "232": {
+      "name": "NtEnumerateTransactionObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "233": {
+      "name": "NtExtendSection",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "234": {
+      "name": "NtFilterBootOption",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "235": {
+      "name": "NtFilterToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "236": {
+      "name": "NtFilterTokenEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "237": {
+      "name": "NtFlushBuffersFileEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "238": {
+      "name": "NtFlushInstallUILanguage",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "239": {
+      "name": "NtFlushInstructionCache",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "240": {
+      "name": "NtFlushKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "241": {
+      "name": "NtFlushProcessWriteBuffers",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "242": {
+      "name": "NtFlushVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "243": {
+      "name": "NtFlushWriteBuffer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "244": {
+      "name": "NtFreeUserPhysicalPages",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "245": {
+      "name": "NtFreezeRegistry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "246": {
+      "name": "NtFreezeTransactions",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "247": {
+      "name": "NtGetCachedSigningLevel",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "248": {
+      "name": "NtGetCompleteWnfStateSubscription",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "249": {
+      "name": "NtGetContextThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "250": {
+      "name": "NtGetCurrentProcessorNumber",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "251": {
+      "name": "NtGetCurrentProcessorNumberEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "252": {
+      "name": "NtGetDevicePowerState",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "253": {
+      "name": "NtGetMUIRegistryInfo",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "254": {
+      "name": "NtGetNextProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "255": {
+      "name": "NtGetNextThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "256": {
+      "name": "NtGetNlsSectionPtr",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "257": {
+      "name": "NtGetNotificationResourceManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "258": {
+      "name": "NtGetWriteWatch",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "259": {
+      "name": "NtImpersonateAnonymousToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "260": {
+      "name": "NtImpersonateThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "261": {
+      "name": "NtInitializeEnclave",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "262": {
+      "name": "NtInitializeNlsFiles",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "263": {
+      "name": "NtInitializeRegistry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "264": {
+      "name": "NtInitiatePowerAction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "265": {
+      "name": "NtIsSystemResumeAutomatic",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "266": {
+      "name": "NtIsUILanguageComitted",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "267": {
+      "name": "NtListenPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "268": {
+      "name": "NtLoadDriver",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "269": {
+      "name": "NtLoadEnclaveData",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "270": {
+      "name": "NtLoadKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "271": {
+      "name": "NtLoadKey2",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "272": {
+      "name": "NtLoadKey3",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "273": {
+      "name": "NtLoadKeyEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "274": {
+      "name": "NtLockFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "275": {
+      "name": "NtLockProductActivationKeys",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "276": {
+      "name": "NtLockRegistryKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "277": {
+      "name": "NtLockVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "278": {
+      "name": "NtMakePermanentObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "279": {
+      "name": "NtMakeTemporaryObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "280": {
+      "name": "NtManageHotPatch",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "281": {
+      "name": "NtManagePartition",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "282": {
+      "name": "NtMapCMFModule",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "283": {
+      "name": "NtMapUserPhysicalPages",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "284": {
+      "name": "NtMapViewOfSectionEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "285": {
+      "name": "NtModifyBootEntry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "286": {
+      "name": "NtModifyDriverEntry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "287": {
+      "name": "NtNotifyChangeDirectoryFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "288": {
+      "name": "NtNotifyChangeDirectoryFileEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "289": {
+      "name": "NtNotifyChangeKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "290": {
+      "name": "NtNotifyChangeMultipleKeys",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "291": {
+      "name": "NtNotifyChangeSession",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "292": {
+      "name": "NtOpenCpuPartition",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "293": {
+      "name": "NtOpenEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "294": {
+      "name": "NtOpenEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "295": {
+      "name": "NtOpenIoCompletion",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "296": {
+      "name": "NtOpenJobObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "297": {
+      "name": "NtOpenKeyEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "298": {
+      "name": "NtOpenKeyTransacted",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "299": {
+      "name": "NtOpenKeyTransactedEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "300": {
+      "name": "NtOpenKeyedEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "301": {
+      "name": "NtOpenMutant",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "302": {
+      "name": "NtOpenObjectAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "303": {
+      "name": "NtOpenPartition",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "304": {
+      "name": "NtOpenPrivateNamespace",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "305": {
+      "name": "NtOpenProcessToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "306": {
+      "name": "NtOpenRegistryTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "307": {
+      "name": "NtOpenResourceManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "308": {
+      "name": "NtOpenSemaphore",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "309": {
+      "name": "NtOpenSession",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "310": {
+      "name": "NtOpenSymbolicLinkObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "311": {
+      "name": "NtOpenThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "312": {
+      "name": "NtOpenTimer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "313": {
+      "name": "NtOpenTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "314": {
+      "name": "NtOpenTransactionManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "315": {
+      "name": "NtPlugPlayControl",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "316": {
+      "name": "NtPrePrepareComplete",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "317": {
+      "name": "NtPrePrepareEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "318": {
+      "name": "NtPrepareComplete",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "319": {
+      "name": "NtPrepareEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "320": {
+      "name": "NtPrivilegeCheck",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "321": {
+      "name": "NtPrivilegeObjectAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "322": {
+      "name": "NtPrivilegedServiceAuditAlarm",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "323": {
+      "name": "NtPropagationComplete",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "324": {
+      "name": "NtPropagationFailed",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "325": {
+      "name": "NtPssCaptureVaSpaceBulk",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "326": {
+      "name": "NtPulseEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "327": {
+      "name": "NtQueryAuxiliaryCounterFrequency",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "328": {
+      "name": "NtQueryBootEntryOrder",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "329": {
+      "name": "NtQueryBootOptions",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "330": {
+      "name": "NtQueryDebugFilterState",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "331": {
+      "name": "NtQueryDirectoryFileEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "332": {
+      "name": "NtQueryDirectoryObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "333": {
+      "name": "NtQueryDriverEntryOrder",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "334": {
+      "name": "NtQueryEaFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "335": {
+      "name": "NtQueryFullAttributesFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "336": {
+      "name": "NtQueryInformationAtom",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "337": {
+      "name": "NtQueryInformationByName",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "338": {
+      "name": "NtQueryInformationCpuPartition",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "339": {
+      "name": "NtQueryInformationEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "340": {
+      "name": "NtQueryInformationJobObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "341": {
+      "name": "NtQueryInformationPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "342": {
+      "name": "NtQueryInformationResourceManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "343": {
+      "name": "NtQueryInformationTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "344": {
+      "name": "NtQueryInformationTransactionManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "345": {
+      "name": "NtQueryInformationWorkerFactory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "346": {
+      "name": "NtQueryInstallUILanguage",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "347": {
+      "name": "NtQueryIntervalProfile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "348": {
+      "name": "NtQueryIoCompletion",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "349": {
+      "name": "NtQueryIoRingCapabilities",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "350": {
+      "name": "NtQueryLicenseValue",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "351": {
+      "name": "NtQueryMultipleValueKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "352": {
+      "name": "NtQueryMutant",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "353": {
+      "name": "NtQueryOpenSubKeys",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "354": {
+      "name": "NtQueryOpenSubKeysEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "355": {
+      "name": "NtQueryPortInformationProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "356": {
+      "name": "NtQueryQuotaInformationFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "357": {
+      "name": "NtQuerySecurityAttributesToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "358": {
+      "name": "NtQuerySecurityObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "359": {
+      "name": "NtQuerySecurityPolicy",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "360": {
+      "name": "NtQuerySemaphore",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "361": {
+      "name": "NtQuerySymbolicLinkObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "362": {
+      "name": "NtQuerySystemEnvironmentValue",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "363": {
+      "name": "NtQuerySystemEnvironmentValueEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "364": {
+      "name": "NtQuerySystemInformationEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "365": {
+      "name": "NtQueryTimerResolution",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "366": {
+      "name": "NtQueryWnfStateData",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "367": {
+      "name": "NtQueryWnfStateNameInformation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "368": {
+      "name": "NtQueueApcThreadEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "369": {
+      "name": "NtQueueApcThreadEx2",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "370": {
+      "name": "NtRaiseException",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "371": {
+      "name": "NtRaiseHardError",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "372": {
+      "name": "NtReadOnlyEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "373": {
+      "name": "NtReadVirtualMemoryEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "374": {
+      "name": "NtRecoverEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "375": {
+      "name": "NtRecoverResourceManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "376": {
+      "name": "NtRecoverTransactionManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "377": {
+      "name": "NtRegisterProtocolAddressInformation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "378": {
+      "name": "NtRegisterThreadTerminatePort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "379": {
+      "name": "NtReleaseKeyedEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "380": {
+      "name": "NtReleaseWorkerFactoryWorker",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "381": {
+      "name": "NtRemoveIoCompletionEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "382": {
+      "name": "NtRemoveProcessDebug",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "383": {
+      "name": "NtRenameKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "384": {
+      "name": "NtRenameTransactionManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "385": {
+      "name": "NtReplaceKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "386": {
+      "name": "NtReplacePartitionUnit",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "387": {
+      "name": "NtReplyWaitReplyPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "388": {
+      "name": "NtRequestPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "389": {
+      "name": "NtResetEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "390": {
+      "name": "NtResetWriteWatch",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "391": {
+      "name": "NtRestoreKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "392": {
+      "name": "NtResumeProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "393": {
+      "name": "NtRevertContainerImpersonation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "394": {
+      "name": "NtRollbackComplete",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "395": {
+      "name": "NtRollbackEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "396": {
+      "name": "NtRollbackRegistryTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "397": {
+      "name": "NtRollbackTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "398": {
+      "name": "NtRollforwardTransactionManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "399": {
+      "name": "NtSaveKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "400": {
+      "name": "NtSaveKeyEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "401": {
+      "name": "NtSaveMergedKeys",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "402": {
+      "name": "NtSecureConnectPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "403": {
+      "name": "NtSerializeBoot",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "404": {
+      "name": "NtSetBootEntryOrder",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "405": {
+      "name": "NtSetBootOptions",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "406": {
+      "name": "NtSetCachedSigningLevel",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "407": {
+      "name": "NtSetCachedSigningLevel2",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "408": {
+      "name": "NtSetContextThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "409": {
+      "name": "NtSetDebugFilterState",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "410": {
+      "name": "NtSetDefaultHardErrorPort",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "411": {
+      "name": "NtSetDefaultLocale",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "412": {
+      "name": "NtSetDefaultUILanguage",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "413": {
+      "name": "NtSetDriverEntryOrder",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "414": {
+      "name": "NtSetEaFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "415": {
+      "name": "NtSetHighEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "416": {
+      "name": "NtSetHighWaitLowEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "417": {
+      "name": "NtSetIRTimer",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "418": {
+      "name": "NtSetInformationCpuPartition",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "419": {
+      "name": "NtSetInformationDebugObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "420": {
+      "name": "NtSetInformationEnlistment",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "421": {
+      "name": "NtSetInformationIoRing",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "422": {
+      "name": "NtSetInformationJobObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "423": {
+      "name": "NtSetInformationKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "424": {
+      "name": "NtSetInformationResourceManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "425": {
+      "name": "NtSetInformationSymbolicLink",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "426": {
+      "name": "NtSetInformationToken",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "427": {
+      "name": "NtSetInformationTransaction",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "428": {
+      "name": "NtSetInformationTransactionManager",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "429": {
+      "name": "NtSetInformationVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "430": {
+      "name": "NtSetInformationWorkerFactory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "431": {
+      "name": "NtSetIntervalProfile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "432": {
+      "name": "NtSetIoCompletion",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "433": {
+      "name": "NtSetIoCompletionEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "434": {
+      "name": "NtSetLdtEntries",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "435": {
+      "name": "NtSetLowEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "436": {
+      "name": "NtSetLowWaitHighEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "437": {
+      "name": "NtSetQuotaInformationFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "438": {
+      "name": "NtSetSecurityObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "439": {
+      "name": "NtSetSystemEnvironmentValue",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "440": {
+      "name": "NtSetSystemEnvironmentValueEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "441": {
+      "name": "NtSetSystemInformation",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "442": {
+      "name": "NtSetSystemPowerState",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "443": {
+      "name": "NtSetSystemTime",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "444": {
+      "name": "NtSetThreadExecutionState",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "445": {
+      "name": "NtSetTimer2",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "446": {
+      "name": "NtSetTimerEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "447": {
+      "name": "NtSetTimerResolution",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "448": {
+      "name": "NtSetUuidSeed",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "449": {
+      "name": "NtSetVolumeInformationFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "450": {
+      "name": "NtSetWnfProcessNotificationEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "451": {
+      "name": "NtShutdownSystem",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "452": {
+      "name": "NtShutdownWorkerFactory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "453": {
+      "name": "NtSignalAndWaitForSingleObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "454": {
+      "name": "NtSinglePhaseReject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "455": {
+      "name": "NtStartProfile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "456": {
+      "name": "NtStopProfile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "457": {
+      "name": "NtSubmitIoRing",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "458": {
+      "name": "NtSubscribeWnfStateChange",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "459": {
+      "name": "NtSuspendProcess",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "460": {
+      "name": "NtSuspendThread",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "461": {
+      "name": "NtSystemDebugControl",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "462": {
+      "name": "NtTerminateEnclave",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "463": {
+      "name": "NtTerminateJobObject",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "464": {
+      "name": "NtTestAlert",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "465": {
+      "name": "NtThawRegistry",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "466": {
+      "name": "NtThawTransactions",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "467": {
+      "name": "NtTraceControl",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "468": {
+      "name": "NtTranslateFilePath",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "469": {
+      "name": "NtUmsThreadYield",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "470": {
+      "name": "NtUnloadDriver",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "471": {
+      "name": "NtUnloadKey",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "472": {
+      "name": "NtUnloadKey2",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "473": {
+      "name": "NtUnloadKeyEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "474": {
+      "name": "NtUnlockFile",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "475": {
+      "name": "NtUnlockVirtualMemory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "476": {
+      "name": "NtUnmapViewOfSectionEx",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "477": {
+      "name": "NtUnsubscribeWnfStateChange",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "478": {
+      "name": "NtUpdateWnfStateData",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "479": {
+      "name": "NtVdmControl",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "480": {
+      "name": "NtWaitForAlertByThreadId",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "481": {
+      "name": "NtWaitForDebugEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "482": {
+      "name": "NtWaitForKeyedEvent",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "483": {
+      "name": "NtWaitForWorkViaWorkerFactory",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "484": {
+      "name": "NtWaitHighEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    },
+    "485": {
+      "name": "NtWaitLowEventPair",
+      "mechanism": "syscall (x64)",
+      "has_zw_pair": true
+    }
+  }
+}
