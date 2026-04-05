@@ -23,6 +23,7 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 - [Opening the GUI](#opening-the-gui)
 - [Using the CLI](#using-the-cli)
 - [CLI Command Reference (All 27 Commands)](#cli-command-reference-all-27-commands)
+- [Patching NT System Internals (.sys / Kernel-Mode Binaries)](#patching-nt-system-internals-sys--kernel-mode-binaries)
 - [GUI Tab Reference (All 13 Tabs)](#gui-tab-reference-all-13-tabs)
 - [Using with Visual Studio Code](#using-with-visual-studio-code)
 - [Using with GitHub Copilot](#using-with-github-copilot)
@@ -503,6 +504,185 @@ Changes the PE ImageBase and walks all relocation entries to fix up absolute add
 python win2k_analyzer.py hex-dump <pe_path> 0x1000 -l 0x100
 ```
 Dumps hex + ASCII at any RVA in a PE file. Useful for verifying patches.
+
+---
+
+## Patching NT System Internals (.sys / Kernel-Mode Binaries)
+
+The Win2K Analyzer fully supports patching **kernel-mode system binaries** — the core NT executables and drivers that make up the Windows 2000 kernel. All PE Patcher commands and the GUI (Tab 13) work on `.sys`, `.exe`, `.dll` kernel files equally.
+
+### Target System Files
+
+| File | Role | Common Patching Scenarios |
+|---|---|---|
+| `ntoskrnl.exe` | NT kernel executive | Version stamp, syscall mechanism (`sysenter` → `int 0x2E`), structure layout fixes |
+| `hal.dll` | Hardware Abstraction Layer | Calling convention shims (stdcall↔fastcall), HalpVector macro fix (`shl 8` → `shl 4`), HAL dispatch table entries |
+| `win32k.sys` | Win32 kernel subsystem | Syscall stubs, version stamp, export forwarding |
+| `ntdll.dll` | NT user→kernel transition layer | Syscall stub patching (`sysenter` → `int 0x2E`), version stamp |
+| `ACPI.sys` / `pci.sys` | Bus / power drivers | Rebase, calling convention shims, version stamp |
+| Any `.sys` driver | Third-party / ReactOS drivers | Full PE patching pipeline |
+
+### Step-by-Step: Patching a ReactOS Kernel Binary for Win2000
+
+#### 1. Analyze compatibility first
+
+Before patching, run `compat-analyze` to see exactly what differs between your Win2000 original and the ReactOS replacement:
+
+```bash
+# Compare ntoskrnl.exe
+python win2k_analyzer.py compat-analyze C:\win2k\ntoskrnl.exe C:\reactos\ntoskrnl.exe
+
+# Compare HAL
+python win2k_analyzer.py compat-analyze C:\win2k\hal.dll C:\reactos\hal.dll --label-a "Win2000 HAL" --label-b "ReactOS HAL"
+
+# Compare win32k.sys
+python win2k_analyzer.py compat-analyze C:\win2k\win32k.sys C:\reactos\win32k.sys
+```
+
+The report will flag:
+- **Version mismatch** (NT 5.1 vs 5.0)
+- **Syscall mechanism** (`sysenter`/`syscall` vs `int 0x2E`)
+- **Calling convention changes** (functions that switched from stdcall to fastcall)
+- **Missing/added exports**
+- **HalpVector bit-shift differences** (`shl 4` on Win2000, `shl 8` on XP)
+- **HAL dispatch table** entries removed in XP
+
+#### 2. Inspect the PE structure
+
+```bash
+# View all internal tables
+python win2k_analyzer.py inspect-pe C:\reactos\ntoskrnl.exe
+
+# Check exports specifically
+python win2k_analyzer.py inspect-pe C:\reactos\hal.dll -t exports
+
+# Verify relocations (critical for kernel rebasing)
+python win2k_analyzer.py inspect-pe C:\reactos\ACPI.sys -t relocations
+```
+
+#### 3. Quick-patch for version + syscalls
+
+The `--quick` flag handles the two most common issues in one shot — sets PE version to 5.0 (NT 2000) and patches `sysenter` → `int 0x2E`:
+
+```bash
+python win2k_analyzer.py patch-pe --quick C:\reactos\ntoskrnl.exe -o ntoskrnl_w2k.exe
+python win2k_analyzer.py patch-pe --quick C:\reactos\win32k.sys -o win32k_w2k.sys
+python win2k_analyzer.py patch-pe --quick C:\reactos\ntdll.dll -o ntdll_w2k.dll
+```
+
+#### 4. Fix calling convention differences (HAL / kernel functions)
+
+Several HAL I/O functions changed from `stdcall` (Win2000) to `fastcall` (XP/ReactOS). If a ReactOS driver calls these with the wrong convention, it will corrupt the stack and bugcheck. Apply shims:
+
+```bash
+# Fix IoReadPartitionTable: ReactOS uses fastcall, Win2000 expects stdcall
+python win2k_analyzer.py patch-pe C:\reactos\hal.dll --shim "IoReadPartitionTable,fastcall,stdcall,4"
+
+# Fix all four HAL I/O partition functions at once
+python win2k_analyzer.py patch-pe C:\reactos\hal.dll \
+  --shim "IoAssignDriveLetters,fastcall,stdcall,4" \
+  --shim "IoReadPartitionTable,fastcall,stdcall,4" \
+  --shim "IoSetPartitionInformation,fastcall,stdcall,4" \
+  --shim "IoWritePartitionTable,fastcall,stdcall,4" \
+  -o hal_w2k.dll
+
+# Fix IRQL spinlock fastcall wrappers
+python win2k_analyzer.py patch-pe C:\reactos\ntoskrnl.exe \
+  --shim "KfAcquireSpinLock,fastcall,stdcall,1" \
+  --shim "KfReleaseSpinLock,fastcall,stdcall,2" \
+  -o ntoskrnl_w2k.exe
+```
+
+**Known NT 5.0 → 5.1 calling convention changes detected by our tool:**
+
+| Function | Win2000 (5.0) | XP/ReactOS (5.1) |
+|---|---|---|
+| `IoAssignDriveLetters` | stdcall | fastcall |
+| `IoReadPartitionTable` | stdcall | fastcall |
+| `IoSetPartitionInformation` | stdcall | fastcall |
+| `IoWritePartitionTable` | stdcall | fastcall |
+| `IofCallDriver` | stdcall | fastcall |
+| `IofCompleteRequest` | stdcall | fastcall |
+| `KfAcquireSpinLock` | stdcall | fastcall |
+| `KfReleaseSpinLock` | stdcall | fastcall |
+| `KfRaiseIrql` | stdcall | fastcall |
+| `KfLowerIrql` | stdcall | fastcall |
+
+#### 5. Rebase kernel drivers
+
+Windows 2000 loads kernel images at specific base addresses. If a ReactOS driver uses a different ImageBase, rebase it:
+
+```bash
+# Rebase ntoskrnl to Win2000's expected address
+python win2k_analyzer.py rebase C:\reactos\ntoskrnl.exe 0x80400000 -o ntoskrnl_w2k.exe
+
+# Rebase hal.dll
+python win2k_analyzer.py rebase C:\reactos\hal.dll 0x80010000 -o hal_w2k.dll
+
+# Rebase a .sys driver
+python win2k_analyzer.py rebase C:\reactos\ACPI.sys 0x80000000 -o ACPI_w2k.sys
+```
+
+#### 6. Inject code blobs for kernel-mode hooks
+
+For advanced fixes (HalpVector macro, IDT dispatch routing, custom shims), compile and inject machine code:
+
+```bash
+# Compile a C shim and inject into hal.dll
+python win2k_analyzer.py compile-inject C:\reactos\hal.dll halpvector_fix.c --hook "HalpVectorToIRQL=0x00"
+
+# Inject a pre-built binary blob into a .sys driver
+python win2k_analyzer.py inject-blob C:\reactos\ACPI.sys acpi_shim.bin --hook "AcpiInitialize=0x00"
+```
+
+#### 7. Verify patches
+
+```bash
+# Hex dump to confirm int 0x2E bytes (CD 2E) replaced sysenter (0F 34)
+python win2k_analyzer.py hex-dump ntoskrnl_w2k.exe 0x1000 -l 0x100
+
+# Re-inspect the patched PE
+python win2k_analyzer.py inspect-pe ntoskrnl_w2k.exe
+
+# Run compat-analyze on patched vs original Win2000 binary
+python win2k_analyzer.py compat-analyze C:\win2k\ntoskrnl.exe ntoskrnl_w2k.exe
+```
+
+#### Full pipeline example — patching ReactOS ntoskrnl.exe for Windows 2000
+
+```bash
+# All-in-one: version 5.0 + syscalls + spinlock shims + rebase + strip debug
+python win2k_analyzer.py patch-pe C:\reactos\ntoskrnl.exe \
+  --version 5.0 \
+  --syscalls \
+  --shim "KfAcquireSpinLock,fastcall,stdcall,1" \
+  --shim "KfReleaseSpinLock,fastcall,stdcall,2" \
+  --rebase 0x80400000 \
+  --strip-debug \
+  -o ntoskrnl_w2k.exe
+```
+
+### Known Kernel-Mode Differences Detected
+
+Our compatibility analyzer automatically detects these NT 5.0 vs 5.1 kernel-mode issues:
+
+| Category | What It Detects |
+|---|---|
+| **Syscall mechanism** | `sysenter`/`syscall` (XP) vs `int 0x2E` (Win2000) |
+| **Calling conventions** | 10 HAL/kernel functions that changed stdcall → fastcall |
+| **HalpVector macro** | Bit-shift `shl 4` (Win2000) vs `shl 8` (XP) for IDT vector calc |
+| **HAL dispatch table** | Entries removed in XP (`HalIoAssignDriveLetters`, etc.) |
+| **IDT dispatch routing** | Direct vector vs `HalVectorToIDTEntry()` translation |
+| **Interrupt affinity** | Direct bitmask (2000) vs `HalpVectorToNode` NUMA table (XP) |
+| **Structure layout** | `KINTERRUPT` size change (0x1E8 → 0x1F0), field offsets |
+| **PE version stamp** | MajorOperatingSystemVersion / MajorSubsystemVersion |
+
+> **⚠️ WARNING:** Patching kernel-mode binaries is inherently dangerous. Always keep backups of your original system files. Test patched drivers in a virtual machine before deploying to real hardware. A bad kernel patch will cause a blue screen (BSOD). Use the `bugcheck` command to decode any resulting stop codes:
+> ```bash
+> python win2k_analyzer.py bugcheck 0x7F    # UNEXPECTED_KERNEL_MODE_TRAP
+> python win2k_analyzer.py bugcheck 0x0A    # IRQL_NOT_LESS_OR_EQUAL
+> python win2k_analyzer.py bugcheck 0x1E    # KMODE_EXCEPTION_NOT_HANDLED
+> ```
 
 ---
 
