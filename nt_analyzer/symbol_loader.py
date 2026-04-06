@@ -191,30 +191,183 @@ def load_sym_file(sym_path, image_base=None):
 #  PDB parsing (optional — requires pdbparse)
 # ---------------------------------------------------------------------------
 
-def load_pdb_file(pdb_path, image_base=None):
+def load_pdb_file(pdb_path, image_base=None, pe_path=None):
     """
     Parse a PDB file for public symbols.
-    Requires pdbparse: pip install pdbparse
+    Native support for PDB 2.0 (JG / MSF 2.0) — Win2K-era format.
+    Falls back to pdbparse for PDB 7.0 (DS / MSF 7.0) if installed.
+
+    Args:
+        pdb_path:   Path to the .pdb file
+        image_base: Override image base (auto-detected from PE if pe_path given)
+        pe_path:    Optional PE file for section header mapping
 
     Returns:
         dict of {virtual_address: symbol_name}
         metadata dict
     """
-    try:
-        import pdbparse
-        import pdbparse.pepi
-    except ImportError:
-        return {}, {'error': 'pdbparse not installed (pip install pdbparse)',
-                    'format': 'pdb', 'total_symbols': 0}
-
     symbols = {}
     meta = {'source': os.path.basename(pdb_path), 'format': 'pdb'}
     base = image_base or 0
 
     try:
-        pdb = pdbparse.parse(pdb_path)
+        with open(pdb_path, 'rb') as f:
+            data = f.read()
+    except Exception as e:
+        meta['error'] = f'Cannot read PDB: {e}'
+        return symbols, meta
 
-        # Try to get the OMAP or section headers for address translation
+    if len(data) < 64:
+        meta['error'] = 'File too small'
+        return symbols, meta
+
+    # Detect format: PDB 2.0 starts with "Microsoft C/C++ program database 2.00"
+    if data[:44] == b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00':
+        symbols, meta = _parse_pdb20(data, base, pe_path)
+    elif b'Microsoft C/C++ MSF 7.00' in data[:32]:
+        # PDB 7.0 — try pdbparse
+        symbols, meta = _parse_pdb70_via_pdbparse(pdb_path, base)
+    else:
+        meta['error'] = f'Unknown PDB format: {data[:24]}'
+
+    meta['total_symbols'] = len(symbols)
+    return symbols, meta
+
+
+def _parse_pdb20(data, base, pe_path=None):
+    """Native PDB 2.0 (JG / MSF 2.0) parser."""
+    import math
+    symbols = {}
+    meta = {'source': 'pdb20', 'format': 'pdb20'}
+
+    try:
+        # Header: signature(44) + page_size(u32) + start_page(u16) +
+        #         file_pages(u16) + root_size(u32) + reserved(u32)
+        page_size = struct.unpack_from('<I', data, 44)[0]
+        file_pages = struct.unpack_from('<H', data, 50)[0]
+        root_size = struct.unpack_from('<I', data, 52)[0]
+
+        if page_size == 0 or page_size > 0x10000:
+            meta['error'] = f'Invalid page size: {page_size}'
+            return symbols, meta
+
+        # Root page map at offset 60 (uint16 page numbers)
+        num_root_pages = math.ceil(root_size / page_size)
+        root_pages = [struct.unpack_from('<H', data, 60 + i * 2)[0]
+                      for i in range(num_root_pages)]
+
+        # Read root stream
+        root_data = bytearray()
+        for pn in root_pages:
+            start = pn * page_size
+            root_data.extend(data[start:start + page_size])
+        root_data = bytes(root_data[:root_size])
+
+        # Root directory: num_streams(u16), reserved(u16),
+        #   then per stream: size(u32) + reserved(u32),
+        #   then page maps (u16 per page) for all streams
+        num_streams = struct.unpack_from('<H', root_data, 0)[0]
+        off = 4
+        stream_sizes = []
+        for i in range(num_streams):
+            stream_sizes.append(struct.unpack_from('<I', root_data, off)[0])
+            off += 8  # size + reserved per entry
+
+        stream_pages = []
+        for sz in stream_sizes:
+            pn_count = math.ceil(sz / page_size) if sz > 0 else 0
+            pages = [struct.unpack_from('<H', root_data, off + j * 2)[0]
+                     for j in range(pn_count)]
+            off += pn_count * 2
+            stream_pages.append(pages)
+
+        def read_stream(idx):
+            if idx >= num_streams or stream_sizes[idx] == 0:
+                return b''
+            sd = bytearray()
+            for pn in stream_pages[idx]:
+                start = pn * page_size
+                sd.extend(data[start:start + page_size])
+            return bytes(sd[:stream_sizes[idx]])
+
+        meta['num_streams'] = num_streams
+        meta['page_size'] = page_size
+
+        # Get section headers from PE (needed for segment:offset → RVA)
+        section_vas = {}
+        if pe_path:
+            try:
+                import pefile
+                pe = pefile.PE(pe_path, fast_load=True)
+                for i, s in enumerate(pe.sections):
+                    section_vas[i + 1] = s.VirtualAddress
+                if base == 0:
+                    base = pe.OPTIONAL_HEADER.ImageBase
+                pe.close()
+            except Exception:
+                pass
+
+        # Stream 7 = GSI (Global Symbol Information) in typical PDB 2.0
+        # Parse symbol records — type 0x1009 = S_PUB32_16t
+        for stream_idx in (7, 6, 5):
+            if stream_idx >= num_streams:
+                continue
+            gsi = read_stream(stream_idx)
+            if len(gsi) < 4:
+                continue
+            sym_off = 0
+            found = 0
+            while sym_off + 4 <= len(gsi):
+                reclen = struct.unpack_from('<H', gsi, sym_off)[0]
+                if reclen < 2 or sym_off + 2 + reclen > len(gsi):
+                    break
+                rectyp = struct.unpack_from('<H', gsi, sym_off + 2)[0]
+                rec = gsi[sym_off + 4:sym_off + 2 + reclen]
+
+                if rectyp == 0x1009 and len(rec) >= 11:
+                    # S_PUB32_16t: flags(u32), offset(u32), segment(u16),
+                    #              name_len(u8), name(chars)
+                    offset_val = struct.unpack_from('<I', rec, 4)[0]
+                    segment = struct.unpack_from('<H', rec, 8)[0]
+                    name_len = rec[10]
+                    if name_len > 0 and 11 + name_len <= len(rec):
+                        name = rec[11:11 + name_len].decode('ascii', errors='replace')
+                        clean = _undecorate(name)
+                        if clean and not clean.startswith('.'):
+                            if segment in section_vas:
+                                rva = section_vas[segment] + offset_val
+                                va = base + rva
+                            else:
+                                va = base + offset_val
+                            symbols[va] = clean
+                            found += 1
+
+                sym_off += 2 + reclen
+                if sym_off % 4:
+                    sym_off += 4 - (sym_off % 4)
+
+            if found > 0:
+                meta['symbol_stream'] = stream_idx
+                break
+
+    except Exception as e:
+        meta['error'] = f'PDB 2.0 parse error: {e}'
+
+    return symbols, meta
+
+
+def _parse_pdb70_via_pdbparse(pdb_path, base):
+    """Parse PDB 7.0 via pdbparse library."""
+    meta = {'format': 'pdb70', 'source': os.path.basename(pdb_path)}
+    symbols = {}
+    try:
+        import pdbparse
+    except ImportError:
+        meta['error'] = 'PDB 7.0 requires pdbparse (pip install pdbparse)'
+        return symbols, meta
+
+    try:
+        pdb = pdbparse.parse(pdb_path)
         try:
             sects = pdb.STREAM_SECT_HDR_ORIG.sections
         except AttributeError:
@@ -223,14 +376,12 @@ def load_pdb_file(pdb_path, image_base=None):
             except AttributeError:
                 sects = []
 
-        # Get public symbols (global symbols stream)
         try:
             gsyms = pdb.STREAM_GSYM
             for sym in gsyms.globals:
                 if hasattr(sym, 'offset') and hasattr(sym, 'segment'):
                     name = getattr(sym, 'name', None)
                     if name:
-                        # Convert segment:offset to RVA
                         seg_idx = sym.segment - 1
                         if 0 <= seg_idx < len(sects):
                             rva = sects[seg_idx].VirtualAddress + sym.offset
@@ -241,27 +392,9 @@ def load_pdb_file(pdb_path, image_base=None):
         except AttributeError:
             pass
 
-        # Also try DBI stream public symbols
-        try:
-            pdb_publics = pdb.STREAM_DBI
-            if hasattr(pdb_publics, 'publics'):
-                for pub in pdb_publics.publics:
-                    if hasattr(pub, 'offset') and hasattr(pub, 'name'):
-                        name = pub.name
-                        seg_idx = getattr(pub, 'segment', 1) - 1
-                        if 0 <= seg_idx < len(sects):
-                            rva = sects[seg_idx].VirtualAddress + pub.offset
-                        else:
-                            rva = pub.offset
-                        va = base + rva
-                        symbols[va] = _undecorate(name)
-        except (AttributeError, Exception):
-            pass
-
     except Exception as e:
-        meta['error'] = f'PDB parse error: {e}'
+        meta['error'] = f'PDB 7.0 parse error: {e}'
 
-    meta['total_symbols'] = len(symbols)
     return symbols, meta
 
 
@@ -305,9 +438,8 @@ def load_dbg_file(dbg_path, image_base=None):
         if image_base is None:
             base = image_base_dbg
 
-        # COFF symbol table is after section headers and debug directories
-        # We'll try to find the COFF symbols at the debug directory offset
-        offset = 48 + num_sections * 40  # after section headers
+        # Debug directories follow: header (48) + section headers + exported names
+        offset = 48 + num_sections * 40 + exported_names_size
 
         # Look for IMAGE_DEBUG_TYPE_COFF (1) in debug directories
         debug_dir_offset = offset
@@ -323,6 +455,14 @@ def load_dbg_file(dbg_path, image_base=None):
                 coff_data = data[dd_ptr:dd_ptr + dd_size]
                 coff_symbols = _parse_coff_symbols(coff_data, base)
                 symbols.update(coff_symbols)
+            elif dd_type == 3 and dd_ptr + dd_size <= len(data):  # FPO
+                meta['fpo_entries'] = dd_size // 16
+            elif dd_type == 2 and dd_ptr + dd_size <= len(data):  # CodeView
+                cv_data = data[dd_ptr:dd_ptr + dd_size]
+                if cv_data[:4] in (b'NB10', b'NB09'):
+                    # NB10 has 12-byte header then PDB filename
+                    pdb_name = cv_data[16:].split(b'\x00', 1)[0].decode('ascii', errors='replace')
+                    meta['pdb_reference'] = pdb_name
 
     except Exception as e:
         meta['error'] = f'DBG parse error: {e}'
@@ -410,13 +550,14 @@ def _undecorate(name):
 #  Unified loader — auto-detect format
 # ---------------------------------------------------------------------------
 
-def load_symbols(path, image_base=None):
+def load_symbols(path, image_base=None, pe_path=None):
     """
     Auto-detect file format and load symbols.
 
     Args:
         path: Path to .map, .pdb, .dbg, or .sym file
         image_base: Override image base address (auto-detected if possible)
+        pe_path: Optional PE file path for section header mapping (PDB 2.0)
 
     Returns:
         tuple of (symbols_dict, metadata_dict)
@@ -428,7 +569,7 @@ def load_symbols(path, image_base=None):
     if ext == '.map':
         return load_map_file(path, image_base)
     elif ext == '.pdb':
-        return load_pdb_file(path, image_base)
+        return load_pdb_file(path, image_base, pe_path=pe_path)
     elif ext == '.dbg':
         return load_dbg_file(path, image_base)
     elif ext in ('.sym', '.txt'):

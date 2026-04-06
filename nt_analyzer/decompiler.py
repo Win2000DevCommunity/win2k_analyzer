@@ -1539,20 +1539,28 @@ class X86Decompiler:
         m = re.search(r'\[(\w+)\s*\+\s*(0x[0-9a-fA-F]+)\]', op_str)
         if not m:
             return ""
+        reg = m.group(1).lower()
+        # Skip stack frame registers — these are params/locals, not struct ptrs
+        if reg in ('ebp', 'esp', 'rbp', 'rsp'):
+            return ""
         try:
             offset = int(m.group(2), 16)
         except ValueError:
             return ""
+        # Check parameters with known struct types first (high confidence)
         for p in info.params:
             if p.struct_type:
                 fields = KNOWN_STRUCTURES.get(p.struct_type, {})
                 if offset in fields:
                     ct, fn = fields[offset]
                     return f"{p.name}->{fn} ({ct})"
-        for stype, fields in KNOWN_STRUCTURES.items():
+        # Check register-to-struct tracking from data flow
+        if hasattr(info, 'reg_structs') and reg in info.reg_structs:
+            stype = info.reg_structs[reg]
+            fields = KNOWN_STRUCTURES.get(stype, {})
             if offset in fields:
                 ct, fn = fields[offset]
-                return f"? {stype}->{fn}"
+                return f"{stype}->{fn} ({ct})"
         return ""
 
     # ── Operand resolution ───────────────────────────────────────────────

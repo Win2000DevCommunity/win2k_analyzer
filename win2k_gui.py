@@ -815,7 +815,7 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
         output_widget.new_tab(f"Disasm{sym_tag}: {func_name}")
         def work():
             if use_sym and sym_path:
-                syms = _sym_loader().load_symbols(sym_path)
+                syms = _sym_loader().load_symbols(sym_path, pe_path=pe_path)
                 fm = _deep_analyzer().PEFunctionMap(pe_path)
                 fm.discover_all_functions()
                 fm.analyze_all_functions()
@@ -2194,7 +2194,7 @@ class BehaviorTab(ttk.Frame):
             progress_cb(f"Loading PE: {os.path.basename(path)}", 10)
             if use_sym and sym_path:
                 progress_cb(f"Loading symbols\u2026", 20)
-                syms = _sym_loader().load_symbols(sym_path)
+                syms = _sym_loader().load_symbols(sym_path, pe_path=path)
                 progress_cb(f"Building function map\u2026", 30)
                 fm = _deep_analyzer().PEFunctionMap(path, progress_callback=progress_cb)
                 fm.discover_all_functions()
@@ -2834,7 +2834,7 @@ class DecompilerTab(ttk.Frame):
         self.status_var.set(f"\u23F3 Loading symbols from {os.path.basename(sym_path)}...")
 
         def work():
-            return _sym_loader().load_symbols(sym_path)
+            return _sym_loader().load_symbols(sym_path, pe_path=self._get_pe())
 
         def done(result):
             if isinstance(result, Exception):
@@ -3530,11 +3530,15 @@ class DeepAnalyzerTab(ttk.Frame):
             return
         self.status_var.set("\u23F3 Loading symbols\u2026")
         def work():
-            syms = _sym_loader().load_symbols(sym_path)
+            result = _sym_loader().load_symbols(sym_path, pe_path=self._get_pe())
+            if isinstance(result, tuple):
+                sym_dict, _ = result
+            else:
+                sym_dict = result
+            if not isinstance(sym_dict, dict):
+                return 0
             merged = 0
-            for sym in syms:
-                va = sym.get('address', 0)
-                name = sym.get('name', '')
+            for va, name in sym_dict.items():
                 if va in self._func_map.functions and name:
                     self._func_map.functions[va].name = name
                     self._func_map._va_to_name[va] = name

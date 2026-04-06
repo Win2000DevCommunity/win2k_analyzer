@@ -362,7 +362,9 @@ def cmd_behavior(args):
         categories = scan_all_exports(args.dll, args.max or 200)
         for cat, funcs in sorted(categories.items(), key=lambda x: -len(x[1])):
             print(f"\n  [{cat}] ({len(funcs)} functions)")
-            for fname, fdesc in funcs[:20]:
+            for entry in funcs[:20]:
+                fname = entry[0]
+                fdesc = entry[1] if len(entry) > 1 else ""
                 print(f"    {fname:<48} {fdesc}")
             if len(funcs) > 20:
                 print(f"    ... +{len(funcs)-20} more")
