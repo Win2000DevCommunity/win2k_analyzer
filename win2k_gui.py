@@ -757,13 +757,14 @@ def _extract_func_from_click(event, output_widget):
         return None
 
 
-def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
+def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mode_var=None):
     """Register func_link tag on a TabbedOutput so clicking a function name
-    opens a mode-picker menu (Assembly / Pseudo-C / Hex Dump).
+    opens a new tab with the decompilation mode selected in mode_var.
 
     pe_path_getter: callable returning the PE file path
     app_ref: the main Win2KAnalyzerApp for after() and target tab lookup
     sym_getter: optional callable returning (use_sym:bool, sym_path:str|None)
+    mode_var: optional StringVar ('Assembly'|'Pseudo-C'|'Hex Dump'); defaults to Assembly
     """
     output_widget.tag_configure("func_link", foreground="#89b4fa", underline=True)
 
@@ -913,9 +914,6 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
             app_ref.after(0, done, result)
         run_async(work, callback)
 
-    # Store persistent reference so the menu doesn't get garbage-collected
-    _menu_ref = [None]
-
     def on_click(event):
         func_name = _extract_func_from_click(event, output_widget)
         if not func_name:
@@ -923,30 +921,13 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
         pe_path = pe_path_getter()
         if not pe_path:
             return
-        # Capture coordinates now — event object may be recycled
-        rx, ry = event.x_root, event.y_root
-
-        def _show_menu():
-            # Destroy old menu if any
-            if _menu_ref[0]:
-                try:
-                    _menu_ref[0].destroy()
-                except Exception:
-                    pass
-            menu = tk.Menu(app_ref, tearoff=0,
-                           bg="#1e1e2e", fg="#cdd6f4", activebackground="#45475a",
-                           activeforeground="#cdd6f4", font=("Consolas", 10))
-            menu.add_command(label="\U0001F4BB  Assembly",
-                             command=lambda: _do_asm(func_name, pe_path))
-            menu.add_command(label="\U0001F5A5  Pseudo-C",
-                             command=lambda: _do_pseudoc(func_name, pe_path))
-            menu.add_command(label="HEX  Hex Dump",
-                             command=lambda: _do_hex(func_name, pe_path))
-            _menu_ref[0] = menu
-            menu.tk_popup(rx, ry)
-
-        # Delay popup so the Button-1 release doesn't dismiss it immediately
-        app_ref.after(150, _show_menu)
+        mode = mode_var.get() if mode_var else "Assembly"
+        if mode == "Pseudo-C":
+            _do_pseudoc(func_name, pe_path)
+        elif mode == "Hex Dump":
+            _do_hex(func_name, pe_path)
+        else:
+            _do_asm(func_name, pe_path)
 
     output_widget.tag_bind("func_link", "<Button-1>", on_click)
     output_widget.tag_bind("func_link", "<Enter>",
@@ -1065,13 +1046,19 @@ class ExportImportTab(ttk.Frame):
                    command=self._save_json).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
                    command=lambda: self.output.close_all()).pack(side="left", padx=5)
+        ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
+        ttk.Label(btn_frm, text="Click mode:").pack(side="left", padx=(0, 3))
+        self._click_mode_var = tk.StringVar(value="Assembly")
+        ttk.Combobox(btn_frm, textvariable=self._click_mode_var, width=10,
+                     values=["Assembly", "Pseudo-C", "Hex Dump"],
+                     state="readonly").pack(side="left", padx=2)
 
         self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
             self, "\u2022 Select a PE file (ntdll.dll, kernel32.dll, hal.dll, win32k.sys, ...)", row=2)
 
         self.output = TabbedOutput(self)
         self.output.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        setup_func_link(self.output, self._get_dll, app)
+        setup_func_link(self.output, self._get_dll, app, mode_var=self._click_mode_var)
         self._last_data = None
 
     def _run_exports(self):
@@ -2090,6 +2077,12 @@ class BehaviorTab(ttk.Frame):
                                  values=["win2k", "winxp", "win2k3", "vista", "win7", "win10", "win11"],
                                  state="readonly")
         ver_combo.pack(side="left", padx=5)
+        # Struct display mode
+        ttk.Label(lim_frm, text="   Structs:").pack(side="left", padx=5)
+        self._struct_mode_var = tk.StringVar(value="Database")
+        ttk.Combobox(lim_frm, textvariable=self._struct_mode_var, width=12,
+                     values=["Raw Offsets", "Database", "Symbols"],
+                     state="readonly").pack(side="left", padx=2)
 
         # ── Symbol & history row ──
         sym_frm = tk.Frame(self, bg=T["bg"])
@@ -2114,15 +2107,21 @@ class BehaviorTab(ttk.Frame):
         self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
             self, "\u2022 Compare function behavior between Win2000 and ReactOS binaries", row=6)
 
+        # Click mode selector
+        click_frm = tk.Frame(self, bg=T["bg"])
+        click_frm.grid(row=7, column=0, sticky="w", padx=12, pady=0)
+        ttk.Label(click_frm, text="Click mode:").pack(side="left", padx=(0, 3))
+        self._click_mode_var = tk.StringVar(value="Assembly")
+        ttk.Combobox(click_frm, textvariable=self._click_mode_var, width=10,
+                     values=["Assembly", "Pseudo-C", "Hex Dump"],
+                     state="readonly").pack(side="left", padx=2)
+
         self.output = TabbedOutput(self)
         self.output.grid(row=8, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        # Clickable function tag
-        self.output.tag_configure("func_link", foreground="#89b4fa", underline=True)
-        self.output.tag_bind("func_link", "<Button-1>", self._on_func_click)
-        self.output.tag_bind("func_link", "<Enter>",
-                             lambda e: self.output.configure(cursor="hand2"))
-        self.output.tag_bind("func_link", "<Leave>",
-                             lambda e: self.output.configure(cursor=""))
+        def _sym_getter():
+            return (self._use_sym_var.get(), self._sym_entry.get_value())
+        setup_func_link(self.output, self._get_a, self.app,
+                        sym_getter=_sym_getter, mode_var=self._click_mode_var)
 
     # ── Symbol browsing ──
     def _browse_symbols(self):
@@ -2166,28 +2165,6 @@ class BehaviorTab(ttk.Frame):
             self._hist_var.set(f"History: {self._history_idx + 1}/{n}")
         else:
             self._hist_var.set("")
-
-    # ── Click-on-function handler ──
-    def _on_func_click(self, event):
-        txt = self.output._cur()
-        if not txt:
-            return
-        try:
-            idx = txt.index(f"@{event.x},{event.y}")
-            # Get text covered by the func_link tag at click position
-            tags = txt.tag_names(idx)
-            if "func_link" not in tags:
-                return
-            # Walk back/forward to find the extent of the func_link tag
-            r = txt.tag_prevrange("func_link", f"{idx}+1c")
-            if not r:
-                return
-            func_name = txt.get(r[0], r[1]).strip()
-        except Exception:
-            return
-        if func_name:
-            self._func_entry.set_value(func_name)
-            self._disasm()
 
     def _get_func(self):
         return self._func_entry.get_value()
@@ -2460,46 +2437,96 @@ class BehaviorTab(ttk.Frame):
                         output_write(self.output, f"  RVA:0x{rva:08X}  VA:0x{va:08X}", "dim")
                     # Description (blocks, instructions)
                     output_write(self.output, f"\n        {fdesc}", "")
-                    # Struct field accesses (data-flow identified)
+                    # Struct field accesses — display depends on struct mode
                     struct_fields = info.get('struct_fields', {})
                     struct_ofs = info.get('struct_offsets', [])
-                    if struct_fields:
-                        # Group by struct name
-                        by_struct = {}
-                        for ofs_key, field_list in struct_fields.items():
-                            for sname, fname, ftype, cnt in field_list:
-                                if sname not in by_struct:
-                                    by_struct[sname] = []
-                                by_struct[sname].append((ofs_key, fname, ftype, cnt))
-                        for sname in sorted(by_struct.keys()):
-                            fields = by_struct[sname]
-                            field_strs = [f'+{o} {fn}' for o, fn, ft, c in fields]
-                            output_write(self.output,
-                                f"\n        {sname}: ", "ok")
-                            output_write(self.output,
-                                f"{', '.join(field_strs)}", "peach")
-                        # Also show raw offsets that weren't identified
-                        identified_offsets = set(struct_fields.keys())
-                        unknown = [o for o in struct_ofs if o not in identified_offsets]
-                        if unknown:
+                    struct_mode = self._struct_mode_var.get()
+                    if struct_mode == "Raw Offsets":
+                        # Always show raw offsets only
+                        if struct_ofs:
+                            seen = []
+                            for o in struct_ofs:
+                                if o not in seen:
+                                    seen.append(o)
                             try:
-                                unknown.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
+                                seen.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
                             except Exception:
                                 pass
                             output_write(self.output,
-                                f"\n        unresolved offsets: [{','.join(unknown)}]", "dim")
-                    elif struct_ofs:
-                        # Fallback: show raw offsets
-                        seen = []
-                        for o in struct_ofs:
-                            if o not in seen:
-                                seen.append(o)
-                        try:
-                            seen.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
-                        except Exception:
-                            pass
-                        output_write(self.output,
-                            f"  structs:[{','.join(seen)}]", "peach")
+                                f"  structs:[{','.join(seen)}]", "peach")
+                    elif struct_mode == "Symbols":
+                        # Try symbol-based resolution first, fall back to database
+                        sym_fields = info.get('sym_struct_fields', {})
+                        if sym_fields:
+                            for sname in sorted(sym_fields.keys()):
+                                fields = sym_fields[sname]
+                                field_strs = [f'+{o} {fn}' for o, fn in fields]
+                                output_write(self.output,
+                                    f"\n        {sname}: ", "ok")
+                                output_write(self.output,
+                                    f"{', '.join(field_strs)}", "peach")
+                        elif struct_fields:
+                            # Fall back to database
+                            by_struct = {}
+                            for ofs_key, field_list in struct_fields.items():
+                                for sname, fname_f, ftype, cnt in field_list:
+                                    if sname not in by_struct:
+                                        by_struct[sname] = []
+                                    by_struct[sname].append((ofs_key, fname_f, ftype, cnt))
+                            for sname in sorted(by_struct.keys()):
+                                fields = by_struct[sname]
+                                field_strs = [f'+{o} {fn}' for o, fn, ft, c in fields]
+                                output_write(self.output,
+                                    f"\n        {sname} (db): ", "ok")
+                                output_write(self.output,
+                                    f"{', '.join(field_strs)}", "peach")
+                        elif struct_ofs:
+                            seen = []
+                            for o in struct_ofs:
+                                if o not in seen:
+                                    seen.append(o)
+                            try:
+                                seen.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
+                            except Exception:
+                                pass
+                            output_write(self.output,
+                                f"  structs:[{','.join(seen)}]", "peach")
+                    else:
+                        # Database mode (default)
+                        if struct_fields:
+                            by_struct = {}
+                            for ofs_key, field_list in struct_fields.items():
+                                for sname, fname_f, ftype, cnt in field_list:
+                                    if sname not in by_struct:
+                                        by_struct[sname] = []
+                                    by_struct[sname].append((ofs_key, fname_f, ftype, cnt))
+                            for sname in sorted(by_struct.keys()):
+                                fields = by_struct[sname]
+                                field_strs = [f'+{o} {fn}' for o, fn, ft, c in fields]
+                                output_write(self.output,
+                                    f"\n        {sname}: ", "ok")
+                                output_write(self.output,
+                                    f"{', '.join(field_strs)}", "peach")
+                            identified_offsets = set(struct_fields.keys())
+                            unknown = [o for o in struct_ofs if o not in identified_offsets]
+                            if unknown:
+                                try:
+                                    unknown.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
+                                except Exception:
+                                    pass
+                                output_write(self.output,
+                                    f"\n        unresolved offsets: [{','.join(unknown)}]", "dim")
+                        elif struct_ofs:
+                            seen = []
+                            for o in struct_ofs:
+                                if o not in seen:
+                                    seen.append(o)
+                            try:
+                                seen.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
+                            except Exception:
+                                pass
+                            output_write(self.output,
+                                f"  structs:[{','.join(seen)}]", "peach")
                     # API calls (deduplicated with counts)
                     apis = info.get('api_calls', [])
                     if apis:
@@ -2765,12 +2792,19 @@ class DecompilerTab(ttk.Frame):
         ttk.Label(sym_frm, textvariable=self.sym_status_var, foreground=T["green"],
                   font=("Segoe UI", 9)).grid(row=0, column=4, padx=(8, 0))
 
+        # Click mode in lim_frm
+        ttk.Label(lim_frm, text="   Click mode:").pack(side="left", padx=5)
+        self._click_mode_var = tk.StringVar(value="Assembly")
+        ttk.Combobox(lim_frm, textvariable=self._click_mode_var, width=10,
+                     values=["Assembly", "Pseudo-C", "Hex Dump"],
+                     state="readonly").pack(side="left", padx=2)
+
         self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
             self, "\u2022 Decompile PE exports to C pseudocode \u2014 recognizes kernel APIs, NTSTATUS, IRP codes", row=5)
 
         self.output = TabbedOutput(self)
         self.output.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        setup_func_link(self.output, self._get_pe, app)
+        setup_func_link(self.output, self._get_pe, app, mode_var=self._click_mode_var)
 
     def _get_func(self):
         return self._func_entry.get_value()
@@ -3091,13 +3125,19 @@ class CompatAnalyzerTab(ttk.Frame):
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
                    command=lambda: self.output.close_all()).pack(side="left", padx=5)
+        ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
+        ttk.Label(btn_frm, text="Click mode:").pack(side="left", padx=(0, 3))
+        self._click_mode_var = tk.StringVar(value="Assembly")
+        ttk.Combobox(btn_frm, textvariable=self._click_mode_var, width=10,
+                     values=["Assembly", "Pseudo-C", "Hex Dump"],
+                     state="readonly").pack(side="left", padx=2)
 
         self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
             self, "\u2022 Deep NT version compatibility analysis \u2014 detects syscall, calling convention, and structure differences", row=4)
 
         self.output = TabbedOutput(self)
         self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        setup_func_link(self.output, self._get_a, app)
+        setup_func_link(self.output, self._get_a, app, mode_var=self._click_mode_var)
 
     def _analyze_both(self):
         pa, pb = self._get_a(), self._get_b()
@@ -3441,9 +3481,16 @@ class DeepAnalyzerTab(ttk.Frame):
         ttk.Button(sym_frm, text="Browse\u2026", command=self._browse_symbols).pack(side="left", padx=5)
         ttk.Button(sym_frm, text="Load", command=self._load_symbols).pack(side="left", padx=3)
 
+        # Click mode in opt_frm
+        ttk.Label(opt_frm, text="   Click mode:").pack(side="left", padx=5)
+        self._click_mode_var = tk.StringVar(value="Assembly")
+        ttk.Combobox(opt_frm, textvariable=self._click_mode_var, width=10,
+                     values=["Assembly", "Pseudo-C", "Hex Dump"],
+                     state="readonly").pack(side="left", padx=2)
+
         self.output = TabbedOutput(self)
         self.output.grid(row=10, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        setup_func_link(self.output, self._get_pe, app)
+        setup_func_link(self.output, self._get_pe, app, mode_var=self._click_mode_var)
 
         # Right-click context menu on output
         self._context_menu = tk.Menu(self.output, tearoff=0,
