@@ -149,8 +149,8 @@ IO_STACK_LOCATION_FIELDS = {
     0x00: ("UCHAR", "MajorFunction"), 0x01: ("UCHAR", "MinorFunction"),
     0x02: ("UCHAR", "Flags"), 0x03: ("UCHAR", "Control"),
     0x04: ("ULONG", "Parameters"),
-    0x18: ("PDEVICE_OBJECT", "DeviceObject"), 0x1C: ("PFILE_OBJECT", "FileObject"),
-    0x20: ("PIO_COMPLETION_ROUTINE", "CompletionRoutine"), 0x24: ("PVOID", "Context"),
+    0x14: ("PDEVICE_OBJECT", "DeviceObject"), 0x18: ("PFILE_OBJECT", "FileObject"),
+    0x1C: ("PIO_COMPLETION_ROUTINE", "CompletionRoutine"), 0x20: ("PVOID", "Context"),
 }
 
 FILE_OBJECT_FIELDS = {
