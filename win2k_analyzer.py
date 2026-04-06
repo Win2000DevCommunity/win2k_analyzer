@@ -27,6 +27,12 @@ import os
 import sys
 import glob
 
+# Ensure Unicode output works on Windows consoles (→ arrows, etc.)
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 from nt_analyzer.pe_analyzer import (
     analyze_exports, analyze_imports, analyze_pe_header,
     save_exports_json, save_imports_json
