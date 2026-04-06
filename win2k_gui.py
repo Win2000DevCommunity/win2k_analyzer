@@ -913,6 +913,9 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
             app_ref.after(0, done, result)
         run_async(work, callback)
 
+    # Store persistent reference so the menu doesn't get garbage-collected
+    _menu_ref = [None]
+
     def on_click(event):
         func_name = _extract_func_from_click(event, output_widget)
         if not func_name:
@@ -924,6 +927,12 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
         rx, ry = event.x_root, event.y_root
 
         def _show_menu():
+            # Destroy old menu if any
+            if _menu_ref[0]:
+                try:
+                    _menu_ref[0].destroy()
+                except Exception:
+                    pass
             menu = tk.Menu(app_ref, tearoff=0,
                            bg="#1e1e2e", fg="#cdd6f4", activebackground="#45475a",
                            activeforeground="#cdd6f4", font=("Consolas", 10))
@@ -933,10 +942,11 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
                              command=lambda: _do_pseudoc(func_name, pe_path))
             menu.add_command(label="HEX  Hex Dump",
                              command=lambda: _do_hex(func_name, pe_path))
+            _menu_ref[0] = menu
             menu.tk_popup(rx, ry)
 
         # Delay popup so the Button-1 release doesn't dismiss it immediately
-        app_ref.after(50, _show_menu)
+        app_ref.after(150, _show_menu)
 
     output_widget.tag_bind("func_link", "<Button-1>", on_click)
     output_widget.tag_bind("func_link", "<Enter>",
@@ -2073,6 +2083,13 @@ class BehaviorTab(ttk.Frame):
         dll_dir_ent.pack(side="left", padx=5)
         app.register_placeholder(dll_dir_ent)
         self._dll_dir_entry = dll_dir_ent
+        # Windows version selector for struct field analysis
+        ttk.Label(lim_frm, text="   Target OS:").pack(side="left", padx=5)
+        self._version_var = tk.StringVar(value="win2k")
+        ver_combo = ttk.Combobox(lim_frm, textvariable=self._version_var, width=18,
+                                 values=["win2k", "winxp", "win2k3", "vista", "win7", "win10", "win11"],
+                                 state="readonly")
+        ver_combo.pack(side="left", padx=5)
 
         # ── Symbol & history row ──
         sym_frm = tk.Frame(self, bg=T["bg"])
@@ -2410,10 +2427,11 @@ class BehaviorTab(ttk.Frame):
             max_funcs = int(self.max_var.get())
         except ValueError:
             max_funcs = 100
+        version = self._version_var.get() or 'win2k'
         self.output.new_tab("Scan All")
 
         def work(progress_cb):
-            return _behavior().scan_all_exports(path, max_funcs, progress_callback=progress_cb)
+            return _behavior().scan_all_exports(path, max_funcs, progress_callback=progress_cb, version=version)
 
         def done(result):
             if isinstance(result, Exception):
@@ -2442,9 +2460,36 @@ class BehaviorTab(ttk.Frame):
                         output_write(self.output, f"  RVA:0x{rva:08X}  VA:0x{va:08X}", "dim")
                     # Description (blocks, instructions)
                     output_write(self.output, f"\n        {fdesc}", "")
-                    # Struct offset accesses (deduplicated, sorted numerically)
+                    # Struct field accesses (data-flow identified)
+                    struct_fields = info.get('struct_fields', {})
                     struct_ofs = info.get('struct_offsets', [])
-                    if struct_ofs:
+                    if struct_fields:
+                        # Group by struct name
+                        by_struct = {}
+                        for ofs_key, field_list in struct_fields.items():
+                            for sname, fname, ftype, cnt in field_list:
+                                if sname not in by_struct:
+                                    by_struct[sname] = []
+                                by_struct[sname].append((ofs_key, fname, ftype, cnt))
+                        for sname in sorted(by_struct.keys()):
+                            fields = by_struct[sname]
+                            field_strs = [f'+{o} {fn}' for o, fn, ft, c in fields]
+                            output_write(self.output,
+                                f"\n        {sname}: ", "ok")
+                            output_write(self.output,
+                                f"{', '.join(field_strs)}", "peach")
+                        # Also show raw offsets that weren't identified
+                        identified_offsets = set(struct_fields.keys())
+                        unknown = [o for o in struct_ofs if o not in identified_offsets]
+                        if unknown:
+                            try:
+                                unknown.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
+                            except Exception:
+                                pass
+                            output_write(self.output,
+                                f"\n        unresolved offsets: [{','.join(unknown)}]", "dim")
+                    elif struct_ofs:
+                        # Fallback: show raw offsets
                         seen = []
                         for o in struct_ofs:
                             if o not in seen:

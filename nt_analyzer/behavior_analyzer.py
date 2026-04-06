@@ -526,12 +526,13 @@ def detect_api_patterns(pe_path, func_name):
     return {'function': func_name, 'patterns': patterns, 'fingerprint': fp}
 
 
-def scan_all_exports(pe_path, max_functions=500, progress_callback=None):
+def scan_all_exports(pe_path, max_functions=500, progress_callback=None, version='win2k'):
     """
     Scan all exports in a PE and categorize them by behavioral pattern.
     Returns dict of pattern_type → list of (func_name, pdesc, info_dict).
-    info_dict contains: rva, va, size, api_calls, struct_offsets, block_count, insn_count.
+    info_dict contains: rva, va, size, api_calls, struct_offsets, struct_fields, block_count, insn_count.
     progress_callback(message, pct) is called per function if provided.
+    version: Windows version key for struct field lookup (win2k, winxp, win7, win10, etc.)
     """
     pe = pefile.PE(pe_path, fast_load=False)
     image_base = pe.OPTIONAL_HEADER.ImageBase
@@ -559,18 +560,35 @@ def scan_all_exports(pe_path, max_functions=500, progress_callback=None):
             fp = result.get('fingerprint')
             # Gather struct-like offset accesses from the fingerprint
             struct_offsets = []
+            struct_fields = {}  # offset → [(struct_name, field_name, field_type)]
             func_size = 0
             if fp:
                 func_size = sum(len(b.instructions) for b in fp.blocks.values())
-                # Detect structure accesses: [reg+offset] patterns
+                # Data-flow analysis for struct field identification
+                try:
+                    from nt_analyzer.struct_dataflow import analyze_struct_accesses, summarize_accesses
+                    accesses = analyze_struct_accesses(fp.blocks, func_name, version=version)
+                    summary = summarize_accesses(accesses, version=version)
+                    # Collect identified struct fields
+                    for sname, fields in summary.items():
+                        for ofs, fname, ftype, cnt in fields:
+                            ofs_key = f'0x{ofs:x}'
+                            if ofs_key not in struct_fields:
+                                struct_fields[ofs_key] = []
+                            struct_fields[ofs_key].append((sname, fname, ftype, cnt))
+                except Exception:
+                    pass
+                # Also collect raw offsets (non-ebp, non-esp) for display
                 for b in fp.blocks.values():
                     for mnem, op in b.instructions:
                         if '+' in op and ('[' in op or 'ptr' in op.lower()):
-                            # Extract offset from e.g. [ebp+0x08] or [esi+0x1c]
                             import re as _re
-                            m = _re.search(r'\[(?:e[abcds][xip]|esi|edi)\s*\+\s*(0x[0-9a-fA-F]+|\d+)\]', op)
+                            m = _re.search(r'\[(?:e[abcds][xip]|esi|edi)\s*[+\-]\s*(0x[0-9a-fA-F]+|\d+)\]', op)
                             if m:
                                 ofs = m.group(1)
+                                # Skip ebp/esp-relative (stack frame)
+                                if '[ebp' in op or '[esp' in op:
+                                    continue
                                 if ofs not in struct_offsets:
                                     struct_offsets.append(ofs)
             info = {
@@ -580,6 +598,7 @@ def scan_all_exports(pe_path, max_functions=500, progress_callback=None):
                 'insn_count': fp.total_insns if fp else 0,
                 'api_calls': fp.api_calls if fp else [],
                 'struct_offsets': struct_offsets,
+                'struct_fields': struct_fields,
             }
             for ptype, pdesc in result['patterns']:
                 categories[ptype].append((func_name, pdesc, info))
