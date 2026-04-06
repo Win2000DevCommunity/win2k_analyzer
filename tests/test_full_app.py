@@ -5,7 +5,7 @@
   Tests every module, every tab's backend, every CLI command, every data
   structure, every decompiler mode, every patcher feature.
   
-  For Alex Ionescu — proving Claude can build real reverse-engineering tools.
+ proving Claude can build real reverse-engineering tools.
 ═══════════════════════════════════════════════════════════════════════════
 """
 import sys, os, re, json, struct, tempfile, shutil
