@@ -757,14 +757,161 @@ def _extract_func_from_click(event, output_widget):
         return None
 
 
-def setup_func_link(output_widget, pe_path_getter, app_ref):
+def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
     """Register func_link tag on a TabbedOutput so clicking a function name
-    opens a Disassembly tab with the result.
+    opens a mode-picker menu (Assembly / Pseudo-C / Hex Dump).
 
     pe_path_getter: callable returning the PE file path
     app_ref: the main Win2KAnalyzerApp for after() and target tab lookup
+    sym_getter: optional callable returning (use_sym:bool, sym_path:str|None)
     """
     output_widget.tag_configure("func_link", foreground="#89b4fa", underline=True)
+
+    def _colorize_asm(result, func_name):
+        output_write(output_widget, f"  DISASSEMBLY: {func_name}\n\n", "title")
+        for line in result.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith(';'):
+                output_write(output_widget, line + "\n", "dim")
+            elif '; \u2192' in line:
+                output_write(output_widget, line + "\n", "peach")
+            elif '; arg' in line:
+                output_write(output_widget, line + "\n", "ok")
+            elif '; local_' in line:
+                output_write(output_widget, line + "\n", "warn")
+            elif 'call' in line.lower() or 'int' in line:
+                output_write(output_widget, line + "\n", "ok")
+            elif stripped.startswith(('ret', 'retn')):
+                output_write(output_widget, line + "\n", "warn")
+            elif stripped.startswith('j'):
+                output_write(output_widget, line + "\n", "peach")
+            else:
+                output_write(output_widget, line + "\n")
+
+    def _colorize_pseudoc(code, func_name):
+        output_write(output_widget, f"  PSEUDO-C: {func_name}\n\n", "title")
+        for line in code.split('\n'):
+            stripped = line.lstrip()
+            if stripped.startswith('/*') or stripped.startswith(' *') or stripped.startswith('*/'):
+                output_write(output_widget, line + '\n', "dim")
+            elif stripped.startswith('//'):
+                output_write(output_widget, line + '\n', "dim")
+            elif any(kw in stripped for kw in ('if ', 'else', 'while', 'for ', 'switch', 'case ', 'return')):
+                output_write(output_widget, line + '\n', "warn")
+            elif stripped.startswith(('void ', 'int ', 'NTSTATUS', 'DWORD', 'BOOL')):
+                output_write(output_widget, line + '\n', "ok")
+            elif '(' in stripped and ')' in stripped and not stripped.startswith('//'):
+                output_write(output_widget, line + '\n', "peach")
+            else:
+                output_write(output_widget, line + '\n')
+
+    def _do_asm(func_name, pe_path):
+        output_widget.new_tab(f"Disasm: {func_name}")
+        use_sym = False
+        sym_path = None
+        if sym_getter:
+            use_sym, sym_path = sym_getter()
+        def work():
+            if use_sym and sym_path:
+                syms = _sym_loader().load_symbols(sym_path)
+                fm = _deep_analyzer().PEFunctionMap(pe_path)
+                fm.discover_all_functions()
+                fm.analyze_all_functions()
+                if isinstance(syms, tuple):
+                    sym_list, _ = syms
+                else:
+                    sym_list = syms
+                if isinstance(sym_list, dict):
+                    for va, name in sym_list.items():
+                        if va in fm.functions and name:
+                            fm.functions[va].name = name
+                elif isinstance(sym_list, list):
+                    for sym in sym_list:
+                        va = sym.get('address', 0)
+                        name = sym.get('name', '')
+                        if va in fm.functions and name:
+                            fm.functions[va].name = name
+                code = _deep_analyzer().disassemble_function_full(fm, func_name)
+                fm.close()
+                return code
+            return _behavior().disassemble_function(pe_path, func_name)
+        def done(result):
+            if isinstance(result, Exception):
+                output_write(output_widget, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(output_widget, f"  Function '{func_name}' not found.\n", "error")
+                return
+            _colorize_asm(result, func_name)
+        def callback(result):
+            app_ref.after(0, done, result)
+        run_async(work, callback)
+
+    def _do_pseudoc(func_name, pe_path):
+        output_widget.new_tab(f"Pseudo-C: {func_name}")
+        def work():
+            return _decompiler().decompile(pe_path, func_name)
+        def done(result):
+            if isinstance(result, Exception):
+                output_write(output_widget, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(output_widget, f"  Function '{func_name}' not found.\n", "error")
+                return
+            _colorize_pseudoc(result, func_name)
+        def callback(result):
+            app_ref.after(0, done, result)
+        run_async(work, callback)
+
+    def _do_hex(func_name, pe_path):
+        output_widget.new_tab(f"HEX: {func_name}")
+        def work():
+            import pefile
+            pe = pefile.PE(pe_path, fast_load=False)
+            rva = None
+            if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if exp.name and exp.name.decode('ascii', errors='replace') == func_name:
+                        rva = exp.address
+                        break
+            if rva is None:
+                pe.close()
+                return None
+            img_base = pe.OPTIONAL_HEADER.ImageBase
+            va = img_base + rva
+            offset = pe.get_offset_from_rva(rva)
+            data = pe.get_data(rva, min(4096, len(pe.__data__) - offset))
+            pe.close()
+            return (data, va, rva)
+        def done(result):
+            if isinstance(result, Exception):
+                output_write(output_widget, f"ERROR: {result}\n", "error")
+                return
+            if result is None:
+                output_write(output_widget, f"  Function '{func_name}' not found.\n", "error")
+                return
+            data, va, rva = result
+            output_write(output_widget, f"  HEX DUMP: {func_name}\n", "title")
+            output_write(output_widget, f"  RVA: 0x{rva:08X}  VA: 0x{va:08X}  Size: {len(data)} bytes\n\n", "dim")
+            for i in range(0, min(len(data), 2048), 16):
+                chunk = data[i:i+16]
+                hex_str = ' '.join(f'{b:02X}' for b in chunk)
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                addr = va + i
+                tag = None
+                if b'\xC3' in chunk:
+                    tag = "warn"
+                elif b'\xE8' in chunk:
+                    tag = "ok"
+                elif b'\xCC' in chunk:
+                    tag = "error"
+                output_write(output_widget, f"  {addr:08X}     {hex_str:<50s} {ascii_str}\n", tag)
+                if b'\xC3' in chunk or b'\xCC' in chunk:
+                    if i > 32:
+                        break
+        def callback(result):
+            app_ref.after(0, done, result)
+        run_async(work, callback)
 
     def on_click(event):
         func_name = _extract_func_from_click(event, output_widget)
@@ -773,30 +920,20 @@ def setup_func_link(output_widget, pe_path_getter, app_ref):
         pe_path = pe_path_getter()
         if not pe_path:
             return
-        # Disassemble inline in the same TabbedOutput
-        output_widget.new_tab(f"Disasm: {func_name}")
-        def work():
-            return _behavior().disassemble_function(pe_path, func_name)
-        def done(result):
-            if isinstance(result, Exception):
-                output_write(output_widget, f"ERROR: {result}\n", "error")
-                return
-            output_write(output_widget, f"  DISASSEMBLY: {func_name}\n\n", "title")
-            for line in result.splitlines():
-                stripped = line.lstrip()
-                if stripped.startswith(';'):
-                    output_write(output_widget, line + "\n", "dim")
-                elif '\u2192' in line or stripped[:5].startswith('call'):
-                    output_write(output_widget, line + "\n", "ok")
-                elif stripped.startswith(('ret', 'retn')):
-                    output_write(output_widget, line + "\n", "warn")
-                elif stripped.startswith('j'):
-                    output_write(output_widget, line + "\n", "peach")
-                else:
-                    output_write(output_widget, line + "\n")
-        def callback(result):
-            app_ref.after(0, done, result)
-        run_async(work, callback)
+        # Show mode picker menu
+        menu = tk.Menu(app_ref, tearoff=0,
+                       bg="#1e1e2e", fg="#cdd6f4", activebackground="#45475a",
+                       activeforeground="#cdd6f4", font=("Consolas", 10))
+        menu.add_command(label="\U0001F4BB  Assembly",
+                         command=lambda: _do_asm(func_name, pe_path))
+        menu.add_command(label="\U0001F5A5  Pseudo-C",
+                         command=lambda: _do_pseudoc(func_name, pe_path))
+        menu.add_command(label="HEX  Hex Dump",
+                         command=lambda: _do_hex(func_name, pe_path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     output_widget.tag_bind("func_link", "<Button-1>", on_click)
     output_widget.tag_bind("func_link", "<Enter>",
@@ -2306,14 +2443,12 @@ class BehaviorTab(ttk.Frame):
                     struct_ofs = info.get('struct_offsets', [])
                     if struct_ofs:
                         output_write(self.output,
-                            f"  structs:[{','.join(struct_ofs[:8])}]", "peach")
+                            f"  structs:[{','.join(struct_ofs)}]", "peach")
                     # API calls
                     apis = info.get('api_calls', [])
                     if apis:
-                        shown = apis[:6]
-                        more = f" +{len(apis)-6}" if len(apis) > 6 else ""
                         output_write(self.output,
-                            f"\n        calls: {', '.join(shown)}{more}", "dim")
+                            f"\n        calls: {', '.join(apis)}", "dim")
                     output_write(self.output, "\n")
                 output_write(self.output, "\n")
                 total += len(funcs)
