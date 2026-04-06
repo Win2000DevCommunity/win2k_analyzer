@@ -920,20 +920,23 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None):
         pe_path = pe_path_getter()
         if not pe_path:
             return
-        # Show mode picker menu
-        menu = tk.Menu(app_ref, tearoff=0,
-                       bg="#1e1e2e", fg="#cdd6f4", activebackground="#45475a",
-                       activeforeground="#cdd6f4", font=("Consolas", 10))
-        menu.add_command(label="\U0001F4BB  Assembly",
-                         command=lambda: _do_asm(func_name, pe_path))
-        menu.add_command(label="\U0001F5A5  Pseudo-C",
-                         command=lambda: _do_pseudoc(func_name, pe_path))
-        menu.add_command(label="HEX  Hex Dump",
-                         command=lambda: _do_hex(func_name, pe_path))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        # Capture coordinates now — event object may be recycled
+        rx, ry = event.x_root, event.y_root
+
+        def _show_menu():
+            menu = tk.Menu(app_ref, tearoff=0,
+                           bg="#1e1e2e", fg="#cdd6f4", activebackground="#45475a",
+                           activeforeground="#cdd6f4", font=("Consolas", 10))
+            menu.add_command(label="\U0001F4BB  Assembly",
+                             command=lambda: _do_asm(func_name, pe_path))
+            menu.add_command(label="\U0001F5A5  Pseudo-C",
+                             command=lambda: _do_pseudoc(func_name, pe_path))
+            menu.add_command(label="HEX  Hex Dump",
+                             command=lambda: _do_hex(func_name, pe_path))
+            menu.tk_popup(rx, ry)
+
+        # Delay popup so the Button-1 release doesn't dismiss it immediately
+        app_ref.after(50, _show_menu)
 
     output_widget.tag_bind("func_link", "<Button-1>", on_click)
     output_widget.tag_bind("func_link", "<Enter>",
@@ -2439,16 +2442,32 @@ class BehaviorTab(ttk.Frame):
                         output_write(self.output, f"  RVA:0x{rva:08X}  VA:0x{va:08X}", "dim")
                     # Description (blocks, instructions)
                     output_write(self.output, f"\n        {fdesc}", "")
-                    # Struct offset accesses
+                    # Struct offset accesses (deduplicated, sorted numerically)
                     struct_ofs = info.get('struct_offsets', [])
                     if struct_ofs:
+                        seen = []
+                        for o in struct_ofs:
+                            if o not in seen:
+                                seen.append(o)
+                        try:
+                            seen.sort(key=lambda x: int(x, 16) if x.startswith('0x') else int(x))
+                        except Exception:
+                            pass
                         output_write(self.output,
-                            f"  structs:[{','.join(struct_ofs)}]", "peach")
-                    # API calls
+                            f"  structs:[{','.join(seen)}]", "peach")
+                    # API calls (deduplicated with counts)
                     apis = info.get('api_calls', [])
                     if apis:
+                        from collections import Counter
+                        counts = Counter(apis)
+                        parts = []
+                        for name, cnt in counts.items():
+                            if cnt > 1:
+                                parts.append(f"{name} (\u00d7{cnt})")
+                            else:
+                                parts.append(name)
                         output_write(self.output,
-                            f"\n        calls: {', '.join(apis)}", "dim")
+                            f"\n        calls: {', '.join(parts)}", "dim")
                     output_write(self.output, "\n")
                 output_write(self.output, "\n")
                 total += len(funcs)
