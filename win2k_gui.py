@@ -807,11 +807,12 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
                 output_write(output_widget, line + '\n')
 
     def _do_asm(func_name, pe_path):
-        output_widget.new_tab(f"Disasm: {func_name}")
         use_sym = False
         sym_path = None
         if sym_getter:
             use_sym, sym_path = sym_getter()
+        sym_tag = " +sym" if (use_sym and sym_path) else ""
+        output_widget.new_tab(f"Disasm{sym_tag}: {func_name}")
         def work():
             if use_sym and sym_path:
                 syms = _sym_loader().load_symbols(sym_path)
@@ -849,7 +850,12 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
         run_async(work, callback)
 
     def _do_pseudoc(func_name, pe_path):
-        output_widget.new_tab(f"Pseudo-C: {func_name}")
+        sym_tag = ""
+        if sym_getter:
+            use_sym, sym_path = sym_getter()
+            if use_sym and sym_path:
+                sym_tag = " +sym"
+        output_widget.new_tab(f"Pseudo-C{sym_tag}: {func_name}")
         def work():
             return _decompiler().decompile(pe_path, func_name)
         def done(result):
@@ -865,7 +871,12 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
         run_async(work, callback)
 
     def _do_hex(func_name, pe_path):
-        output_widget.new_tab(f"HEX: {func_name}")
+        sym_tag = ""
+        if sym_getter:
+            use_sym, sym_path = sym_getter()
+            if use_sym and sym_path:
+                sym_tag = " +sym"
+        output_widget.new_tab(f"HEX{sym_tag}: {func_name}")
         def work():
             import pefile
             pe = pefile.PE(pe_path, fast_load=False)

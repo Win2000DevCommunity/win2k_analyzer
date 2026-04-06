@@ -159,7 +159,61 @@ FILE_OBJECT_FIELDS = {
     0x0C: ("PVOID", "FsContext"), 0x10: ("PVOID", "FsContext2"),
     0x14: ("PSECTION_OBJECT_POINTERS", "SectionObjectPointer"),
     0x18: ("PVOID", "PrivateCacheMap"), 0x1C: ("NTSTATUS", "FinalStatus"),
+    0x20: ("PVOID", "RelatedFileObject"),
     0x24: ("UNICODE_STRING", "FileName"), 0x2C: ("LARGE_INTEGER", "CurrentByteOffset"),
+    0x34: ("ULONG", "Waiters"), 0x38: ("ULONG", "Busy"),
+    0x3C: ("PVOID", "LastLock"), 0x40: ("KEVENT", "Lock"),
+    0x50: ("KEVENT", "Event"), 0x60: ("PIO_COMPLETION_CONTEXT", "CompletionContext"),
+}
+
+SECTION_OBJECT_POINTERS_FIELDS = {
+    0x00: ("PVOID", "DataSectionObject"),
+    0x04: ("PVOID", "SharedCacheMap"),
+    0x08: ("PVOID", "ImageSectionObject"),
+}
+
+SHARED_CACHE_MAP_FIELDS = {
+    0x00: ("CSHORT", "NodeTypeCode"), 0x02: ("CSHORT", "NodeByteSize"),
+    0x04: ("ULONG", "OpenCount"), 0x08: ("LARGE_INTEGER", "FileSize"),
+    0x10: ("LIST_ENTRY", "BcbList"), 0x18: ("LARGE_INTEGER", "SectionSize"),
+    0x20: ("LARGE_INTEGER", "ValidDataLength"), 0x28: ("LARGE_INTEGER", "ValidDataGoal"),
+    0x30: ("PVACB", "InitialVacbs[0]"), 0x34: ("PVACB", "InitialVacbs[1]"),
+    0x38: ("PVACB", "InitialVacbs[2]"), 0x3C: ("PVACB", "InitialVacbs[3]"),
+    0x40: ("PVACB*", "Vacbs"), 0x44: ("PFILE_OBJECT", "FileObject"),
+    0x48: ("PVACB", "ActiveVacb"), 0x4C: ("PVOID", "NeedToZero"),
+    0x50: ("ULONG", "NeedToZeroPage"), 0x54: ("KSPIN_LOCK", "ActiveVacbSpinLock"),
+    0x58: ("ULONG", "VacbActiveCount"), 0x5C: ("ULONG", "DirtyPages"),
+    0x60: ("LIST_ENTRY", "SharedCacheMapLinks"), 0x68: ("ULONG", "Flags"),
+    0x6C: ("NTSTATUS", "Status"), 0x70: ("PMBCB", "Mbcb"),
+    0x74: ("PVOID", "Section"), 0x78: ("PKEVENT", "CreateEvent"),
+    0x7C: ("PKEVENT", "WaitOnActiveCount"),
+    0x80: ("ULONG", "PagesToWrite"), 0x88: ("LARGE_INTEGER", "BeyondLastFlush"),
+    0x90: ("PCACHE_MANAGER_CALLBACKS", "Callbacks"),
+    0x94: ("PVOID", "LazyWriteContext"),
+    0x98: ("LIST_ENTRY", "PrivateList"),
+    0xA0: ("PVOID", "LogHandle"), 0xA4: ("PFLUSH_TO_LSN", "FlushToLsnRoutine"),
+    0xA8: ("ULONG", "DirtyPageThreshold"), 0xAC: ("ULONG", "LazyWritePassCount"),
+    0xB0: ("PCACHE_UNINITIALIZE_EVENT", "UninitializeEvent"),
+    0xB4: ("PVACB", "NeedToZeroVacb"),
+    0xB8: ("KSPIN_LOCK", "BcbSpinLock"), 0xBC: ("PVOID", "Reserved"),
+    0xC0: ("LIST_ENTRY", "PrivateCacheMap"),
+    0xD0: ("PPRIVATE_CACHE_MAP", "PrivateCacheMapList"),
+}
+
+PRIVATE_CACHE_MAP_FIELDS = {
+    0x00: ("CSHORT", "NodeTypeCode"), 0x02: ("CSHORT", "NodeByteSize"),
+    0x04: ("PSHARED_CACHE_MAP", "SharedCacheMap"),
+    0x08: ("ULONG", "FileOffset1"), 0x0C: ("ULONG", "BeyondLastByte1"),
+    0x10: ("ULONG", "FileOffset2"), 0x14: ("ULONG", "BeyondLastByte2"),
+    0x18: ("ULONG", "ReadAheadOffset"), 0x1C: ("ULONG", "ReadAheadLength[0]"),
+    0x20: ("ULONG", "ReadAheadLength[1]"), 0x24: ("KSPIN_LOCK", "ReadAheadSpinLock"),
+    0x28: ("LIST_ENTRY", "PrivateLinks"),
+}
+
+CC_FILE_SIZES_FIELDS = {
+    0x00: ("LARGE_INTEGER", "AllocationSize"),
+    0x08: ("LARGE_INTEGER", "FileSize"),
+    0x10: ("LARGE_INTEGER", "ValidDataLength"),
 }
 
 KNOWN_STRUCTURES = {
@@ -168,6 +222,10 @@ KNOWN_STRUCTURES = {
     "IRP": IRP_FIELDS,
     "IO_STACK_LOCATION": IO_STACK_LOCATION_FIELDS,
     "FILE_OBJECT": FILE_OBJECT_FIELDS,
+    "SECTION_OBJECT_POINTERS": SECTION_OBJECT_POINTERS_FIELDS,
+    "SHARED_CACHE_MAP": SHARED_CACHE_MAP_FIELDS,
+    "PRIVATE_CACHE_MAP": PRIVATE_CACHE_MAP_FIELDS,
+    "CC_FILE_SIZES": CC_FILE_SIZES_FIELDS,
 }
 
 # ── Known kernel APIs with parameter info ────────────────────────────────
@@ -303,6 +361,86 @@ KERNEL_API_SIGNATURES = {
     "KeDelayExecutionThread": ("NTSTATUS", [("KPROCESSOR_MODE", "WaitMode"),
                              ("BOOLEAN", "Alertable"), ("PLARGE_INTEGER", "Interval")]),
     "DbgPrint":            ("ULONG", [("PCSTR", "Format")]),
+    # Cache manager (Cc*) APIs
+    "CcInitializeCacheMap": ("VOID", [("PFILE_OBJECT", "FileObject"), ("PCC_FILE_SIZES", "FileSizes"),
+                             ("BOOLEAN", "PinAccess"), ("PCACHE_MANAGER_CALLBACKS", "Callbacks"),
+                             ("PVOID", "LazyWriteContext")]),
+    "CcUninitializeCacheMap": ("BOOLEAN", [("PFILE_OBJECT", "FileObject"),
+                             ("PLARGE_INTEGER", "TruncateSize"), ("PCACHE_UNINITIALIZE_EVENT", "UninitializeEvent")]),
+    "CcSetFileSizes":      ("VOID", [("PFILE_OBJECT", "FileObject"), ("PCC_FILE_SIZES", "FileSizes")]),
+    "CcCopyRead":          ("BOOLEAN", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("BOOLEAN", "Wait"), ("PVOID", "Buffer"),
+                             ("PIO_STATUS_BLOCK", "IoStatus")]),
+    "CcCopyWrite":         ("BOOLEAN", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("BOOLEAN", "Wait"), ("PVOID", "Buffer")]),
+    "CcMdlRead":           ("VOID", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("PMDL*", "MdlChain"), ("PIO_STATUS_BLOCK", "IoStatus")]),
+    "CcMdlReadComplete":   ("VOID", [("PFILE_OBJECT", "FileObject"), ("PMDL", "MdlChain")]),
+    "CcMdlWriteComplete":  ("VOID", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("PMDL", "MdlChain")]),
+    "CcPrepareMdlWrite":   ("VOID", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("PMDL*", "MdlChain"), ("PIO_STATUS_BLOCK", "IoStatus")]),
+    "CcFlushCache":        ("VOID", [("PSECTION_OBJECT_POINTERS", "SectionObjectPointers"),
+                             ("PLARGE_INTEGER", "FileOffset"), ("ULONG", "Length"),
+                             ("PIO_STATUS_BLOCK", "IoStatus")]),
+    "CcPurgeCacheSection":  ("BOOLEAN", [("PSECTION_OBJECT_POINTERS", "SectionObjectPointers"),
+                             ("PLARGE_INTEGER", "FileOffset"), ("ULONG", "Length"),
+                             ("BOOLEAN", "UninitializeCacheMaps")]),
+    "CcMapData":           ("BOOLEAN", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("BOOLEAN", "Wait"), ("PVOID*", "Bcb"),
+                             ("PVOID*", "Buffer")]),
+    "CcPinRead":           ("BOOLEAN", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("ULONG", "Flags"), ("PVOID*", "Bcb"),
+                             ("PVOID*", "Buffer")]),
+    "CcPinMappedData":     ("BOOLEAN", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("ULONG", "Flags"), ("PVOID*", "Bcb")]),
+    "CcPreparePinWrite":   ("BOOLEAN", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length"), ("BOOLEAN", "Zero"), ("ULONG", "Flags"),
+                             ("PVOID*", "Bcb"), ("PVOID*", "Buffer")]),
+    "CcUnpinData":         ("VOID", [("PVOID", "Bcb")]),
+    "CcSetDirtyPinnedData": ("VOID", [("PVOID", "Bcb"), ("PLARGE_INTEGER", "Lsn")]),
+    "CcRepinBcb":          ("VOID", [("PVOID", "Bcb")]),
+    "CcUnpinRepinnedBcb":  ("VOID", [("PVOID", "Bcb"), ("BOOLEAN", "WriteThrough"),
+                             ("PIO_STATUS_BLOCK", "IoStatus")]),
+    "CcGetFileObjectFromSectionPtrs": ("PFILE_OBJECT", [("PSECTION_OBJECT_POINTERS", "SectionObjectPointers")]),
+    "CcGetFileObjectFromBcb": ("PFILE_OBJECT", [("PVOID", "Bcb")]),
+    "CcSetAdditionalCacheAttributes": ("VOID", [("PFILE_OBJECT", "FileObject"),
+                             ("BOOLEAN", "DisableReadAhead"), ("BOOLEAN", "DisableWriteBehind")]),
+    "CcSetLogHandleForFile": ("VOID", [("PFILE_OBJECT", "FileObject"), ("PVOID", "LogHandle"),
+                             ("PFLUSH_TO_LSN", "FlushToLsnRoutine")]),
+    "CcGetDirtyPages":     ("LARGE_INTEGER", [("PVOID", "LogHandle"),
+                             ("PDIRTY_PAGE_ROUTINE", "DirtyPageRoutine"), ("PVOID", "Context1"),
+                             ("PVOID", "Context2")]),
+    "CcIsThereDirtyData":  ("BOOLEAN", [("PVPB", "Vpb")]),
+    "CcZeroData":          ("BOOLEAN", [("PFILE_OBJECT", "FileObject"),
+                             ("PLARGE_INTEGER", "StartOffset"), ("PLARGE_INTEGER", "EndOffset"),
+                             ("BOOLEAN", "Wait")]),
+    "CcCanIWrite":         ("BOOLEAN", [("PFILE_OBJECT", "FileObject"), ("ULONG", "BytesToWrite"),
+                             ("BOOLEAN", "Wait"), ("BOOLEAN", "Retrying")]),
+    "CcDeferWrite":        ("VOID", [("PFILE_OBJECT", "FileObject"), ("PCC_POST_DEFERRED_WRITE", "PostRoutine"),
+                             ("PVOID", "Context1"), ("PVOID", "Context2"),
+                             ("ULONG", "BytesToWrite"), ("BOOLEAN", "Retrying")]),
+    "CcFastCopyRead":      ("VOID", [("PFILE_OBJECT", "FileObject"), ("ULONG", "FileOffset"),
+                             ("ULONG", "Length"), ("ULONG", "PageCount"), ("PVOID", "Buffer"),
+                             ("PIO_STATUS_BLOCK", "IoStatus")]),
+    "CcFastCopyWrite":     ("VOID", [("PFILE_OBJECT", "FileObject"), ("ULONG", "FileOffset"),
+                             ("ULONG", "Length"), ("PVOID", "Buffer")]),
+    "CcScheduleReadAhead": ("VOID", [("PFILE_OBJECT", "FileObject"), ("PLARGE_INTEGER", "FileOffset"),
+                             ("ULONG", "Length")]),
+    # Mm section/cache APIs
+    "MmCreateSection":     ("NTSTATUS", [("PVOID*", "SectionObject"), ("ACCESS_MASK", "DesiredAccess"),
+                             ("POBJECT_ATTRIBUTES", "ObjectAttributes"), ("PLARGE_INTEGER", "InputMaximumSize"),
+                             ("ULONG", "SectionPageProtection"), ("ULONG", "AllocationAttributes"),
+                             ("HANDLE", "FileHandle")]),
+    "MmDisableModifiedWriteOfSection": ("BOOLEAN", [("PSECTION_OBJECT_POINTERS", "SectionObjectPointers")]),
+    "MmFlushImageSection":  ("BOOLEAN", [("PSECTION_OBJECT_POINTERS", "SectionObjectPointers"),
+                             ("MMFLUSH_TYPE", "FlushType")]),
+    # FsRtl helpers commonly used with Cc*
+    "FsRtlNormalizeNtstatus": ("NTSTATUS", [("NTSTATUS", "Exception"), ("NTSTATUS", "GenericException")]),
+    "ExRaiseStatus":       ("VOID", [("NTSTATUS", "Status")]),
+    "ObDeleteCapturedInsertInfo": ("VOID", [("PVOID", "Object")]),
+    "KfRaiseIrql":         ("KIRQL", [("KIRQL", "NewIrql")]),
+    "KfLowerIrql":         ("VOID", [("KIRQL", "NewIrql")]),
 }
 
 POOL_TYPES = {0: "NonPagedPool", 1: "PagedPool", 2: "NonPagedPoolMustSucceed",
@@ -879,7 +1017,10 @@ class X86Decompiler:
     # ── Driver patterns ──────────────────────────────────────────────────
 
     def _detect_driver_patterns(self, instructions, info):
-        if _detect_driver_entry(instructions):
+        # Skip DriverEntry heuristic if the function has a known API signature
+        # (e.g. Cc* cache manager functions have large struct offsets that
+        # falsely match the MajorFunction table heuristic)
+        if info.name not in KERNEL_API_SIGNATURES and _detect_driver_entry(instructions):
             info.is_driver_entry = True
             info.detected_patterns.append("DriverEntry")
             info.return_type = "NTSTATUS"
@@ -950,16 +1091,34 @@ class X86Decompiler:
         if sig:
             ret_type, params = sig
             info.return_type = ret_type
+            # Clear any wrongly-detected driver patterns
+            if info.is_driver_entry and info.name != 'DriverEntry':
+                info.is_driver_entry = False
+                if 'DriverEntry' in info.detected_patterns:
+                    info.detected_patterns.remove('DriverEntry')
+            if info.is_dispatch_routine:
+                info.is_dispatch_routine = False
+                if 'IRP_dispatch' in info.detected_patterns:
+                    info.detected_patterns.remove('IRP_dispatch')
             # Rename parameters to match the known signature
             for i, (ptype, pname) in enumerate(params):
                 if i < len(info.params):
                     info.params[i].var_type = ptype
                     info.params[i].name = pname
+                    info.params[i].struct_type = ''  # clear wrong struct
+                    # Set correct struct_type for known pointer types
+                    stype = ptype.lstrip('P').rstrip('*')
+                    if stype in KNOWN_STRUCTURES:
+                        info.params[i].struct_type = stype
                 else:
-                    info.params.append(StackVar(
+                    p = StackVar(
                         offset=8 + i * 4, size=4,
                         name=pname, var_type=ptype,
-                    ))
+                    )
+                    stype = ptype.lstrip('P').rstrip('*')
+                    if stype in KNOWN_STRUCTURES:
+                        p.struct_type = stype
+                    info.params.append(p)
             return
 
         for api in info.called_apis:
