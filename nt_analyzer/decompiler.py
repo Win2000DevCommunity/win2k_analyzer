@@ -525,15 +525,42 @@ def _rva_to_offset(pe, rva):
 
 
 def _resolve_constant(val):
-    if val in NTSTATUS_CODES:
+    """Conservative constant resolution — only resolves unambiguous values.
+    Small integers (0-0xFF) are NOT resolved because they collide across
+    NTSTATUS, POOL_TYPE, IRQL, DEVICE_TYPE, booleans, sizes, etc.
+    """
+    # NTSTATUS: only resolve severity-flagged codes (info/warning/error)
+    # which are unambiguous (>= 0x40000000)
+    if val >= 0x40000000 and val in NTSTATUS_CODES:
         return NTSTATUS_CODES[val]
-    if val in POOL_TYPES:
-        return POOL_TYPES[val]
-    if val in IRQL_LEVELS:
-        return IRQL_LEVELS[val]
-    if val in DEVICE_TYPES:
+    # STATUS_TIMEOUT (0x102), STATUS_PENDING (0x103) etc. are fairly unique
+    if 0x100 <= val <= 0xFFFF and val in NTSTATUS_CODES:
+        return NTSTATUS_CODES[val]
+    # DBG_EXCEPTION_HANDLED (0x00010001) is unique
+    if val == 0x00010001 and val in NTSTATUS_CODES:
+        return NTSTATUS_CODES[val]
+    # DEVICE_TYPES: only values >= 0x08 are unique enough (avoid 1,2,7)
+    if val >= 0x08 and val in DEVICE_TYPES:
         return DEVICE_TYPES[val]
     return None
+
+
+# Map parameter type names to constant tables for context-aware resolution
+_PARAM_TYPE_TABLES = {
+    'POOL_TYPE': POOL_TYPES,
+    'KIRQL': IRQL_LEVELS,
+    'DEVICE_TYPE': DEVICE_TYPES,
+    'NTSTATUS': NTSTATUS_CODES,
+}
+
+
+def _resolve_typed_constant(val, param_type):
+    """Resolve a constant using the parameter's declared type from API signatures."""
+    ptype = param_type.upper()
+    for key, table in _PARAM_TYPE_TABLES.items():
+        if key in ptype and val in table:
+            return table[val]
+    return _resolve_constant(val)
 
 
 def _format_hex(val):
@@ -684,8 +711,8 @@ class RegisterTracker:
         if src in self.type_hints:
             self.type_hints[dst] = self.type_hints[src]
 
-    def track_push(self, operand, value=None):
-        self.stack_args.append((operand, value))
+    def track_push(self, operand, value=None, raw_int=None):
+        self.stack_args.append((operand, value, raw_int))
 
     def consume_call_args(self, n_args):
         args = []
@@ -1244,7 +1271,16 @@ class X86Decompiler:
         # ── Push (argument) ──────────────────────────────────────────────
         if m == 'push':
             val = self._resolve_operand(op, info)
-            self.tracker.track_push(val)
+            # Store raw integer value for later typed resolution in API calls
+            raw_int = None
+            op_stripped = op.strip()
+            if re.match(r'^-?0x[0-9a-fA-F]+$', op_stripped) or re.match(r'^-?\d+$', op_stripped):
+                try:
+                    raw_int = int(op_stripped, 16) if '0x' in op_stripped else int(op_stripped)
+                    raw_int = raw_int & 0xFFFFFFFF
+                except ValueError:
+                    pass
+            self.tracker.track_push(val, raw_int=raw_int)
             # Pool tag detection
             if re.match(r'^0x[0-9a-fA-F]+$', op.strip()):
                 try:
@@ -1497,7 +1533,14 @@ class X86Decompiler:
             args = []
             for i, (pt, pn) in enumerate(params):
                 if i < len(pushed):
-                    args.append(str(pushed[i][0]))
+                    arg_str = str(pushed[i][0])
+                    # Re-resolve numeric args using the declared parameter type
+                    raw_int = pushed[i][2] if len(pushed[i]) > 2 else None
+                    if raw_int is not None:
+                        typed_name = _resolve_typed_constant(raw_int, pt)
+                        if typed_name:
+                            arg_str = typed_name
+                    args.append(arg_str)
                 else:
                     args.append(f"/* {pt} {pn} */")
             self.tracker.consume_call_args(n)
@@ -1699,6 +1742,13 @@ class X86Decompiler:
             return self.exports_rva[rva]
         if addr in self.strings:
             return f'/* "{self.strings[addr]}" */'
+        # Near-miss symbol lookup: call targets sometimes hit a 2-byte
+        # hot-patch prologue (mov edi, edi) just before the real entry
+        if self.symbols:
+            for delta in (1, 2, -1, -2):
+                near = addr + delta
+                if near in self.symbols:
+                    return self.symbols[near]
         return f"loc_{addr:08X}"
 
 

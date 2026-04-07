@@ -757,12 +757,13 @@ def _extract_func_from_click(event, output_widget):
         return None
 
 
-def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mode_var=None):
+def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mode_var=None, symbols_getter=None):
     """Register func_link tag on a TabbedOutput so clicking a function name
     opens a new tab with the decompilation mode selected in mode_var.
 
     pe_path_getter: callable returning the PE file path
     app_ref: the main Win2KAnalyzerApp for after() and target tab lookup
+    symbols_getter: optional callable returning a symbols dict {va: name} for decompilation
     sym_getter: optional callable returning (use_sym:bool, sym_path:str|None)
     mode_var: optional StringVar ('Assembly'|'Pseudo-C'|'Hex Dump'); defaults to Assembly
     """
@@ -851,13 +852,18 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
 
     def _do_pseudoc(func_name, pe_path):
         sym_tag = ""
-        if sym_getter:
+        syms = None
+        if symbols_getter:
+            syms = symbols_getter()
+            if syms:
+                sym_tag = " +sym"
+        elif sym_getter:
             use_sym, sym_path = sym_getter()
             if use_sym and sym_path:
                 sym_tag = " +sym"
         output_widget.new_tab(f"Pseudo-C{sym_tag}: {func_name}")
         def work():
-            return _decompiler().decompile(pe_path, func_name)
+            return _decompiler().decompile(pe_path, func_name, symbols=syms)
         def done(result):
             if isinstance(result, Exception):
                 output_write(output_widget, f"ERROR: {result}\n", "error")
@@ -2815,7 +2821,8 @@ class DecompilerTab(ttk.Frame):
 
         self.output = TabbedOutput(self)
         self.output.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        setup_func_link(self.output, self._get_pe, app, mode_var=self._click_mode_var)
+        setup_func_link(self.output, self._get_pe, app, mode_var=self._click_mode_var,
+                        symbols_getter=lambda: self._loaded_symbols or None)
 
     def _get_func(self):
         return self._func_entry.get_value()
