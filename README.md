@@ -2,15 +2,16 @@
 
 **The ultimate reverse-engineering and binary compatibility toolkit for porting ReactOS components to Windows 2000 SP4.**
 
-Analyze, compare, decompile, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (15 tabs)** and a **full CLI (27 commands)**.
+Analyze, compare, decompile, emulate, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (15 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.1 — Deep Analyzer, Tabbed Output, Symbol Integration:**
-- **Tabbed Output (IDA Pro-style):** Every analysis action opens a new closeable tab. Right-click or middle-click to close. No more losing previous results — compare them side by side.
-- **Deep Analyzer:** IDA Pro / Ghidra-level function discovery without symbols — finds ALL functions (exported + internal) via prologue scanning, builds cross-reference maps, detects calling conventions, profiles dependencies.
-- **Symbol Loader:** Load .map (MSVC/GCC/IDA), .sym, .pdb, .dbg files to enrich disassembly with real function names, arguments, and locals.
-- **Decompiler Modes:** Three output modes — Pseudo-C, Annotated Assembly, and Hex Dump with color highlighting.
-- **XRef Scanner:** Scan entire directories to find every PE that imports/calls a given function.
-- **Progress Dialogs:** All long-running operations show real-time progress with operation name and percentage.
+**NEW in v3.2 — Kernel Function Emulator, SSDT Intelligence, Dual Symbols:**
+- **Kernel Function Emulator:** WinDbg-like x86 emulation engine powered by Unicorn. Load any Win2K PE (ntoskrnl.exe, hal.dll, ntdll.dll, ...), emulate any kernel function with controlled inputs, auto-generate 12 test scenarios, verify NTSTATUS return values and API call patterns — all **before** patching a live system.
+- **SSDT Resolver (Zero-Symbol Kernel Intelligence):** Resolves ALL 248 private Nt* kernel functions (NtPowerInformation, NtQuerySystemInformation, NtClose, etc.) directly from the binary — no PDB/DBG symbols required. Scans KiServiceTable via Zw stub → syscall number → SSDT lookup.
+- **Dual Symbol Loading:** Behavior Analyzer now supports separate symbol files for DLL A (Win2K) and DLL B (ReactOS) with color-coded clickable links — blue for Win2K, green for ReactOS.
+- **67+ Kernel API Mocks:** ExAllocatePool, ProbeForRead/Write, ObReferenceObjectByHandle, KeGetCurrentIrql, spinlocks, MDL operations, registry, IO/IRP, power management — all mocked for accurate emulation.
+
+**Previously in v3.1 — Deep Analyzer, Tabbed Output, Symbol Integration:**
+- Tabbed Output (IDA Pro-style), Deep Analyzer (function discovery without symbols), Symbol Loader (.map/.pdb/.dbg/.sym), Decompiler Modes (Pseudo-C/ASM/Hex), XRef Scanner, Progress Dialogs.
 
 **Previously in v3.0 — KernelEx Ultimate PE Patcher:**  All patching techniques from KernelEx (Xeno86, 2006-2008) have been reverse-engineered and reimplemented in Python with modern 2026 capabilities: code blob injection with 4-table fixups, full export/import table rebuild, PE rebase, GenPatch-style C→binary compilation, 5-stage patch pipeline, symbol-aware patching, and more.
 
@@ -25,7 +26,9 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 ## Table of Contents
 
 - [What Does This Tool Do?](#what-does-this-tool-do)
-- [What's New in v3.1](#whats-new-in-v31)
+- [What's New in v3.2](#whats-new-in-v32)
+- [Kernel Function Emulator](#kernel-function-emulator--pre-test-patches-before-deploying)
+- [SSDT Resolver — Zero-Symbol Kernel Intelligence](#ssdt-resolver--zero-symbol-kernel-intelligence)
 - [Features Overview](#features-overview)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -66,7 +69,235 @@ This tool gives you everything in one place:
 
 ---
 
-## What's New in v3.1
+## What's New in v3.2
+
+### Kernel Function Emulator (NEW)
+
+A **WinDbg-like x86 emulation engine** that lets you execute any kernel function virtually and verify its behavior before deploying patches to real hardware:
+
+- **Works on any Win2K system PE** — ntoskrnl.exe, hal.dll, ntdll.dll, win32k.sys, any .sys driver
+- **SSDT-powered** — finds private Nt* kernel functions automatically, no symbols needed
+- **67+ kernel API mocks** — ExAllocatePool, ProbeForRead/Write, ObReferenceObjectByHandle, KeGetCurrentIrql, spinlocks, MDL, registry, IO/IRP, power, HAL stubs
+- **Auto-generated test scenarios** — 12 scenarios per function: null args, valid/invalid classes, user/kernel mode, small buffers, privilege checks
+- **Full execution trace** — every instruction, every branch, every API call logged
+- **NTSTATUS verification** — compare return values against expected results
+- **Dynamic memory layout** — stack/heap/stubs placed automatically to avoid PE image overlap
+
+**Real example — NtPowerInformation from Win2K ntoskrnl.exe (all 12 scenarios):**
+
+```
+========================================================================
+  KERNEL FUNCTION EMULATION REPORT
+  Function: NtPowerInformation
+  Scenarios tested: 12
+========================================================================
+
+────────────────────────────────────────────────────────────────────────
+ ❌  Scenario 1: Null arguments
+    All arguments zero / NULL - should fail gracefully
+    Mode: User
+    Args: [0x0, 0x0, 0x0, 0x0, 0x0]
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Expected: 0xC000000D (STATUS_INVALID_PARAMETER)
+    Match: NO
+    Instructions: 140
+    Time: 0.016s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 2: Class 0 - Kernel mode
+    InformationClass=0, valid output buffer, kernel mode
+    Mode: Kernel
+    Args: [0x0, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Expected: 0x00000000 (STATUS_SUCCESS)
+    Match: YES
+    Instructions: 210
+    Time: 0.011s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 3: Class 0 - User mode
+    InformationClass=0, valid output buffer, user mode
+    Mode: User
+    Args: [0x0, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 210
+    Time: 0.013s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 4: Small buffer
+    Output buffer too small
+    Mode: Kernel
+    Args: [0x0, 0x0, 0x0, 0x8C0000, 0x4]
+    Return: 0xC0000023 (STATUS_BUFFER_TOO_SMALL)
+    Expected: 0xC0000023 (STATUS_BUFFER_TOO_SMALL)
+    Match: YES
+    Instructions: 148
+    Time: 0.018s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ❌  Scenario 5: Invalid class 0xFFFF
+    Very large information class - should return INVALID_PARAMETER
+    Mode: Kernel
+    Args: [0xFFFF, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0x01469780 (STATUS_OK(0x01469780))
+    Expected: 0xC000000D (STATUS_INVALID_PARAMETER)
+    Match: NO
+    Instructions: 282428
+    Time: 4.651s
+    Exception: Unicorn error: Invalid instruction (UC_ERR_INSN_INVALID)
+    API calls (3003):
+      KeGetCurrentIrql (x3003)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 6: User mode - no privilege
+    User mode call with privilege check disabled
+    Mode: User
+    Args: [0x0, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 210
+    Time: 0.012s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ❌  Scenario 7: Valid input buffer
+    Both InputBuffer and OutputBuffer valid
+    Mode: Kernel
+    Args: [0x0, 0x8D0000, 0x100, 0x8C0000, 0x1000]
+    Return: 0x00000045 (STATUS_OK(0x00000045))
+    Expected: 0x00000000 (STATUS_SUCCESS)
+    Match: NO
+    Instructions: 500001
+    Time: 9.811s
+    Exception: Instruction limit (500000)
+    API calls (3002):
+      KeGetCurrentIrql (x3002)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 8: Class 1
+    InformationClass=1, kernel mode
+    Mode: Kernel
+    Args: [0x1, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 210
+    Time: 0.007s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 9: Class 2
+    InformationClass=2, kernel mode
+    Mode: Kernel
+    Args: [0x2, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0xC000000D (STATUS_INVALID_PARAMETER)
+    Instructions: 135
+    Time: 0.016s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 10: Class 3
+    InformationClass=3, kernel mode
+    Mode: Kernel
+    Args: [0x3, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0xC000000D (STATUS_INVALID_PARAMETER)
+    Instructions: 135
+    Time: 0.006s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 11: Class 4
+    InformationClass=4, kernel mode
+    Mode: Kernel
+    Args: [0x4, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 267
+    Time: 0.009s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+────────────────────────────────────────────────────────────────────────
+ ✅  Scenario 12: Class 5
+    InformationClass=5, kernel mode
+    Mode: Kernel
+    Args: [0x5, 0x0, 0x0, 0x8C0000, 0x1000]
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 198
+    Time: 0.005s
+    API calls (1):
+      HalRequestSoftwareInterrupt (x1)
+
+========================================================================
+  SUMMARY: 9 passed, 3 failed out of 12 scenarios
+========================================================================
+```
+
+**Detailed execution trace (NtYieldExecution — 11 instructions):**
+
+```
+  VA         | Instruction
+  -----------+-------------------------------------------
+  0x00432F1C | cmp dword ptr [0x473bdc], 0
+  0x00432F23 | push ebx
+  0x00432F24 | push esi
+  0x00432F25 | push edi
+  0x00432F26 | mov ebx, 0x40000024
+  0x00432F2B | je 0x432fcb                          <-- BRANCH
+  0x00432FCB | pop edi
+  0x00432FCC | mov eax, ebx
+  0x00432FCE | pop esi
+  0x00432FCF | pop ebx
+  0x00432FD0 | ret                                  <-- RETURN
+
+  Return: 0x40000024 (STATUS_NO_YIELD_PERFORMED)
+```
+
+**Multi-function analysis on real Win2K ntoskrnl.exe:**
+
+| Function | Args | Return | Status | Instructions | API Calls |
+|---|---|---|---|---|---|
+| NtClose | Handle=0x10 | 0xC0000008 | STATUS_INVALID_HANDLE | 121 | HalRequestSoftwareInterrupt |
+| NtQuerySystemInformation | Class=0, Buf=NULL | 0xC0000004 | STATUS_INFO_LENGTH_MISMATCH | 50 | (none) |
+| NtQueryInformationProcess | Handle=-1, Class=0 | 0xC0000004 | STATUS_INFO_LENGTH_MISMATCH | 41 | (none) |
+| NtYieldExecution | (none) | 0x40000024 | STATUS_NO_YIELD_PERFORMED | 11 | (none) |
+| NtPowerInformation | Class=0, Buf=valid | 0x00000000 | STATUS_SUCCESS | 210 | HalRequestSoftwareInterrupt |
+| NtPowerInformation | Class=2 | 0xC000000D | STATUS_INVALID_PARAMETER | 135 | HalRequestSoftwareInterrupt |
+
+**Use case — verify your patch before deploying:**
+
+1. Run the **original** Win2K function → get return values + API call pattern
+2. Run **your patched** version of the same function → compare results
+3. If both return the **same NTSTATUS** for the same inputs and call the **same APIs**, your patch integrates correctly with the kernel
+
+### SSDT Resolver — Zero-Symbol Kernel Intelligence (NEW)
+
+In ntoskrnl.exe, `Nt*` functions (NtCreateFile, NtPowerInformation, etc.) are **private** — they don't appear in the PE export table. Only `Zw*` wrappers are exported. Previously, you needed PDB/DBG symbols to find them.
+
+The SSDT resolver finds them automatically:
+
+1. Find the `Zw*` export (e.g., `ZwPowerInformation`) → read the stub: `mov eax, N` → syscall number
+2. Scan the binary for `mov [KeServiceDescriptorTable], offset KiServiceTable` (the kernel init code)
+3. Read `KiServiceTable[N]` → the actual `Nt*` function VA
+
+All **248 private Nt kernel syscalls** are now resolvable — zero symbols required.
+
+### Dual Symbol Loading (NEW)
+
+The Behavior Analyzer (Tab 10) now supports **two separate symbol files**:
+
+- **Symbols A** (Win2K) — loaded with blue clickable links
+- **Symbols B** (ReactOS) — loaded with green clickable links
+
+When comparing functions, click the blue link to view in DLL A or the green link to view in DLL B. No more confusion about which symbol set is active.
 
 ### Tabbed Output (IDA Pro-style)
 
@@ -161,6 +392,9 @@ All long-running operations now show a **real-time progress dialog** with:
 | **Behavior** | Function fingerprinting and API pattern detection | `behavior` | Tab 10 |
 | | Disassemble exported functions | `disasm` | Tab 10 |
 | | **Symbol-enhanced disassembly** (args, locals, call targets) | — | Tab 10 |
+| | **Dual symbol loading** (Symbols A + Symbols B with color-coded links) | — | Tab 10 |
+| | **SSDT resolver** (find all 248 private Nt* functions, no symbols) | Python API | Tab 10 |
+| | **Kernel function emulator** (Unicorn x86 emulation + test scenarios) | Python API | Tab 10 |
 | | **Scan all exports with progress tracking** | — | Tab 10 |
 | | **Batch compare with real-time progress** | — | Tab 10 |
 | **Deep Analysis** | **Discover ALL functions (exported + internal)** | — | Tab 13 |
@@ -220,11 +454,12 @@ pip install -r requirements.txt
 ```
 pefile>=2023.2.7    # PE file parsing
 capstone>=5.0.0     # x86 disassembly engine
+unicorn>=2.0.0      # x86 CPU emulator (kernel function emulator)
 tabulate>=0.9.0     # Table formatting for CLI output
 colorama>=0.4.6     # Colored terminal output
 ```
 
-All pure-Python except capstone (has native C backend for speed).
+All pure-Python except capstone and unicorn (have native C backends for speed).
 
 ---
 
@@ -1309,8 +1544,8 @@ win2k_analyzer/
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
 │
-├── nt_analyzer/               # Core analysis package (15 modules)
-│   ├── __init__.py            # Package init, version 3.0.0
+├── nt_analyzer/               # Core analysis package (16 modules)
+│   ├── __init__.py            # Package init
 │   ├── pe_analyzer.py         # PE export/import/header analysis
 │   ├── syscall_extractor.py   # Syscall number extraction from ntdll stubs
 │   ├── comparator.py          # Side-by-side DLL comparison
@@ -1319,12 +1554,13 @@ win2k_analyzer/
 │   ├── syscall_patcher.py     # Syscall header generation (4 styles)
 │   ├── ros_patcher.py         # ReactOS source tree auto-patcher
 │   ├── build_generator.py     # Build script generation (RosBE/MSVC/CMake)
-│   ├── behavior_analyzer.py   # Function fingerprinting, API patterns, progress callbacks
+│   ├── behavior_analyzer.py   # Function fingerprinting, API patterns, SSDT resolver
 │   ├── decompiler.py          # x86→C decompiler (works without symbols)
 │   ├── compat_analyzer.py     # Deep NT version compatibility detection
 │   ├── pe_patcher.py          # KernelEx-inspired PE binary patcher (1900+ lines, 46 methods)
-│   ├── deep_analyzer.py       # (NEW) IDA Pro-level function discovery, profiling, XRefs, deep compare
-│   └── symbol_loader.py       # (NEW) Multi-format symbol loader (.map/.pdb/.dbg/.sym)
+│   ├── deep_analyzer.py       # IDA Pro-level function discovery, profiling, XRefs, deep compare
+│   ├── symbol_loader.py       # Multi-format symbol loader (.map/.pdb/.dbg/.sym)
+│   └── emulator.py            # (NEW) Unicorn-based kernel function emulator with API mocking
 │
 ├── generated_headers/         # Output: generated C header files
 │   ├── peb_win2k.h

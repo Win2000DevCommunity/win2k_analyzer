@@ -857,10 +857,43 @@ class X86Decompiler:
             display_name = self.symbols.get(self.image_base + target_rva,
                                             f"sub_{self.image_base + target_rva:08X}")
         else:
+            # 1) Search PE exports
             if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
                 for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
                     if exp.name and exp.name.decode('ascii', errors='replace') == func_name_or_rva:
                         target_rva = exp.address
+                        display_name = func_name_or_rva
+                        break
+            # 2) SSDT resolution for Nt* kernel functions (finds the REAL function)
+            if target_rva is None and func_name_or_rva.startswith('Nt') and not func_name_or_rva.startswith('Ntdll'):
+                pe.close()
+                try:
+                    from nt_analyzer.behavior_analyzer import resolve_nt_via_ssdt
+                    ssdt_result = resolve_nt_via_ssdt(pe_path, func_name_or_rva)
+                    if ssdt_result:
+                        target_rva = ssdt_result[0]
+                        display_name = func_name_or_rva
+                except Exception:
+                    pass
+                pe = pefile.PE(pe_path, fast_load=False)
+            # 3) Try Nt↔Zw name alias in exports (fallback)
+            if target_rva is None and hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                alt_name = None
+                if func_name_or_rva.startswith('Nt') and not func_name_or_rva.startswith('Ntdll'):
+                    alt_name = 'Zw' + func_name_or_rva[2:]
+                elif func_name_or_rva.startswith('Zw'):
+                    alt_name = 'Nt' + func_name_or_rva[2:]
+                if alt_name:
+                    for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                        if exp.name and exp.name.decode('ascii', errors='replace') == alt_name:
+                            target_rva = exp.address
+                            display_name = func_name_or_rva
+                            break
+            # 4) Search loaded symbols
+            if target_rva is None and self.symbols:
+                for va, name in self.symbols.items():
+                    if name == func_name_or_rva:
+                        target_rva = va - pe.OPTIONAL_HEADER.ImageBase
                         display_name = func_name_or_rva
                         break
 

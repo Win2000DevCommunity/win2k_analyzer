@@ -72,30 +72,232 @@ def _get_export_map(pe):
 
 
 # ---------------------------------------------------------------------------
+#  SSDT-based Nt function resolver (kernel-mode intelligence)
+# ---------------------------------------------------------------------------
+
+def _find_ki_service_table(pe, image_base):
+    """
+    Find KiServiceTable address by scanning for the kernel init code that writes:
+        mov dword ptr [KeServiceDescriptorTable], offset KiServiceTable
+    Pattern: C7 05 <ssdt_va_le32> <ki_table_va_le32>
+    Returns (ki_table_rva, service_count) or (None, 0).
+    """
+    ssdt_rva = None
+    if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if exp.name and exp.name.decode('ascii', 'replace') == 'KeServiceDescriptorTable':
+                ssdt_rva = exp.address
+                break
+    if ssdt_rva is None:
+        return None, 0
+
+    ssdt_va = ssdt_rva + image_base
+    ssdt_bytes = struct.pack('<I', ssdt_va)
+    pe_data = pe.__data__
+
+    for i in range(len(pe_data) - 10):
+        if pe_data[i] == 0xC7 and pe_data[i + 1] == 0x05:
+            if pe_data[i + 2:i + 6] == ssdt_bytes:
+                ki_va = struct.unpack('<I', pe_data[i + 6:i + 10])[0]
+                ki_rva = ki_va - image_base
+                if 0 < ki_rva < len(pe_data):
+                    # Count services: read until we hit a non-kernel VA
+                    count = 0
+                    try:
+                        tbl = pe.get_data(ki_rva, 1024 * 4)
+                        for j in range(0, len(tbl), 4):
+                            va = struct.unpack('<I', tbl[j:j + 4])[0]
+                            rva = va - image_base
+                            if rva <= 0 or rva >= len(pe_data):
+                                break
+                            count += 1
+                    except Exception:
+                        count = 256
+                    return ki_rva, count
+    return None, 0
+
+
+def resolve_nt_via_ssdt(pe_path, nt_func_name):
+    """
+    Resolve an Nt* kernel function address via the SSDT — no symbols needed.
+
+    In ntoskrnl.exe, Nt* functions are private (not exported).
+    Only Zw* wrappers are exported. This function:
+      1. Finds the Zw* variant in exports
+      2. Reads the syscall number from the Zw stub (mov eax, N)
+      3. Finds KiServiceTable by scanning for initialization code
+      4. Reads SSDT[N] → the actual Nt* function VA
+
+    Returns (rva, va, syscall_num) or None.
+    """
+    if not nt_func_name.startswith('Nt'):
+        return None
+
+    zw_name = 'Zw' + nt_func_name[2:]
+    pe = pefile.PE(pe_path, fast_load=False)
+    image_base = pe.OPTIONAL_HEADER.ImageBase
+
+    # Step 1: find Zw export
+    zw_rva = None
+    if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if exp.name and exp.name.decode('ascii', 'replace') == zw_name:
+                zw_rva = exp.address
+                break
+    if zw_rva is None:
+        pe.close()
+        return None
+
+    # Step 2: extract syscall number from Zw stub  (B8 xx xx xx xx = mov eax, imm32)
+    zw_code = pe.get_data(zw_rva, 16)
+    if zw_code[0] != 0xB8:
+        pe.close()
+        return None
+    syscall_num = struct.unpack('<I', zw_code[1:5])[0]
+
+    # Step 3: find KiServiceTable
+    ki_rva, svc_count = _find_ki_service_table(pe, image_base)
+    if ki_rva is None or syscall_num >= svc_count:
+        pe.close()
+        return None
+
+    # Step 4: read SSDT[syscall_num]
+    table_data = pe.get_data(ki_rva + syscall_num * 4, 4)
+    nt_va = struct.unpack('<I', table_data[0:4])[0]
+    nt_rva = nt_va - image_base
+
+    pe.close()
+
+    if nt_rva <= 0:
+        return None
+    return nt_rva, nt_va, syscall_num
+
+
+def build_ssdt_map(pe_path):
+    """
+    Build a complete SSDT map: {syscall_num: (nt_name, nt_va, nt_rva)}.
+    Resolves all Nt* functions via their Zw* stubs.
+    Works on ntoskrnl.exe without any symbols.
+    """
+    pe = pefile.PE(pe_path, fast_load=False)
+    image_base = pe.OPTIONAL_HEADER.ImageBase
+
+    # Collect all Zw stubs
+    zw_stubs = {}  # {syscall_num: zw_export_name}
+    if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if not exp.name:
+                continue
+            name = exp.name.decode('ascii', 'replace')
+            if name.startswith('Zw'):
+                code = pe.get_data(exp.address, 8)
+                if code[0] == 0xB8:
+                    sc = struct.unpack('<I', code[1:5])[0]
+                    zw_stubs[sc] = name
+
+    # Find KiServiceTable
+    ki_rva, svc_count = _find_ki_service_table(pe, image_base)
+    if ki_rva is None:
+        pe.close()
+        return {}
+
+    # Read full table
+    ssdt_map = {}
+    table_data = pe.get_data(ki_rva, svc_count * 4)
+    for i in range(svc_count):
+        va = struct.unpack('<I', table_data[i * 4:i * 4 + 4])[0]
+        rva = va - image_base
+        zw_name = zw_stubs.get(i)
+        nt_name = 'Nt' + zw_name[2:] if zw_name else f'NtSyscall_{i:03X}'
+        ssdt_map[i] = (nt_name, va, rva)
+
+    pe.close()
+    return ssdt_map
+
+
+# ---------------------------------------------------------------------------
 #  Function extraction
 # ---------------------------------------------------------------------------
 
-def get_function_bytes(pe_path, func_name, max_bytes=4096):
+def get_function_bytes(pe_path, func_name, max_bytes=4096, symbols=None):
     """
-    Extract raw bytes for an exported function from a PE file.
+    Extract raw bytes for a function from a PE file.
+
+    Search order:
+      1. PE export table (exact name match)
+      2. Nt↔Zw name alias (try alternate prefix)
+      3. SSDT resolution (Nt* → Zw stub → KiServiceTable — kernel intelligence)
+      4. Loaded symbols dict ({va: name})
+
     Returns (bytes, rva, va) or None if not found.
     """
     pe = pefile.PE(pe_path, fast_load=False)
-    if not hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
-        return None
+    image_base = pe.OPTIONAL_HEADER.ImageBase
 
-    for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-        if exp.name and exp.name.decode('ascii', errors='replace') == func_name:
-            rva = exp.address
-            offset = _rva_to_offset(pe, rva)
-            if offset is None:
-                return None
-            data = pe.get_data(rva, max_bytes)
-            va = rva + pe.OPTIONAL_HEADER.ImageBase
-            pe.close()
-            return data, rva, va
+    # 1) Search PE export table (exact match)
+    if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if exp.name and exp.name.decode('ascii', errors='replace') == func_name:
+                rva = exp.address
+                offset = _rva_to_offset(pe, rva)
+                if offset is None:
+                    pe.close()
+                    return None
+                data = pe.get_data(rva, max_bytes)
+                va = rva + image_base
+                pe.close()
+                return data, rva, va
+
+    # 2) SSDT resolution for Nt* kernel functions (no symbols needed)
+    #    This finds the REAL Nt function, not just the Zw stub
+    if func_name.startswith('Nt') and not func_name.startswith('Ntdll'):
+        pe.close()
+        ssdt_result = resolve_nt_via_ssdt(pe_path, func_name)
+        if ssdt_result:
+            nt_rva, nt_va, _sc = ssdt_result
+            pe2 = pefile.PE(pe_path, fast_load=False)
+            try:
+                data = pe2.get_data(nt_rva, max_bytes)
+                pe2.close()
+                return data, nt_rva, nt_va
+            except Exception:
+                pe2.close()
+        pe = pefile.PE(pe_path, fast_load=False)
+
+    # 3) Try Nt↔Zw name alias in exports (fallback: at least show the Zw stub)
+    alt_name = None
+    if func_name.startswith('Nt') and not func_name.startswith('Ntdll'):
+        alt_name = 'Zw' + func_name[2:]
+    elif func_name.startswith('Zw'):
+        alt_name = 'Nt' + func_name[2:]
+    if alt_name and hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if exp.name and exp.name.decode('ascii', errors='replace') == alt_name:
+                rva = exp.address
+                data = pe.get_data(rva, max_bytes)
+                va = rva + image_base
+                pe.close()
+                return data, rva, va
 
     pe.close()
+
+    # 4) Search loaded symbols for non-exported functions
+    if symbols:
+        pe2 = pefile.PE(pe_path, fast_load=False)
+        ib = pe2.OPTIONAL_HEADER.ImageBase
+        for va, name in symbols.items():
+            if name == func_name:
+                rva = va - ib
+                if rva < 0:
+                    continue
+                try:
+                    data = pe2.get_data(rva, max_bytes)
+                    pe2.close()
+                    return data, rva, va
+                except Exception:
+                    continue
+        pe2.close()
+
     return None
 
 
@@ -287,12 +489,13 @@ class FunctionFingerprint:
                                     pass
 
 
-def fingerprint_function(pe_path, func_name, max_bytes=8192):
+def fingerprint_function(pe_path, func_name, max_bytes=8192, symbols=None):
     """
     Build a FunctionFingerprint for a named export.
+    If symbols dict is provided, can find non-exported functions.
     Returns FunctionFingerprint or None if the function is not found.
     """
-    result = get_function_bytes(pe_path, func_name, max_bytes)
+    result = get_function_bytes(pe_path, func_name, max_bytes, symbols=symbols)
     if result is None:
         return None
     code_bytes, rva, va = result
@@ -395,13 +598,15 @@ class ComparisonResult:
         return '\n'.join(lines)
 
 
-def compare_functions(pe_path_a, pe_path_b, func_name, max_bytes=8192):
+def compare_functions(pe_path_a, pe_path_b, func_name, max_bytes=8192,
+                      symbols_a=None, symbols_b=None):
     """
     Compare a single function between two PE files.
+    symbols_a/symbols_b: optional {va: name} dicts for non-exported functions.
     Returns a ComparisonResult.
     """
-    fp_a = fingerprint_function(pe_path_a, func_name, max_bytes)
-    fp_b = fingerprint_function(pe_path_b, func_name, max_bytes)
+    fp_a = fingerprint_function(pe_path_a, func_name, max_bytes, symbols=symbols_a)
+    fp_b = fingerprint_function(pe_path_b, func_name, max_bytes, symbols=symbols_b)
     return ComparisonResult(func_name, fp_a, fp_b)
 
 
@@ -611,12 +816,13 @@ def scan_all_exports(pe_path, max_functions=500, progress_callback=None, version
 #  Disassembly listing for display
 # ---------------------------------------------------------------------------
 
-def disassemble_function(pe_path, func_name, max_bytes=4096):
+def disassemble_function(pe_path, func_name, max_bytes=4096, symbols=None):
     """
     Return a formatted disassembly listing of a function.
     Annotates calls with import names when possible.
+    If symbols dict is provided, can find non-exported functions.
     """
-    result = get_function_bytes(pe_path, func_name, max_bytes)
+    result = get_function_bytes(pe_path, func_name, max_bytes, symbols=symbols)
     if result is None:
         return None
 

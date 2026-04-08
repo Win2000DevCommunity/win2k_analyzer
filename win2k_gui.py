@@ -50,6 +50,7 @@ def _compat():          return _lazy('nt_analyzer.compat_analyzer')
 def _pe_patcher():      return _lazy('nt_analyzer.pe_patcher')
 def _sym_loader():      return _lazy('nt_analyzer.symbol_loader')
 def _deep_analyzer():   return _lazy('nt_analyzer.deep_analyzer')
+def _emulator():        return _lazy('nt_analyzer.emulator')
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -736,7 +737,7 @@ def output_clear(txt_widget):
 
 
 def _extract_func_from_click(event, output_widget):
-    """Extract the function name under a func_link tag click.
+    """Extract the function name under a func_link or func_link_b tag click.
     Works with both TabbedOutput and plain ScrolledText.
     Returns the stripped function name or None."""
     try:
@@ -747,9 +748,16 @@ def _extract_func_from_click(event, output_widget):
         if not txt:
             return None
         idx = txt.index(f"@{event.x},{event.y}")
-        if "func_link" not in txt.tag_names(idx):
+        tags = txt.tag_names(idx)
+        # Check for either func_link or func_link_b
+        tag_name = None
+        if "func_link" in tags:
+            tag_name = "func_link"
+        elif "func_link_b" in tags:
+            tag_name = "func_link_b"
+        if not tag_name:
             return None
-        r = txt.tag_prevrange("func_link", f"{idx}+1c")
+        r = txt.tag_prevrange(tag_name, f"{idx}+1c")
         if not r:
             return None
         return txt.get(r[0], r[1]).strip()
@@ -757,17 +765,28 @@ def _extract_func_from_click(event, output_widget):
         return None
 
 
-def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mode_var=None, symbols_getter=None):
+def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mode_var=None, symbols_getter=None,
+                    pe_path_getter_b=None, sym_getter_b=None, symbols_getter_b=None):
     """Register func_link tag on a TabbedOutput so clicking a function name
     opens a new tab with the decompilation mode selected in mode_var.
 
-    pe_path_getter: callable returning the PE file path
+    pe_path_getter: callable returning the PE file path (DLL A)
     app_ref: the main Win2KAnalyzerApp for after() and target tab lookup
-    symbols_getter: optional callable returning a symbols dict {va: name} for decompilation
-    sym_getter: optional callable returning (use_sym:bool, sym_path:str|None)
+    symbols_getter: optional callable returning a symbols dict {va: name} for DLL A
+    sym_getter: optional callable returning (use_sym:bool, sym_path:str|None) for DLL A
     mode_var: optional StringVar ('Assembly'|'Pseudo-C'|'Hex Dump'); defaults to Assembly
+    pe_path_getter_b: optional callable returning the PE file path (DLL B / ReactOS)
+    sym_getter_b: optional callable returning (use_sym:bool, sym_path:str|None) for DLL B
+    symbols_getter_b: optional callable returning a symbols dict {va: name} for DLL B
     """
     output_widget.tag_configure("func_link", foreground="#89b4fa", underline=True)
+    output_widget.tag_configure("func_link_b", foreground="#a6e3a1", underline=True)
+
+    def _pick_sym(is_b=False):
+        """Return (sym_getter_fn, symbols_getter_fn, pe_getter_fn) for the right side."""
+        if is_b and pe_path_getter_b:
+            return (sym_getter_b, symbols_getter_b, pe_path_getter_b)
+        return (sym_getter, symbols_getter, pe_path_getter)
 
     def _colorize_asm(result, func_name):
         output_write(output_widget, f"  DISASSEMBLY: {func_name}\n\n", "title")
@@ -807,13 +826,15 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
             else:
                 output_write(output_widget, line + '\n')
 
-    def _do_asm(func_name, pe_path):
+    def _do_asm(func_name, pe_path, is_b=False):
+        sg, _, _ = _pick_sym(is_b)
         use_sym = False
         sym_path = None
-        if sym_getter:
-            use_sym, sym_path = sym_getter()
+        if sg:
+            use_sym, sym_path = sg()
+        side_tag = " [B]" if is_b else ""
         sym_tag = " +sym" if (use_sym and sym_path) else ""
-        output_widget.new_tab(f"Disasm{sym_tag}: {func_name}")
+        output_widget.new_tab(f"Disasm{sym_tag}{side_tag}: {func_name}")
         def work():
             if use_sym and sym_path:
                 syms = _sym_loader().load_symbols(sym_path, pe_path=pe_path)
@@ -837,7 +858,10 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
                 code = _deep_analyzer().disassemble_function_full(fm, func_name)
                 fm.close()
                 return code
-            return _behavior().disassemble_function(pe_path, func_name)
+            # Pass symbols for non-exported function lookup
+            _, syms_g_fn, _ = _pick_sym(is_b)
+            click_syms = syms_g_fn() if syms_g_fn else None
+            return _behavior().disassemble_function(pe_path, func_name, symbols=click_syms)
         def done(result):
             if isinstance(result, Exception):
                 output_write(output_widget, f"ERROR: {result}\n", "error")
@@ -850,18 +874,20 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
             app_ref.after(0, done, result)
         run_async(work, callback)
 
-    def _do_pseudoc(func_name, pe_path):
+    def _do_pseudoc(func_name, pe_path, is_b=False):
+        sg, syms_g, _ = _pick_sym(is_b)
         sym_tag = ""
         syms = None
-        if symbols_getter:
-            syms = symbols_getter()
+        if syms_g:
+            syms = syms_g()
             if syms:
                 sym_tag = " +sym"
-        elif sym_getter:
-            use_sym, sym_path = sym_getter()
+        elif sg:
+            use_sym, sym_path = sg()
             if use_sym and sym_path:
                 sym_tag = " +sym"
-        output_widget.new_tab(f"Pseudo-C{sym_tag}: {func_name}")
+        side_tag = " [B]" if is_b else ""
+        output_widget.new_tab(f"Pseudo-C{sym_tag}{side_tag}: {func_name}")
         def work():
             return _decompiler().decompile(pe_path, func_name, symbols=syms)
         def done(result):
@@ -876,13 +902,15 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
             app_ref.after(0, done, result)
         run_async(work, callback)
 
-    def _do_hex(func_name, pe_path):
+    def _do_hex(func_name, pe_path, is_b=False):
+        sg, _, _ = _pick_sym(is_b)
         sym_tag = ""
-        if sym_getter:
-            use_sym, sym_path = sym_getter()
+        if sg:
+            use_sym, sym_path = sg()
             if use_sym and sym_path:
                 sym_tag = " +sym"
-        output_widget.new_tab(f"HEX{sym_tag}: {func_name}")
+        side_tag = " [B]" if is_b else ""
+        output_widget.new_tab(f"HEX{sym_tag}{side_tag}: {func_name}")
         def work():
             import pefile
             pe = pefile.PE(pe_path, fast_load=False)
@@ -931,25 +959,37 @@ def setup_func_link(output_widget, pe_path_getter, app_ref, sym_getter=None, mod
             app_ref.after(0, done, result)
         run_async(work, callback)
 
-    def on_click(event):
+    def _on_click_side(event, is_b=False):
         func_name = _extract_func_from_click(event, output_widget)
         if not func_name:
             return
-        pe_path = pe_path_getter()
+        _, _, pg = _pick_sym(is_b)
+        pe_path = pg()
         if not pe_path:
             return
         mode = mode_var.get() if mode_var else "Assembly"
         if mode == "Pseudo-C":
-            _do_pseudoc(func_name, pe_path)
+            _do_pseudoc(func_name, pe_path, is_b=is_b)
         elif mode == "Hex Dump":
-            _do_hex(func_name, pe_path)
+            _do_hex(func_name, pe_path, is_b=is_b)
         else:
-            _do_asm(func_name, pe_path)
+            _do_asm(func_name, pe_path, is_b=is_b)
+
+    def on_click(event):
+        _on_click_side(event, is_b=False)
+
+    def on_click_b(event):
+        _on_click_side(event, is_b=True)
 
     output_widget.tag_bind("func_link", "<Button-1>", on_click)
     output_widget.tag_bind("func_link", "<Enter>",
                            lambda e: output_widget.configure(cursor="hand2"))
     output_widget.tag_bind("func_link", "<Leave>",
+                           lambda e: output_widget.configure(cursor=""))
+    output_widget.tag_bind("func_link_b", "<Button-1>", on_click_b)
+    output_widget.tag_bind("func_link_b", "<Enter>",
+                           lambda e: output_widget.configure(cursor="hand2"))
+    output_widget.tag_bind("func_link_b", "<Leave>",
                            lambda e: output_widget.configure(cursor=""))
 
 
@@ -2023,7 +2063,7 @@ class BehaviorTab(ttk.Frame):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(8, weight=1)
+        self.rowconfigure(9, weight=1)
 
         # ── History state ──
         self._history = []
@@ -2064,6 +2104,8 @@ class BehaviorTab(ttk.Frame):
                    command=self._control_flow).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F517  Resolve Unknown",
                    command=self._resolve_unknown).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F3AE  Simulate",
+                   command=self._simulate).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u25C0 Back",
                    command=self._history_back).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="Forward \u25B6",
@@ -2101,32 +2143,70 @@ class BehaviorTab(ttk.Frame):
                      values=["Raw Offsets", "Database", "Symbols"],
                      state="readonly").pack(side="left", padx=2)
 
-        # ── Symbol & history row ──
-        sym_frm = tk.Frame(self, bg=T["bg"])
-        sym_frm.grid(row=5, column=0, sticky="ew", padx=12, pady=3)
-        ttk.Label(sym_frm, text="Symbols:").pack(side="left", padx=5)
-        self._sym_var = tk.StringVar()
-        sym_ent = PlaceholderEntry(sym_frm, placeholder="Optional: .map / .pdb / .dbg symbol file",
-                                   textvariable=self._sym_var,
-                                   bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
-                                   font=("Consolas", 10), relief="flat", bd=5, width=40)
-        sym_ent.pack(side="left", padx=5)
-        app.register_placeholder(sym_ent)
-        self._sym_entry = sym_ent
-        ttk.Button(sym_frm, text="Browse",
-                   command=self._browse_symbols).pack(side="left", padx=3)
-        self._use_sym_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sym_frm, text="Use symbols in disassembly",
-                        variable=self._use_sym_var).pack(side="left", padx=10)
+        # ── Symbols A (Win2K) row ──
+        sym_a_frm = tk.Frame(self, bg=T["bg"])
+        sym_a_frm.grid(row=5, column=0, sticky="ew", padx=12, pady=2)
+        ttk.Label(sym_a_frm, text="Symbols A:").pack(side="left", padx=5)
+        self._sym_a_var = tk.StringVar()
+        sym_a_ent = PlaceholderEntry(sym_a_frm, placeholder="Win2K symbols: .map / .pdb / .dbg",
+                                     textvariable=self._sym_a_var,
+                                     bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                                     font=("Consolas", 10), relief="flat", bd=5, width=36)
+        sym_a_ent.pack(side="left", padx=5)
+        app.register_placeholder(sym_a_ent)
+        self._sym_a_entry = sym_a_ent
+        ttk.Button(sym_a_frm, text="Browse",
+                   command=lambda: self._browse_symbols('a')).pack(side="left", padx=3)
+        ttk.Button(sym_a_frm, text="\U0001F4E5  Load",
+                   command=lambda: self._load_symbols('a')).pack(side="left", padx=3)
+        ttk.Button(sym_a_frm, text="\U0001F4E4  Unload",
+                   command=lambda: self._unload_symbols('a')).pack(side="left", padx=3)
+        self._loaded_symbols_a = {}
+        self._sym_meta_a = {}
+        self._use_sym_a_var = tk.BooleanVar(value=False)
+        self.sym_a_status_var = tk.StringVar(value="")
+        ttk.Label(sym_a_frm, textvariable=self.sym_a_status_var, foreground=T["green"],
+                  font=("Segoe UI", 9)).pack(side="left", padx=(8, 0))
+
+        # ── Symbols B (ReactOS) row ──
+        sym_b_frm = tk.Frame(self, bg=T["bg"])
+        sym_b_frm.grid(row=6, column=0, sticky="ew", padx=12, pady=2)
+        ttk.Label(sym_b_frm, text="Symbols B:").pack(side="left", padx=5)
+        self._sym_b_var = tk.StringVar()
+        sym_b_ent = PlaceholderEntry(sym_b_frm, placeholder="ReactOS symbols: .map / .pdb / .dbg",
+                                     textvariable=self._sym_b_var,
+                                     bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                                     font=("Consolas", 10), relief="flat", bd=5, width=36)
+        sym_b_ent.pack(side="left", padx=5)
+        app.register_placeholder(sym_b_ent)
+        self._sym_b_entry = sym_b_ent
+        ttk.Button(sym_b_frm, text="Browse",
+                   command=lambda: self._browse_symbols('b')).pack(side="left", padx=3)
+        ttk.Button(sym_b_frm, text="\U0001F4E5  Load",
+                   command=lambda: self._load_symbols('b')).pack(side="left", padx=3)
+        ttk.Button(sym_b_frm, text="\U0001F4E4  Unload",
+                   command=lambda: self._unload_symbols('b')).pack(side="left", padx=3)
+        self._loaded_symbols_b = {}
+        self._sym_meta_b = {}
+        self._use_sym_b_var = tk.BooleanVar(value=False)
+        self.sym_b_status_var = tk.StringVar(value="")
+        ttk.Label(sym_b_frm, textvariable=self.sym_b_status_var, foreground=T["green"],
+                  font=("Segoe UI", 9)).pack(side="left", padx=(8, 0))
         self._hist_var = tk.StringVar(value="")
-        ttk.Label(sym_frm, textvariable=self._hist_var).pack(side="right", padx=10)
+        ttk.Label(sym_b_frm, textvariable=self._hist_var).pack(side="right", padx=10)
+
+        # Backward-compatible combined accessor
+        self._loaded_symbols = {}  # merged view (A+B) for legacy code
+        self._sym_meta = {}
+        self._use_sym_var = self._use_sym_a_var  # alias
+        self.sym_status_var = self.sym_a_status_var  # alias
 
         self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
-            self, "\u2022 Compare function behavior between Win2000 and ReactOS binaries", row=6)
+            self, "\u2022 Compare function behavior between Win2000 and ReactOS binaries", row=7)
 
         # Click mode selector
         click_frm = tk.Frame(self, bg=T["bg"])
-        click_frm.grid(row=7, column=0, sticky="w", padx=12, pady=0)
+        click_frm.grid(row=8, column=0, sticky="w", padx=12, pady=0)
         ttk.Label(click_frm, text="Click mode:").pack(side="left", padx=(0, 3))
         self._click_mode_var = tk.StringVar(value="Assembly")
         ttk.Combobox(click_frm, textvariable=self._click_mode_var, width=10,
@@ -2134,18 +2214,101 @@ class BehaviorTab(ttk.Frame):
                      state="readonly").pack(side="left", padx=2)
 
         self.output = TabbedOutput(self)
-        self.output.grid(row=8, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.output.grid(row=9, column=0, sticky="nsew", padx=10, pady=(0, 10))
         def _sym_getter():
-            return (self._use_sym_var.get(), self._sym_entry.get_value())
+            if self._loaded_symbols_a:
+                return (True, self._sym_a_entry.get_value())
+            return (False, None)
+        def _sym_getter_b():
+            if self._loaded_symbols_b:
+                return (True, self._sym_b_entry.get_value())
+            return (False, None)
         setup_func_link(self.output, self._get_a, self.app,
-                        sym_getter=_sym_getter, mode_var=self._click_mode_var)
+                        sym_getter=_sym_getter,
+                        symbols_getter=lambda: self._loaded_symbols_a or None,
+                        mode_var=self._click_mode_var,
+                        pe_path_getter_b=self._get_b,
+                        sym_getter_b=_sym_getter_b,
+                        symbols_getter_b=lambda: self._loaded_symbols_b or None)
 
     # ── Symbol browsing ──
-    def _browse_symbols(self):
+    def _browse_symbols(self, which='a'):
         path = filedialog.askopenfilename(
             filetypes=[("Symbol files", "*.map *.pdb *.dbg *.sym"), ("All", "*.*")])
         if path:
-            self._sym_entry.set_value(path)
+            entry = self._sym_a_entry if which == 'a' else self._sym_b_entry
+            entry.set_value(path)
+
+    def _load_symbols(self, which='a'):
+        """Load a symbol file (.map, .pdb, .dbg, .sym) into persistent cache for DLL A or B."""
+        entry = self._sym_a_entry if which == 'a' else self._sym_b_entry
+        sym_path = entry.get_value()
+        label = "A (Win2K)" if which == 'a' else "B (ReactOS)"
+        if not sym_path:
+            messagebox.showwarning("No file", f"Enter or browse for a symbol file for {label}.\n\n"
+                                   "Supported: .map (MSVC/GCC/IDA), .pdb, .dbg, .sym")
+            return
+        if not os.path.isfile(sym_path):
+            messagebox.showerror("Not found", f"File not found:\n{sym_path}")
+            return
+
+        pe_path = self._get_a() if which == 'a' else self._get_b()
+        self.status_var.set(f"\u23F3 Loading {label} symbols from {os.path.basename(sym_path)}...")
+
+        def work(progress_cb):
+            progress_cb(f"Loading {label} symbols from {os.path.basename(sym_path)}...", 30)
+            return _sym_loader().load_symbols(sym_path, pe_path=pe_path)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                return
+            symbols, meta = result
+            if which == 'a':
+                self._loaded_symbols_a = _sym_loader().merge_symbols(self._loaded_symbols_a, symbols)
+                self._sym_meta_a = meta
+                self._use_sym_a_var.set(True)
+                status_var = self.sym_a_status_var
+            else:
+                self._loaded_symbols_b = _sym_loader().merge_symbols(self._loaded_symbols_b, symbols)
+                self._sym_meta_b = meta
+                self._use_sym_b_var.set(True)
+                status_var = self.sym_b_status_var
+            # Update merged view for legacy code
+            self._loaded_symbols = _sym_loader().merge_symbols(
+                self._loaded_symbols_a, self._loaded_symbols_b)
+            n = meta.get('total_symbols', 0)
+            fmt = meta.get('format', '?')
+            err = meta.get('error', '')
+            total = len(self._loaded_symbols_a) if which == 'a' else len(self._loaded_symbols_b)
+            if err:
+                status_var.set(f"\u26A0 {err}")
+                self.status_var.set(f"\u26A0 {label}: {err}")
+            else:
+                status_var.set(f"\u2705 {n} symbols ({fmt})")
+                self.status_var.set(
+                    f"\u2705 {label}: Loaded {n} symbols from {os.path.basename(sym_path)} "
+                    f"[{fmt}] \u2014 total: {total}")
+
+        run_with_progress_dialog(self.app, f"Loading {label} symbols\u2026", work, done)
+
+    def _unload_symbols(self, which='a'):
+        """Clear loaded symbols for DLL A or B."""
+        label = "A (Win2K)" if which == 'a' else "B (ReactOS)"
+        if which == 'a':
+            self._loaded_symbols_a = {}
+            self._sym_meta_a = {}
+            self._use_sym_a_var.set(False)
+            self.sym_a_status_var.set("")
+        else:
+            self._loaded_symbols_b = {}
+            self._sym_meta_b = {}
+            self._use_sym_b_var.set(False)
+            self.sym_b_status_var.set("")
+        # Update merged view
+        self._loaded_symbols = _sym_loader().merge_symbols(
+            self._loaded_symbols_a, self._loaded_symbols_b)
+        self.status_var.set(f"\U0001F4E4 {label} symbols unloaded")
 
     # ── History system ──
     def _save_to_history(self, title):
@@ -2192,41 +2355,31 @@ class BehaviorTab(ttk.Frame):
         if not path or not func:
             messagebox.showwarning("Missing", "Select DLL A and enter a function name.\n\nExample: NtCreateFile")
             return
-        use_sym = self._use_sym_var.get()
-        sym_path = self._sym_entry.get_value() if use_sym else None
+        use_sym = self._use_sym_a_var.get() and self._loaded_symbols_a
+        # Also pass symbols for non-exported function lookup even in basic mode
+        all_syms_a = dict(self._loaded_symbols_a) if self._loaded_symbols_a else None
         self.output.new_tab(f"Disasm: {func}")
+
+        loaded_syms = dict(self._loaded_symbols_a) if use_sym else None
 
         def work(progress_cb):
             progress_cb(f"Loading PE: {os.path.basename(path)}", 10)
-            if use_sym and sym_path:
-                progress_cb(f"Loading symbols\u2026", 20)
-                syms = _sym_loader().load_symbols(sym_path, pe_path=path)
+            if loaded_syms:
                 progress_cb(f"Building function map\u2026", 30)
                 fm = _deep_analyzer().PEFunctionMap(path, progress_callback=progress_cb)
                 fm.discover_all_functions()
                 fm.analyze_all_functions()
-                # Merge symbols
-                if isinstance(syms, tuple):
-                    sym_list, _ = syms
-                else:
-                    sym_list = syms
-                if isinstance(sym_list, dict):
-                    for va, name in sym_list.items():
-                        if va in fm.functions and name:
-                            fm.functions[va].name = name
-                elif isinstance(sym_list, list):
-                    for sym in sym_list:
-                        va = sym.get('address', 0)
-                        name = sym.get('name', '')
-                        if va in fm.functions and name:
-                            fm.functions[va].name = name
+                # Merge loaded symbols
+                for va, name in loaded_syms.items():
+                    if va in fm.functions and name:
+                        fm.functions[va].name = name
                 progress_cb(f"Disassembling {func} with symbols\u2026", 70)
                 code = _deep_analyzer().disassemble_function_full(fm, func)
                 fm.close()
                 return ('deep', code)
             else:
                 progress_cb(f"Disassembling {func}\u2026", 30)
-                result = _behavior().disassemble_function(path, func)
+                result = _behavior().disassemble_function(path, func, symbols=all_syms_a)
                 progress_cb("Formatting output\u2026", 90)
                 return ('basic', result)
 
@@ -2237,7 +2390,12 @@ class BehaviorTab(ttk.Frame):
                 return
             mode, code = result
             if code is None:
-                output_write(self.output, f"  Function '{func}' not found in the DLL exports.\n", "error")
+                output_write(self.output, f"  Function '{func}' not found.\n\n", "error")
+                output_write(self.output,
+                    f"  Searched: PE exports, Nt\u2194Zw alias, SSDT resolution", "dim")
+                if self._loaded_symbols_a:
+                    output_write(self.output, f", loaded symbols ({len(self._loaded_symbols_a)})", "dim")
+                output_write(self.output, "\n", "dim")
                 self.status_var.set("\u274C Function not found")
                 return
             for line in code.split('\n'):
@@ -2269,11 +2427,14 @@ class BehaviorTab(ttk.Frame):
             messagebox.showwarning("Missing", "Select both DLLs and enter a function name.")
             return
         self.output.new_tab(f"Compare: {func}")
+        syms_a = dict(self._loaded_symbols_a) if self._loaded_symbols_a else None
+        syms_b = dict(self._loaded_symbols_b) if self._loaded_symbols_b else None
 
         def work(progress_cb):
             progress_cb(f"Fingerprinting {func} in {os.path.basename(pa)}\u2026", 20)
             progress_cb(f"Fingerprinting {func} in {os.path.basename(pb)}\u2026", 50)
-            result = _behavior().compare_functions(pa, pb, func)
+            result = _behavior().compare_functions(pa, pb, func,
+                                                   symbols_a=syms_a, symbols_b=syms_b)
             progress_cb("Computing similarity\u2026", 90)
             return result
 
@@ -2283,6 +2444,12 @@ class BehaviorTab(ttk.Frame):
                 output_write(self.output, f"ERROR: {result}\n", "error")
                 return
             output_write(self.output, "  FUNCTION COMPARISON\n\n", "title")
+            # Clickable links to decompile from either DLL
+            output_write(self.output, "  \u25B6 View in DLL A (Win2K):  ")
+            output_write(self.output, f"{result.func_name}", "func_link")
+            output_write(self.output, "   |   \u25B6 View in DLL B (ReactOS):  ")
+            output_write(self.output, f"{result.func_name}", "func_link_b")
+            output_write(self.output, "\n\n")
             for line in result.summary().split('\n'):
                 if 'Similarity' in line:
                     pct = result.similarity
@@ -2323,11 +2490,12 @@ class BehaviorTab(ttk.Frame):
                 self.status_var.set(f"\u274C Error: {results}")
                 output_write(self.output, f"ERROR: {results}\n", "error")
                 return
-            output_write(self.output, "  BATCH FUNCTION COMPARISON\n\n", "title")
+            output_write(self.output, "  BATCH FUNCTION COMPARISON\n", "title")
+            output_write(self.output, "  Click function name: blue=DLL A (Win2K), green=DLL B (ReactOS)\n\n", "dim")
             output_write(self.output,
-                f"  {'Function':<48} {'Sim%':<8} {'Blocks A':<10} {'Blocks B':<10} {'Notes'}\n", "heading")
+                f"  {'Function A':<26}{'Function B':<26}{'Sim%':<8} {'Blocks A':<10} {'Blocks B':<10} {'Notes'}\n", "heading")
             output_write(self.output,
-                f"  {'\u2500'*48} {'\u2500'*8} {'\u2500'*10} {'\u2500'*10} {'\u2500'*20}\n", "dim")
+                f"  {'\u2500'*26}{'\u2500'*26}{'\u2500'*8} {'\u2500'*10} {'\u2500'*10} {'\u2500'*20}\n", "dim")
             for r in results:
                 pct = r.similarity
                 tag = "ok" if pct >= 80 else ("warn" if pct >= 50 else "error")
@@ -2340,8 +2508,14 @@ class BehaviorTab(ttk.Frame):
                     notes = "SYSCALL MISMATCH"
                 elif r.fp_a and r.fp_a.syscall_number is not None:
                     notes = f"stub 0x{r.fp_a.syscall_number:X}"
-                line = f"  {r.func_name:<48} {pct:>6.1f}% {ba:<10} {bb:<10} {notes}\n"
-                output_write(self.output, line, tag)
+                output_write(self.output, "  ")
+                output_write(self.output, f"{r.func_name}", "func_link")
+                pad_a = max(1, 26 - len(r.func_name))
+                output_write(self.output, " " * pad_a)
+                output_write(self.output, f"{r.func_name}", "func_link_b")
+                pad_b = max(1, 26 - len(r.func_name))
+                rest = f"{pct:>6.1f}% {ba:<10} {bb:<10} {notes}\n"
+                output_write(self.output, " " * pad_b + rest, tag)
             self._save_to_history("Batch Compare")
             self.status_var.set(f"\u2705 Compared {len(results)} functions")
 
@@ -2626,6 +2800,55 @@ class BehaviorTab(ttk.Frame):
 
         run_with_progress_dialog(self.app, f"Control flow: {func}\u2026", work, done)
 
+    # ── Kernel Function Emulator ──────────────────────────────────────
+
+    def _simulate(self):
+        """Run the kernel function emulator with auto-generated test scenarios."""
+        path = self._get_a()
+        func = self._get_func()
+        if not path or not func:
+            messagebox.showwarning("Missing", "Select DLL A and enter a function name.")
+            return
+
+        syms_a = dict(self._loaded_symbols_a) if self._loaded_symbols_a else None
+
+        self.output.new_tab(f"Simulate: {func}")
+
+        def work(progress_cb):
+            emu_mod = _emulator()
+            progress_cb(f"Running emulation scenarios for {func}\u2026", 10)
+            # Let run_test_suite generate scenarios internally so
+            # buffer addresses match the emulator's actual heap_base
+            results = emu_mod.run_test_suite(
+                path, func,
+                symbols=syms_a,
+                progress_cb=progress_cb,
+            )
+            report = emu_mod.format_report(func, results)
+            return report, results
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Emulation error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                import traceback
+                output_write(self.output, traceback.format_exc(), "dim")
+                return
+
+            report, suite = result
+            output_write(self.output, report + "\n")
+
+            # Summary status
+            passed = sum(1 for sc, r in suite if not r.exception and
+                         (sc.expected_status is None or r.return_value == sc.expected_status))
+            failed = len(suite) - passed
+            self._save_to_history(f"Simulate: {func}")
+            self.status_var.set(
+                f"\u2705 Emulation done: {passed} passed, {failed} failed "
+                f"out of {len(suite)} scenarios")
+
+        run_with_progress_dialog(self.app, f"Emulating {func}\u2026", work, done)
+
     def _resolve_unknown(self):
         """KernelEx-style: resolve unknown call targets by scanning nearby DLLs."""
         path = self._get_a()
@@ -2802,12 +3025,14 @@ class DecompilerTab(ttk.Frame):
             row=0, column=2, padx=(8, 0))
         ttk.Button(sym_frm, text="\U0001F4E5  Load Symbols", command=self._load_symbols).grid(
             row=0, column=3, padx=(8, 0))
+        ttk.Button(sym_frm, text="\U0001F4E4  Unload Symbols", command=self._unload_symbols).grid(
+            row=0, column=4, padx=(8, 0))
 
         self._loaded_symbols = {}
         self._sym_meta = {}
         self.sym_status_var = tk.StringVar(value="")
         ttk.Label(sym_frm, textvariable=self.sym_status_var, foreground=T["green"],
-                  font=("Segoe UI", 9)).grid(row=0, column=4, padx=(8, 0))
+                  font=("Segoe UI", 9)).grid(row=0, column=5, padx=(8, 0))
 
         # Click mode in lim_frm
         ttk.Label(lim_frm, text="   Click mode:").pack(side="left", padx=5)
@@ -2840,7 +3065,8 @@ class DecompilerTab(ttk.Frame):
 
         self.status_var.set(f"\u23F3 Loading symbols from {os.path.basename(sym_path)}...")
 
-        def work():
+        def work(progress_cb):
+            progress_cb(f"Loading symbols from {os.path.basename(sym_path)}\u2026", 30)
             return _sym_loader().load_symbols(sym_path, pe_path=self._get_pe())
 
         def done(result):
@@ -2862,7 +3088,14 @@ class DecompilerTab(ttk.Frame):
                     f"\u2705 Loaded {n} symbols from {os.path.basename(sym_path)} "
                     f"[{fmt}] — total: {len(self._loaded_symbols)}")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Loading symbols\u2026", work, done)
+
+    def _unload_symbols(self):
+        """Clear all loaded symbols."""
+        self._loaded_symbols = {}
+        self._sym_meta = {}
+        self.sym_status_var.set("")
+        self.status_var.set("\U0001F4E4 Symbols unloaded")
 
     def _decompile_one(self):
         path = self._get_pe()
@@ -2870,8 +3103,6 @@ class DecompilerTab(ttk.Frame):
         if not path or not func:
             messagebox.showwarning("Missing", "Select a PE file and enter a function name or RVA.\n\nExamples:\n  NtCreateFile\n  0x0004AE10")
             return
-        self.status_var.set(f"\u23F3 Decompiling {func}...")
-        self.output.new_tab("Decompile")
 
         if func.startswith('0x') or func.startswith('0X'):
             func_val = int(func, 16)
@@ -2880,9 +3111,18 @@ class DecompilerTab(ttk.Frame):
 
         expand = self.expand_var.get()
         syms = self._loaded_symbols if self._loaded_symbols else None
+        sym_tag = " +sym" if syms else ""
+        self.output.new_tab(f"Pseudo-C{sym_tag}: {func}")
 
-        def work():
-            return _decompiler().decompile(path, func_val, symbols=syms, expand_calls=expand)
+        def work(progress_cb):
+            progress_cb(f"Loading PE: {os.path.basename(path)}", 10)
+            if syms:
+                progress_cb(f"Decompiling {func} with {len(syms)} symbols\u2026", 30)
+            else:
+                progress_cb(f"Decompiling {func}\u2026", 30)
+            result = _decompiler().decompile(path, func_val, symbols=syms, expand_calls=expand)
+            progress_cb("Formatting output\u2026", 90)
+            return result
 
         def done(result):
             if isinstance(result, Exception):
@@ -2896,7 +3136,7 @@ class DecompilerTab(ttk.Frame):
             self._colorize(result)
             self.status_var.set(f"\u2705 Decompiled {func}")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Decompiling {func}\u2026", work, done)
 
     def _disasm_one(self):
         """Disassemble a function showing annotated x86 assembly."""
@@ -2908,7 +3148,9 @@ class DecompilerTab(ttk.Frame):
         syms = self._loaded_symbols if self._loaded_symbols else None
         self.output.new_tab(f"ASM: {func}")
 
-        def work():
+        def work(progress_cb):
+            progress_cb(f"Loading PE: {os.path.basename(path)}", 10)
+            progress_cb(f"Disassembling {func}\u2026", 30)
             return _behavior().disassemble_function(path, func)
 
         def done(result):
@@ -2935,7 +3177,7 @@ class DecompilerTab(ttk.Frame):
                     output_write(self.output, line + '\n')
             self.status_var.set(f"\u2705 Assembly: {func}")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Disassembling {func}\u2026", work, done)
 
     def _hexdump_one(self):
         """Show raw hex dump of a function's machine code."""
@@ -2946,7 +3188,8 @@ class DecompilerTab(ttk.Frame):
             return
         self.output.new_tab(f"HEX: {func}")
 
-        def work():
+        def work(progress_cb):
+            progress_cb(f"Reading {func}\u2026", 30)
             import pefile
             pe = pefile.PE(path, fast_load=False)
             rva = None
@@ -3001,7 +3244,7 @@ class DecompilerTab(ttk.Frame):
                         break
             self.status_var.set(f"\u2705 Hex dump: {func} ({min(len(data), 2048)} bytes)")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Hex dump: {func}\u2026", work, done)
 
     def _discover(self):
         path = self._get_pe()
@@ -3012,10 +3255,10 @@ class DecompilerTab(ttk.Frame):
             mx = int(self.max_var.get())
         except ValueError:
             mx = 50
-        self.status_var.set(f"\u23F3 Discovering functions (max {mx})...")
         self.output.new_tab("Discover")
 
-        def work():
+        def work(progress_cb):
+            progress_cb(f"Discovering functions (max {mx})\u2026", 10)
             return _decompiler().decompile_no_symbols(path, max_funcs=mx)
 
         def done(result):
@@ -3031,7 +3274,7 @@ class DecompilerTab(ttk.Frame):
                 output_write(self.output, "\n")
             self.status_var.set(f"\u2705 Discovered {len(result)} functions")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Discovering functions\u2026", work, done)
 
     def _batch(self):
         path = self._get_pe()
@@ -3042,11 +3285,11 @@ class DecompilerTab(ttk.Frame):
             mx = int(self.max_var.get())
         except ValueError:
             mx = 100
-        self.status_var.set(f"\u23F3 Batch decompiling exports (max {mx})...")
         self.output.new_tab("Batch")
+        syms = self._loaded_symbols if self._loaded_symbols else None
 
-        def work():
-            syms = self._loaded_symbols if self._loaded_symbols else None
+        def work(progress_cb):
+            progress_cb(f"Batch decompiling exports (max {mx})\u2026", 10)
             return _decompiler().batch_decompile(path, max_funcs=mx, symbols=syms)
 
         def done(result):
@@ -3062,7 +3305,7 @@ class DecompilerTab(ttk.Frame):
                 output_write(self.output, "\n")
             self.status_var.set(f"\u2705 Decompiled {len(result)} exports")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Batch decompiling {mx} exports\u2026", work, done)
 
     def _save(self):
         content = self.output.get("1.0", "end-1c")
@@ -3742,7 +3985,7 @@ class DeepAnalyzerTab(ttk.Frame):
         if not pe_path:
             return
         self.status_var.set(f"\u23F3 Decompiling {func_name}\u2026")
-        self.output.new_tab("Decompile")
+        self.output.new_tab(f"Pseudo-C: {func_name}")
         def work():
             dec = _decompiler().X86Decompiler(pe_path)
             return dec.decompile(func_name)
