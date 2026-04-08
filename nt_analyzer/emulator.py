@@ -49,7 +49,8 @@ _HEAP_SIZE  = 0x0040_0000   # 4 MB
 _STUB_SIZE  = 0x0001_0000   # 64 KB for IAT hook stubs
 _RET_SLED   = b"\xCC" * 0x1000
 
-_MAX_INSTRUCTIONS = 500_000
+_MAX_INSTRUCTIONS = 2_000_000
+_SPIN_LOOP_THRESHOLD = 500     # same block hit N times → break
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,7 @@ class KernelMocks:
         self._heap_ptr = 0
         self.privilege_enabled = True
         self.current_irql = 0
+        self._irql_call_count = 0
 
     # -- memory probes --
     def ProbeForRead(self, args):
@@ -215,6 +217,11 @@ class KernelMocks:
         return 0xDEAD0002
 
     def KeGetCurrentIrql(self, args):
+        self._irql_call_count += 1
+        # Cycle IRQL after many calls to break spin loops
+        if self._irql_call_count > 50:
+            cycle = [0, 1, 2, 0]   # PASSIVE → APC → DISPATCH → back
+            self.current_irql = cycle[self._irql_call_count % len(cycle)]
         return self.current_irql
 
     def KfRaiseIrql(self, args):
@@ -228,14 +235,38 @@ class KernelMocks:
             self.current_irql = args[0]
         return STATUS_SUCCESS
 
+    def KeRaiseIrqlToDpcLevel(self, args):
+        old = self.current_irql
+        self.current_irql = 2  # DISPATCH_LEVEL
+        return old
+
     # -- synchronisation --
     def KeInitializeSpinLock(self, args):   return STATUS_SUCCESS
-    def KeAcquireSpinLockRaiseToDpc(self, args): return self.current_irql
-    def KeReleaseSpinLock(self, args):      return STATUS_SUCCESS
+    def KeAcquireSpinLockRaiseToDpc(self, args):
+        old = self.current_irql
+        self.current_irql = 2
+        return old
+    def KeReleaseSpinLock(self, args):
+        if args and len(args) >= 2:
+            self.current_irql = args[1]
+        return STATUS_SUCCESS
+    def KfAcquireSpinLock(self, args):     return self.current_irql
+    def KfReleaseSpinLock(self, args):
+        if args:
+            self.current_irql = args[0]
+        return STATUS_SUCCESS
+    def KeAcquireSpinLockAtDpcLevel(self, args): return STATUS_SUCCESS
+    def KeReleaseSpinLockFromDpcLevel(self, args): return STATUS_SUCCESS
     def ExAcquireFastMutex(self, args):     return STATUS_SUCCESS
     def ExReleaseFastMutex(self, args):     return STATUS_SUCCESS
     def ExAcquireResourceExclusiveLite(self, args): return 1
     def ExReleaseResourceLite(self, args):  return STATUS_SUCCESS
+    def KeWaitForSingleObject(self, args):  return STATUS_SUCCESS
+    def KeWaitForMultipleObjects(self, args): return STATUS_SUCCESS
+    def KeDelayExecutionThread(self, args): return STATUS_SUCCESS
+    def KeSetEvent(self, args):            return 0
+    def KeResetEvent(self, args):          return 0
+    def KeInitializeEvent(self, args):     return STATUS_SUCCESS
 
     # -- misc --
     def RtlCopyMemory(self, args):
@@ -315,8 +346,13 @@ class KernelMocks:
 
     # -- HAL --
     def HalMakeBeep(self, args):       return 1
+    def HalRequestSoftwareInterrupt(self, args): return STATUS_SUCCESS
+    def HalQuerySystemInformation(self, args):   return STATUS_SUCCESS
+    def HalSetSystemInformation(self, args):     return STATUS_SUCCESS
     def READ_PORT_UCHAR(self, args):   return 0
     def WRITE_PORT_UCHAR(self, args):  return STATUS_SUCCESS
+    def READ_PORT_ULONG(self, args):   return 0
+    def WRITE_PORT_ULONG(self, args):  return STATUS_SUCCESS
 
     # -- fallback --
     def _default_mock(self, name, args):
@@ -330,6 +366,10 @@ class KernelMocks:
             return 0
         self._emu._record_alloc(ptr, size)
         return ptr
+
+    def reset_counters(self):
+        """Reset per-run counters."""
+        self._irql_call_count = 0
 
     def dispatch(self, name, args):
         func = name.split("!")[-1] if "!" in name else name
@@ -383,6 +423,7 @@ class KernelEmulator:
         self._current_user_mode = False
         self._alloc_map: Dict[int, int] = {}
         self._coverage_set: set = set()
+        self._block_hits: Dict[int, int] = {}   # spin loop detection
 
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
@@ -545,9 +586,11 @@ class KernelEmulator:
         self._current_user_mode = user_mode
         self._alloc_map.clear()
         self._coverage_set.clear()
+        self._block_hits.clear()
 
         self.mocks.privilege_enabled = privilege_enabled
         self.mocks._heap_ptr = self._heap_base
+        self.mocks.reset_counters()
 
         # Setup stdcall stack: return addr, then args right-to-left
         esp = self._stack_top - 0x100
@@ -612,6 +655,14 @@ class KernelEmulator:
         if self._insn_count > max_insns:
             self._stopped = True
             self._stop_reason = f"Instruction limit ({max_insns})"
+            uc.emu_stop()
+            return
+
+        # Spin loop detection: if same address hit too many times, break
+        self._block_hits[address] = self._block_hits.get(address, 0) + 1
+        if self._block_hits[address] > _SPIN_LOOP_THRESHOLD:
+            self._stopped = True
+            self._stop_reason = f"Spin loop detected at 0x{address:08X} ({self._block_hits[address]} hits)"
             uc.emu_stop()
             return
 
@@ -777,7 +828,7 @@ def generate_scenarios(func_name: str, arg_count: int = 5,
         name="Null arguments",
         args=[0] * arg_count,
         description="All arguments zero / NULL - should fail gracefully",
-        expected_status=STATUS_INVALID_PARAMETER,
+        expected_status=None,   # Win2K may or may not validate
         user_mode=True,
     ))
 
@@ -892,7 +943,7 @@ def run_test_suite(
 #  Text report
 # ---------------------------------------------------------------------------
 
-def format_report(func_name, suite_results):
+def format_report(func_name, suite_results, show_trace=False):
     lines = [
         "=" * 72,
         "  KERNEL FUNCTION EMULATION REPORT",
@@ -945,6 +996,28 @@ def format_report(func_name, suite_results):
                 lines.append(f"      {fn} (x{cnt})")
             if len(seen) > 15:
                 lines.append(f"      ... and {len(seen) - 15} more")
+
+        # Execution trace (optional)
+        if show_trace and res.trace:
+            lines.append("")
+            lines.append(f"    {'─' * 50}")
+            lines.append(f"    Execution trace ({len(res.trace)} entries):")
+            lines.append(f"      {'VA':<12}| {'Instruction':<40}")
+            lines.append(f"      {'-' * 11}+{'-' * 40}")
+            max_trace = min(len(res.trace), 500)
+            for t in res.trace[:max_trace]:
+                if t.is_call:
+                    lines.append(f"      0x{t.address:08X} | CALL {t.call_target}")
+                elif t.mnemonic:
+                    instr = f"{t.mnemonic} {t.op_str}".strip()
+                    tag = ""
+                    if t.mnemonic == "ret":
+                        tag = "  <-- RETURN"
+                    elif t.mnemonic.startswith("j") and t.mnemonic != "jmp":
+                        tag = "  <-- BRANCH"
+                    lines.append(f"      0x{t.address:08X} | {instr}{tag}")
+            if len(res.trace) > max_trace:
+                lines.append(f"      ... {len(res.trace) - max_trace} more entries omitted")
 
         lines.append("")
 

@@ -2213,6 +2213,11 @@ class BehaviorTab(ttk.Frame):
                      values=["Assembly", "Pseudo-C", "Hex Dump"],
                      state="readonly").pack(side="left", padx=2)
 
+        # Execution trace toggle for Simulate
+        self._show_trace_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(click_frm, text="Show execution trace",
+                        variable=self._show_trace_var).pack(side="left", padx=(20, 0))
+
         self.output = TabbedOutput(self)
         self.output.grid(row=9, column=0, sticky="nsew", padx=10, pady=(0, 10))
         def _sym_getter():
@@ -2811,6 +2816,7 @@ class BehaviorTab(ttk.Frame):
             return
 
         syms_a = dict(self._loaded_symbols_a) if self._loaded_symbols_a else None
+        show_trace = self._show_trace_var.get()
 
         self.output.new_tab(f"Simulate: {func}")
 
@@ -2824,7 +2830,7 @@ class BehaviorTab(ttk.Frame):
                 symbols=syms_a,
                 progress_cb=progress_cb,
             )
-            report = emu_mod.format_report(func, results)
+            report = emu_mod.format_report(func, results, show_trace=show_trace)
             return report, results
 
         def done(result):
