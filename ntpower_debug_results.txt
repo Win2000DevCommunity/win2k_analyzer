@@ -1,0 +1,586 @@
+================================================================================
+  NtPowerInformation — LIVE KERNEL DEBUGGER TEST REPORT
+  Date: 2026-04-09 23:37:44
+  System32: C:\Users\win2000\Desktop\2kDEBUG\system32
+================================================================================
+
+[1] LOADING KERNEL ENVIRONMENT
+------------------------------------------------------------
+  Load time: 0.703s
+  Modules loaded: 2
+  Available files: 2142
+    ntoskrnl.exe              base=0x00400000  exports= 1258  unresolved=10
+    hal.dll                   base=0x80010000  exports=   95  unresolved=0
+
+  NtPowerInformation resolved at: ntoskrnl.exe!0x004E1536
+
+================================================================================
+[2] SCENARIO: ALL POWER INFORMATION CLASSES
+    Args: NtPowerInformation(class, NULL, 0, OutputBuf, 0x1000)
+--------------------------------------------------------------------------------
+  Class  Name                                     Return           Status                          Insns
+  -----  ---------------------------------------  ---------------  -----------------------------  ------
+  0      SystemPowerPolicyAc                      0x00000000      STATUS_SUCCESS                    276
+  1      SystemPowerPolicyDc                      0x00000000      STATUS_SUCCESS                    276
+  2      VerifySystemPolicies                     0xC000000D      STATUS_INVALID_PARAMETER          201
+  3      SystemPowerPolicyCurrent                 0xC000000D      STATUS_INVALID_PARAMETER          201
+  4      SystemPowerStateHandler                  0x00000000      STATUS_SUCCESS                    333
+  5      ProcessorStateHandler                    0x00000000      STATUS_SUCCESS                    264
+  6      SystemPowerPolicyOld                     0x0000009F      STATUS_POWER_STATE_INVALID      47591
+  7      ProcessorInformation                     0x0000009F      STATUS_POWER_STATE_INVALID      47591
+  8      SystemBatteryState                       0x00000000      STATUS_SUCCESS                    173
+  9      SystemPowerStateNotifyHandler            0x00000000      STATUS_SUCCESS                    187
+  10     ProcessorPowerPolicyAc                   0x0000009F      STATUS_POWER_STATE_INVALID      47589
+  11     ProcessorPowerPolicyDc                   0x00000000      STATUS_SUCCESS                   3612
+  12     VerifyProcessorPowerPolicy               0x00000000      STATUS_SUCCESS                    196
+  13     ProcessorPowerPolicyCurrent              0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  14     SystemPowerStateLogging                  0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  15     SystemPowerLoggingEntry                  0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  16     SetPowerSettingValue                     0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  17     NotifyUserPowerSetting                   0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  18     PowerInformationLevelUnused0             0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  19     PowerInformationLevelUnused1             0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  20     SystemVideoState                         0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  21     TraceApplicationPowerMessage             0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  22     TraceApplicationPowerMessageEnd          0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  23     ProcessorPerfStates                      0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  24     ProcessorIdleStates                      0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  25     ProcessorCap                             0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  26     SystemWakeSource                         0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  27     SystemHiberFileInformation               0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  28     TraceServicePowerMessage                 0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  29     ProcessorLoad                            0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  30     PowerShutdownNotification                0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  31     MonitorInvocation                        0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  32     FirmwareTableInformationRegistered       0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  50     InvalidClass_50                          0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  99     InvalidClass_99                          0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  255    InvalidClass_0xFF                        0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  4294967295 InvalidClass_MAX                         0x0000009F      STATUS_POWER_STATE_INVALID      47586
+
+================================================================================
+[3] SCENARIO: BUFFER SIZE VARIATIONS (Class=0 SystemPowerPolicyAc)
+    Testing different output buffer sizes
+--------------------------------------------------------------------------------
+  BufSize      Return           Status                          Insns
+  -----------  ---------------  -----------------------------  ------
+  0            0x00000000      STATUS_SUCCESS                    170
+  1            0xC0000023      STATUS_BUFFER_TOO_SMALL           178
+  4            0xC0000023      STATUS_BUFFER_TOO_SMALL           178
+  0x10         0xC0000023      STATUS_BUFFER_TOO_SMALL           178
+  0x40         0xC0000023      STATUS_BUFFER_TOO_SMALL           178
+  0x80         0xC0000023      STATUS_BUFFER_TOO_SMALL           178
+  0x100        0x00000000      STATUS_SUCCESS                    240
+  0x200        0x00000000      STATUS_SUCCESS                    240
+  0x1000       0x00000000      STATUS_SUCCESS                    240
+  0x10000      0x00000000      STATUS_SUCCESS                    240
+
+================================================================================
+[4] SCENARIO: INPUT BUFFER TESTS
+    Testing classes that expect input data (Set operations)
+--------------------------------------------------------------------------------
+  Class  Name                                InBuf      Return           Status                        
+  -----  ----------------------------------  ---------  ---------------  ----------------------------- 
+  0      SystemPowerPolicyAc                 NULL, 0    0x00000000      STATUS_SUCCESS                
+  0      SystemPowerPolicyAc                 buf, 256   0x0000009F      STATUS_POWER_STATE_INVALID    
+  2      VerifySystemPolicies                NULL, 0    0xC000000D      STATUS_INVALID_PARAMETER      
+  2      VerifySystemPolicies                buf, 256   0x0000009F      STATUS_POWER_STATE_INVALID    
+  7      ProcessorInformation                NULL, 0    0x0000009F      STATUS_POWER_STATE_INVALID    
+  7      ProcessorInformation                buf, 64    0x0000009F      STATUS_POWER_STATE_INVALID    
+  8      SystemBatteryState                  NULL, 0    0x00000000      STATUS_SUCCESS                
+  10     ProcessorPowerPolicyAc              NULL, 0    0x0000009F      STATUS_POWER_STATE_INVALID    
+  10     ProcessorPowerPolicyAc              buf, 128   0x0000009F      STATUS_POWER_STATE_INVALID    
+
+================================================================================
+[5] SCENARIO: NULL OUTPUT BUFFER
+    NtPowerInformation(class, NULL, 0, NULL, 0)
+--------------------------------------------------------------------------------
+  Class  Name                                     Return           Status                          Insns
+  -----  ---------------------------------------  ---------------  -----------------------------  ------
+  0      SystemPowerPolicyAc                      0x00000000      STATUS_SUCCESS                    170
+  3      SystemPowerPolicyCurrent                 0xC000000D      STATUS_INVALID_PARAMETER          165
+  7      ProcessorInformation                     0x0000009F      STATUS_POWER_STATE_INVALID      47593
+  8      SystemBatteryState                       0x00000000      STATUS_SUCCESS                    170
+  23     ProcessorPerfStates                      0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  29     ProcessorLoad                            0x0000009F      STATUS_POWER_STATE_INVALID      47586
+
+================================================================================
+[6] SCENARIO: BREAKPOINT + STEPPING (Class=0)
+    Stop at entry, step 20 instructions, then continue
+--------------------------------------------------------------------------------
+  State after run: PAUSED
+  Step  0: EIP=0x004E1536  ntoskrnl.exe!PoShutdownBugCheck+0x13E0             EAX=0x00000000  ESP=0x8023FDE8
+  Step  1: EIP=0x004E27C8  ntoskrnl.exe!PoShutdownBugCheck+0x2672             EAX=0x81340590  ESP=0x8023FA8C
+  Step  2: EIP=0x004E27CE  ntoskrnl.exe!PoShutdownBugCheck+0x2678             EAX=0x81340590  ESP=0x8023FA8C
+  Step  3: EIP=0x004E27D0  ntoskrnl.exe!PoShutdownBugCheck+0x267A             EAX=0x81340590  ESP=0x8023FA88
+  Step  4: EIP=0x004E27D5  ntoskrnl.exe!PoShutdownBugCheck+0x267F             EAX=0x81340590  ESP=0x8023FA84
+  Step  5: EIP=0x004152E6  ntoskrnl.exe!ExAcquireResourceExclusiveLite        EAX=0x81340590  ESP=0x8023FA80
+  Step  6: EIP=0x004152E7  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x1    EAX=0x81340590  ESP=0x8023FA7C
+  Step  7: EIP=0x004152E9  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x3    EAX=0x81340590  ESP=0x8023FA7C
+  Step  8: EIP=0x004152EA  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x4    EAX=0x81340590  ESP=0x8023FA78
+  Step  9: EIP=0x004152EB  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x5    EAX=0x81340590  ESP=0x8023FA74
+  Step 10: EIP=0x004152EC  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x6    EAX=0x81340590  ESP=0x8023FA70
+  Step 11: EIP=0x004152F2  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0xC    EAX=0x81340590  ESP=0x8023FA70
+  Step 12: EIP=0x004152F5  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0xF    EAX=0x81340590  ESP=0x8023FA70
+  Step 13: EIP=0x004152F7  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x11   EAX=0x81340590  ESP=0x8023FA70
+  Step 14: EIP=0x004152FA  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x14   EAX=0x81340590  ESP=0x8023FA70
+  Step 15: EIP=0x004152FD  ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x17   EAX=0x81340590  ESP=0x8023FA70
+  Step 16: EIP=0x800134F0  hal.dll!KfAcquireSpinLock                          EAX=0x81340590  ESP=0x8023FA6C
+  Step 17: EIP=0x800134F6  hal.dll!KfAcquireSpinLock+0x6                      EAX=0x81340590  ESP=0x8023FA6C
+  Step 18: EIP=0x80013500  hal.dll!KfAcquireSpinLock+0x10                     EAX=0x81340590  ESP=0x8023FA6C
+  Step 19: EIP=0x80013503  hal.dll!KfAcquireSpinLock+0x13                     EAX=0x81340590  ESP=0x8023FA6C
+
+  Call stack at step 20:
+    #0: hal.dll!KfAcquireSpinLock+0x1A  (FP=0x8023FA7C)
+    #1: ntoskrnl.exe!PoShutdownBugCheck+0x2684  (FP=0x8023FDE4)
+
+  Continuing execution...
+  Final: 0x00000000 (STATUS_SUCCESS) in 241 instructions
+
+================================================================================
+[7] SCENARIO: BREAKPOINT ON ExAcquireResourceExclusiveLite
+    Verify the function calls into resource acquisition
+--------------------------------------------------------------------------------
+  State: PAUSED
+  Paused at: ntoskrnl.exe!ExAcquireResourceExclusiveLite (EIP=0x004152E6)
+  Events so far:
+    [breakpoint] Breakpoint hit: ntoskrnl.exe!ExAcquireResourceExclusiveLite
+
+  Continuing to completion...
+  Final: 0x00000000 (STATUS_SUCCESS)
+
+================================================================================
+[8] SCENARIO: FULL INSTRUCTION TRACE (Class=0)
+    Complete instruction-by-instruction trace
+--------------------------------------------------------------------------------
+  Total instructions: 240
+  Trace entries: 240
+  Return: 0x00000000 (STATUS_SUCCESS)
+
+  VA             Instruction                                        Note
+  -------------  -------------------------------------------------  ---------------
+  0x004E1536     push ebp                                           
+  0x004E1537     mov ebp, esp                                       
+  0x004E1539     push -1                                            
+  0x004E153B     push 0x406210                                      
+  0x004E1540     push 0x462af0                                      
+  0x004E1545     mov eax, dword ptr fs:[0]                          <-- FS SEGMENT
+  0x004E154B     push eax                                           
+  0x004E154C     mov dword ptr fs:[0], esp                          <-- FS SEGMENT
+  0x004E1553     push ecx                                           
+  0x004E1554     push ecx                                           
+  0x004E1555     sub esp, 0x330                                     
+  0x004E155B     push ebx                                           
+  0x004E155C     push esi                                           
+  0x004E155D     push edi                                           
+  0x004E155E     mov dword ptr [ebp - 0x18], esp                    
+  0x004E1561     xor ebx, ebx                                       
+  0x004E1563     mov dword ptr [ebp - 0x330], ebx                   
+  0x004E1569     mov dword ptr [ebp - 0x1c], ebx                    
+  0x004E156C     mov dword ptr [ebp - 0x20], ebx                    
+  0x004E156F     mov eax, dword ptr fs:[0x124]                      <-- FS SEGMENT
+  0x004E1575     mov al, byte ptr [eax + 0x134]                     
+  0x004E157B     mov byte ptr [ebp - 0x33c], al                     
+  0x004E1581     call 0x4e27c2                                      <-- CALL
+  0x004E27C2     mov eax, dword ptr fs:[0x124]                      <-- FS SEGMENT
+  0x004E27C8     dec dword ptr [eax + 0xd0]                         
+  0x004E27CE     push 1                                             
+  0x004E27D0     push 0x486e00                                      
+  0x004E27D5     call 0x4152e6                                      <-- CALL
+  0x004152E6     push ebp                                           
+  0x004152E7     mov ebp, esp                                       
+  0x004152E9     push ebx                                           
+  0x004152EA     push esi                                           
+  0x004152EB     push edi                                           
+  0x004152EC     mov eax, dword ptr fs:[0x124]                      <-- FS SEGMENT
+  0x004152F2     mov esi, dword ptr [ebp + 8]                       
+  0x004152F5     mov edi, eax                                       
+  0x004152F7     lea ecx, [esi + 0x34]                              
+  0x004152FA     mov dword ptr [ebp + 8], ecx                       
+  0x004152FD     call dword ptr [0x400650]                          <-- CALL
+  0x800134F0     mov edx, dword ptr [0xfffe0080]                    
+  0x800134F6     mov dword ptr [0xfffe0080], 0x41                   
+  0x80013500     shr edx, 4                                         
+  0x80013503     movzx eax, byte ptr [edx - 0x7ffe7600]             
+  0x8001350A     lock bts dword ptr [ecx], 0                        
+  0x8001350F     jb 0x80013514                                      <-- BRANCH
+  0x80013511     ret                                                <-- RETURN
+  0x00415303     xor ebx, ebx                                       
+  0x00415305     cmp word ptr [esi + 0xc], bx                       
+  0x00415309     je 0x41532d                                        <-- BRANCH
+  0x0041530B     test byte ptr [esi + 0xe], 0x80                    
+  0x0041530F     je 0x41531d                                        <-- BRANCH
+  0x00415311     cmp dword ptr [esi + 0x18], edi                    
+  0x00415314     jne 0x41531d                                       <-- BRANCH
+  0x00415316     inc dword ptr [esi + 0x1c]                         
+  0x00415319     mov bl, 1                                          
+  0x0041531B     jmp 0x415340                                       
+  0x00415340     mov ecx, dword ptr [ebp + 8]                       
+  0x00415343     mov dl, al                                         
+  0x00415345     call dword ptr [0x400654]                          <-- CALL
+  0x800135C0     xor eax, eax                                       
+  0x800135C2     mov al, dl                                         
+  0x800135C4     mov byte ptr [ecx], 0                              
+  0x800135C7     xor ecx, ecx                                       
+  0x800135C9     mov cl, byte ptr [eax - 0x7ffe7720]                
+  0x800135CF     mov dword ptr [0xfffe0080], ecx                    
+  0x800135D5     mov eax, dword ptr [0xfffe0080]                    
+  0x800135DA     ret                                                <-- RETURN
+  0x0041534B     mov al, bl                                         
+  0x0041534D     pop edi                                            
+  0x0041534E     pop esi                                            
+  0x0041534F     pop ebx                                            
+  0x00415350     pop ebp                                            
+  0x00415351     ret 8                                              <-- RETURN
+  0x004E27DA     mov eax, dword ptr fs:[0x124]                      <-- FS SEGMENT
+  0x004E27E0     mov dword ptr [0x4784dc], eax                      
+  0x004E27E5     ret                                                <-- RETURN
+  0x004E1586     mov dword ptr [ebp - 4], ebx                       
+  0x004E1589     cmp byte ptr [ebp - 0x33c], bl                     
+  0x004E158F     mov esi, dword ptr [ebp + 0xc]                     
+  0x004E1592     je 0x4e1623                                        <-- BRANCH
+  0x004E1623     mov eax, dword ptr [ebp + 8]                       
+  0x004E1626     cmp eax, 0xc                                       
+  0x004E1629     ja 0x4e1a7a                                        <-- BRANCH
+  0x004E162F     jmp dword ptr [eax*4 + 0x4e1b01]                   
+  0x004E1636     cmp esi, ebx                                       
+  0x004E1638     je 0x4e1647                                        <-- BRANCH
+  0x004E1647     mov dword ptr [ebp - 0x1c], 0x4784e0               
+  0x004E164E     jmp 0x4e171b                                       
+  0x004E171B     mov dword ptr [ebp - 0x20], 0xe8                   
+  0x004E1722     jmp 0x4e1a84                                       
+  0x004E1A84     cmp dword ptr [ebp - 0x330], 0                     
+  0x004E1A8B     jl 0x4e1abd                                        <-- BRANCH
+  0x004E1A8D     mov edi, dword ptr [ebp + 0x14]                    
+  0x004E1A90     test edi, edi                                      
+  0x004E1A92     je 0x4e1abd                                        <-- BRANCH
+  0x004E1A94     mov esi, dword ptr [ebp - 0x1c]                    
+  0x004E1A97     test esi, esi                                      
+  0x004E1A99     je 0x4e1abd                                        <-- BRANCH
+  0x004E1A9B     mov ecx, dword ptr [ebp - 0x20]                    
+  0x004E1A9E     cmp dword ptr [ebp + 0x18], ecx                    
+  0x004E1AA1     jae 0x4e1aaf                                       <-- BRANCH
+  0x004E1AAF     mov eax, ecx                                       
+  0x004E1AB1     shr ecx, 2                                         
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB4     rep movsd dword ptr es:[edi], dword ptr [esi]      <-- REP
+  0x004E1AB6     mov ecx, eax                                       
+  0x004E1AB8     and ecx, 3                                         
+  0x004E1ABB     rep movsb byte ptr es:[edi], byte ptr [esi]        <-- REP
+  0x004E1ABD     or dword ptr [ebp - 4], 0xffffffff                 
+  0x004E1AC1     mov esi, dword ptr [ebp - 0x330]                   
+  0x004E1AC7     jmp 0x4e1ae7                                       
+  0x004E1AE7     push 1                                             
+  0x004E1AE9     call 0x4e27e6                                      <-- CALL
+  0x004E27E6     push ebp                                           
+  0x004E27E7     mov ebp, esp                                       
+  0x004E27E9     and dword ptr [0x4784dc], 0                        
+  0x004E27F0     mov ecx, 0x486e00                                  
+  0x004E27F5     call 0x415748                                      <-- CALL
+  0x00415748     push ebp                                           
+  0x00415749     mov ebp, esp                                       
+  0x0041574B     sub esp, 0xc                                       
+  0x0041574E     push ebx                                           
+  0x0041574F     push esi                                           
+  0x00415750     push edi                                           
+  0x00415751     mov esi, ecx                                       
+  0x00415753     mov eax, dword ptr fs:[0x124]                      <-- FS SEGMENT
+  0x00415759     lea edi, [esi + 0x34]                              
+  0x0041575C     mov ebx, eax                                       
+  0x0041575E     mov ecx, edi                                       
+  0x00415760     mov dword ptr [ebp - 8], edi                       
+  0x00415763     call dword ptr [0x400650]                          <-- CALL
+  0x800134F0     mov edx, dword ptr [0xfffe0080]                    
+  0x800134F6     mov dword ptr [0xfffe0080], 0x41                   
+  0x80013500     shr edx, 4                                         
+  0x80013503     movzx eax, byte ptr [edx - 0x7ffe7600]             
+  0x8001350A     lock bts dword ptr [ecx], 0                        
+  0x8001350F     jb 0x80013514                                      <-- BRANCH
+  0x80013511     ret                                                <-- RETURN
+  0x00415769     mov dl, al                                         
+  0x0041576B     mov ax, word ptr [esi + 0xe]                       
+  0x0041576F     test al, 0x80                                      
+  0x00415771     mov byte ptr [ebp - 1], dl                         
+  0x00415774     je 0x415808                                        <-- BRANCH
+  0x0041577A     dec dword ptr [esi + 0x1c]                         
+  0x0041577D     je 0x415783                                        <-- BRANCH
+  0x0041577F     mov ecx, edi                                       
+  0x00415781     jmp 0x4157fd                                       
+  0x004157FD     call dword ptr [0x400654]                          <-- CALL
+  0x800135C0     xor eax, eax                                       
+  0x800135C2     mov al, dl                                         
+  0x800135C4     mov byte ptr [ecx], 0                              
+  0x800135C7     xor ecx, ecx                                       
+  0x800135C9     mov cl, byte ptr [eax - 0x7ffe7720]                
+  0x800135CF     mov dword ptr [0xfffe0080], ecx                    
+  0x800135D5     mov eax, dword ptr [0xfffe0080]                    
+  0x800135DA     ret                                                <-- RETURN
+  0x00415803     pop edi                                            
+  0x00415804     pop esi                                            
+  0x00415805     pop ebx                                            
+  0x00415806     leave                                              
+  0x00415807     ret                                                <-- RETURN
+  0x004E27FA     cmp byte ptr [ebp + 8], 0                          
+  0x004E27FE     je 0x4e2814                                        <-- BRANCH
+  0x004E2800     mov eax, dword ptr [0x4871c4]                      
+  0x004E2805     test dword ptr [0x486f18], eax                     
+  0x004E280B     je 0x4e2814                                        <-- BRANCH
+  0x004E2814     mov eax, dword ptr fs:[0x124]                      <-- FS SEGMENT
+  0x004E281A     mov edx, dword ptr [eax + 0xd0]                    
+  0x004E2820     lea ecx, [eax + 0xd0]                              
+  0x004E2826     inc edx                                            
+  0x004E2827     test edx, edx                                      
+  0x004E2829     mov dword ptr [ecx], edx                           
+  0x004E282B     jne 0x4e2840                                       <-- BRANCH
+  0x004E2840     pop ebp                                            
+  0x004E2841     ret 4                                              <-- RETURN
+  0x004E1AEE     mov eax, esi                                       
+  0x004E1AF0     mov ecx, dword ptr [ebp - 0x10]                    
+  0x004E1AF3     mov dword ptr fs:[0], ecx                          <-- FS SEGMENT
+  0x004E1AFA     pop edi                                            
+  0x004E1AFB     pop esi                                            
+  0x004E1AFC     pop ebx                                            
+  0x004E1AFD     leave                                              
+  0x004E1AFE     ret 0x14                                           <-- RETURN
+
+================================================================================
+[9] SCENARIO: CROSS-MODULE CALL ANALYSIS
+    Which modules does NtPowerInformation call into?
+--------------------------------------------------------------------------------
+  Module                         Instructions        %
+  -----------------------------  ------------  -------
+  ntoskrnl.exe                            210    87.5%
+  hal.dll                                  30    12.5%
+
+  Module transitions (cross-module calls):
+    ntoskrnl.exe --> hal.dll!KfAcquireSpinLock (0x800134F0)
+    hal.dll --> ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x1D (0x00415303)
+    ntoskrnl.exe --> hal.dll!KfReleaseSpinLock (0x800135C0)
+    hal.dll --> ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x65 (0x0041534B)
+    ntoskrnl.exe --> hal.dll!KfAcquireSpinLock (0x800134F0)
+    hal.dll --> ntoskrnl.exe!ExReleaseResourceLite+0x21 (0x00415769)
+    ntoskrnl.exe --> hal.dll!KfReleaseSpinLock (0x800135C0)
+    hal.dll --> ntoskrnl.exe!ExReleaseResourceLite+0xBB (0x00415803)
+
+================================================================================
+[10] SCENARIO: REGISTER INSPECTION (Step through prologue)
+     Show how registers change during function setup
+--------------------------------------------------------------------------------
+  Step   EIP            EAX            ECX            ESP            EBP            Location
+  -----  -------------  -------------  -------------  -------------  -------------  ------------------------------
+  0      0x004E1536    0x00000000    0x00000000    0x8023FDE8    0x8023FDEC    ntoskrnl.exe!PoShutdownBugCheck+0x13E0
+  1      0x004E27C8    0x81340590    0x00000000    0x8023FA8C    0x8023FDE4    ntoskrnl.exe!PoShutdownBugCheck+0x2672
+  2      0x004E27CE    0x81340590    0x00000000    0x8023FA8C    0x8023FDE4    ntoskrnl.exe!PoShutdownBugCheck+0x2678
+  3      0x004E27D0    0x81340590    0x00000000    0x8023FA88    0x8023FDE4    ntoskrnl.exe!PoShutdownBugCheck+0x267A
+  4      0x004E27D5    0x81340590    0x00000000    0x8023FA84    0x8023FDE4    ntoskrnl.exe!PoShutdownBugCheck+0x267F
+  5      0x004152E6    0x81340590    0x00000000    0x8023FA80    0x8023FDE4    ntoskrnl.exe!ExAcquireResourceExclusiveLite
+  6      0x004152E7    0x81340590    0x00000000    0x8023FA7C    0x8023FDE4    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x1
+  7      0x004152E9    0x81340590    0x00000000    0x8023FA7C    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x3
+  8      0x004152EA    0x81340590    0x00000000    0x8023FA78    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x4
+  9      0x004152EB    0x81340590    0x00000000    0x8023FA74    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x5
+  10     0x004152EC    0x81340590    0x00000000    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x6
+  11     0x004152F2    0x81340590    0x00000000    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0xC
+  12     0x004152F5    0x81340590    0x00000000    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0xF
+  13     0x004152F7    0x81340590    0x00000000    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x11
+  14     0x004152FA    0x81340590    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x14
+  15     0x004152FD    0x81340590    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x17
+  16     0x800134F0    0x81340590    0x00486E34    0x8023FA6C    0x8023FA7C    hal.dll!KfAcquireSpinLock
+  17     0x800134F6    0x81340590    0x00486E34    0x8023FA6C    0x8023FA7C    hal.dll!KfAcquireSpinLock+0x6
+  18     0x80013500    0x81340590    0x00486E34    0x8023FA6C    0x8023FA7C    hal.dll!KfAcquireSpinLock+0x10
+  19     0x80013503    0x81340590    0x00486E34    0x8023FA6C    0x8023FA7C    hal.dll!KfAcquireSpinLock+0x13
+  20     0x8001350A    0x00000000    0x00486E34    0x8023FA6C    0x8023FA7C    hal.dll!KfAcquireSpinLock+0x1A
+  21     0x8001350F    0x00000000    0x00486E34    0x8023FA6C    0x8023FA7C    hal.dll!KfAcquireSpinLock+0x1F
+  22     0x80013511    0x00000000    0x00486E34    0x8023FA6C    0x8023FA7C    hal.dll!KfAcquireSpinLock+0x21
+  23     0x00415303    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x1D
+  24     0x00415305    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x1F
+  25     0x00415309    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x23
+  26     0x0041530B    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x25
+  27     0x0041530F    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x29
+  28     0x00415311    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x2B
+  29     0x00415314    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x2E
+
+  Final: 0x0000009F (STATUS_POWER_STATE_INVALID) in 47592 insns
+
+================================================================================
+[11] SCENARIO: STACK MEMORY ANALYSIS
+     Dump stack after stopping at entry for class 8 (BatteryState)
+--------------------------------------------------------------------------------
+  State: PAUSED
+
+  Offset     Address        Value          Symbol
+  ---------  -------------  -------------  ----------------------------------------
+  +0x0000    0x8023FDE8    0x81740000    
+  +0x0004    0x8023FDEC    0x00000008    
+  +0x0008    0x8023FDF0    0x00000000    
+  +0x000C    0x8023FDF4    0x00000000    
+  +0x0010    0x8023FDF8    0x00001000    
+  +0x0014    0x8023FDFC    0x00001000    
+  +0x0018    0x8023FE00    0x00000000    
+  +0x001C    0x8023FE04    0x00000000    
+  +0x0020    0x8023FE08    0x00000000    
+  +0x0024    0x8023FE0C    0x00000000    
+  +0x0028    0x8023FE10    0x00000000    
+  +0x002C    0x8023FE14    0x00000000    
+  +0x0030    0x8023FE18    0x00000000    
+  +0x0034    0x8023FE1C    0x00000000    
+  +0x0038    0x8023FE20    0x00000000    
+  +0x003C    0x8023FE24    0x00000000    
+  +0x0040    0x8023FE28    0x00000000    
+  +0x0044    0x8023FE2C    0x00000000    
+  +0x0048    0x8023FE30    0x00000000    
+  +0x004C    0x8023FE34    0x00000000    
+  +0x0050    0x8023FE38    0x00000000    
+  +0x0054    0x8023FE3C    0x00000000    
+  +0x0058    0x8023FE40    0x00000000    
+  +0x005C    0x8023FE44    0x00000000    
+
+  Final: 0x00000000 (STATUS_SUCCESS)
+
+================================================================================
+[12] SCENARIO: KERNEL OBJECT INSPECTION
+     Dump handle table + EPROCESS from live environment
+--------------------------------------------------------------------------------
+
+  Handle Table:
+    Handle Table at 0x81341490
+        Handle |       Object |       Access | Type
+    -----------+--------------+--------------+--------------------
+      0x0004   | 0x81340000   | 0x001F0FFF   | DEVICE_OBJECT
+      0x0008   | 0x81340590   | 0x001F03FF   | ETHREAD
+
+  EPROCESS at 0x81340000:
+    ════════════════════════════════════════════════════════════
+      DEVICE_OBJECT at 0x81340000
+    ════════════════════════════════════════════════════════════
+      +0x000 Type                           = 0x0003  should be 3
+      +0x002 Size                           = 0x01B0  
+      +0x004 ReferenceCount                 = 0x81340004  
+      +0x008 DriverObject                   = 0x81340004  PDRIVER_OBJECT — owning driver
+      +0x00C NextDevice                     = 0x00000000  next device in driver's chain
+      +0x010 AttachedDevice                 = 0x00000000  device attached on top
+      +0x014 CurrentIrp                     = 0x00000000  
+      +0x018 Timer                          = 0x00185000  
+      +0x01C Flags                          = 0x00000000  
+      +0x020 Characteristics                = 0x00000000  
+      +0x024 Vpb                            = 0x00000000  PVPB
+      +0x028 DeviceExtension                = 0x00000000  driver-specific data
+      +0x02C DeviceType                     = 0x00000000  
+      +0x030 StackSize                      = 0x00  IRP stack depth
+
+  Null pointer check on EPROCESS:
+    ✅ No critical null pointers detected
+
+================================================================================
+[13] SCENARIO: ERROR / EVENT DETECTION
+     Run with invalid parameters to trigger error events
+--------------------------------------------------------------------------------
+
+  Test: Invalid class 0xFF
+    Args: ['0xFF', '0', '0', '0x1000', '0x1000']
+    Return: 0x0000009F (STATUS_POWER_STATE_INVALID)
+    Instructions: 47586
+    Events (1): spin_loop
+      [spin_loop] Spin loop at 0x0046CF4C (501 hits)
+
+  Test: Invalid class MAX
+    Args: ['0xFFFFFFFF', '0', '0', '0x1000', '0x1000']
+    Return: 0x0000009F (STATUS_POWER_STATE_INVALID)
+    Instructions: 47586
+    Events (1): spin_loop
+      [spin_loop] Spin loop at 0x0046CF4C (501 hits)
+
+  Test: Zero output buffer+size
+    Args: ['0', '0', '0', '0', '0']
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 170
+    Events (0): none
+
+  Test: Huge output size (0xFFFF)
+    Args: ['0', '0', '0', '0x1000', '0xFFFF']
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 240
+    Events (0): none
+
+  Test: Class 7 tiny buffer
+    Args: ['7', '0', '0', '0x1000', '1']
+    Return: 0x0000009F (STATUS_POWER_STATE_INVALID)
+    Instructions: 47591
+    Events (1): spin_loop
+      [spin_loop] Spin loop at 0x0046CF4C (501 hits)
+
+  Test: Class 8 tiny buffer
+    Args: ['8', '0', '0', '0x1000', '1']
+    Return: 0x00000000 (STATUS_SUCCESS)
+    Instructions: 173
+    Events (0): none
+
+================================================================================
+[SUMMARY]
+================================================================================
+  System32 path:     C:\Users\win2000\Desktop\2kDEBUG\system32
+  Modules loaded:    2
+  Test scenarios:    13
+  Function tested:   NtPowerInformation (ntoskrnl.exe!0x004E1536)
+  Power classes:     37 tested
+  Buffer variations: 10 sizes tested
+  Error scenarios:   6 tested
+  Trace captured:    240 instructions for class 0
+  Cross-module:      8 module transitions detected
+================================================================================

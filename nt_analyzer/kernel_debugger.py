@@ -113,6 +113,7 @@ _STATUS_NAMES = {
     0xC0000061: "STATUS_PRIVILEGE_NOT_HELD",
     0x40000024: "STATUS_NO_YIELD_PERFORMED",
     0x80000005: "STATUS_BUFFER_OVERFLOW",
+    0x0000009F: "STATUS_POWER_STATE_INVALID",
 }
 
 def ntstatus_name(code: int) -> str:
@@ -1809,6 +1810,10 @@ class DebugSession:
                 max_instructions, stop_at_entry, show_trace):
         """Core emulation loop."""
         uc = self.env.uc
+
+        # Clean up any stale hooks from a previous run on this session
+        self._cleanup_hooks()
+
         self.state = DebugState.RUNNING
         self._user_mode = user_mode
         self._max_instructions = max_instructions
@@ -2131,6 +2136,37 @@ class DebugSession:
 
         uc = self.env.uc
         eip = uc.reg_read(UC_X86_REG_EIP)
+
+        # If paused at a breakpoint, single-step past it first so we don't
+        # re-trigger the same breakpoint immediately.
+        bp = self._breakpoints.get(eip)
+        if bp and bp.enabled:
+            bp.enabled = False
+            self.state = DebugState.RUNNING
+            try:
+                uc.emu_start(eip, self.env._ret_sled, count=1)
+            except Exception:
+                pass
+            bp.enabled = True
+            eip = uc.reg_read(UC_X86_REG_EIP)
+            # Check if function completed during that single step
+            if eip == self.env._ret_sled:
+                self._cleanup_hooks()
+                self.state = DebugState.STOPPED
+                rs = self._run_state or {}
+                return {
+                    "function": rs.get("func_name", "?"),
+                    "return_value": uc.reg_read(UC_X86_REG_EAX),
+                    "return_status": ntstatus_name(uc.reg_read(UC_X86_REG_EAX)),
+                    "instructions": self._insn_count,
+                    "elapsed_sec": 0,
+                    "state": "completed",
+                    "exception": None,
+                    "trace": list(self._trace) if rs.get("show_trace") else [],
+                    "api_calls": list(self._api_calls),
+                    "events": list(self.events),
+                }
+
         self.state = DebugState.RUNNING
         t0 = time.perf_counter()
         exception_msg = None
@@ -2178,6 +2214,12 @@ class DebugSession:
             except Exception:
                 pass
         self._hooks.clear()
+
+    def close(self):
+        """Clean up hooks and reset state.  Call when done with this session."""
+        self._cleanup_hooks()
+        self._breakpoints.clear()
+        self.state = DebugState.STOPPED
 
     def _pause(self, reason: str):
         self.state = DebugState.PAUSED
