@@ -16,5 +16,7 @@ Capabilities:
   - Deep function analysis (private/internal function discovery)
   - System-wide cross-reference scanning
   - Multi-format symbol loading (.map/.pdb/.dbg/.sym)
+  - Kernel function emulation (Unicorn x86-32)
+  - Live kernel-state debugger (multi-PE loader, breakpoints, stepping)
 """
-__version__ = "3.1.0"
+__version__ = "3.3.0"

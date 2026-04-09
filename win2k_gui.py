@@ -48,6 +48,7 @@ def _behavior():        return _lazy('nt_analyzer.behavior_analyzer')
 def _decompiler():      return _lazy('nt_analyzer.decompiler')
 def _compat():          return _lazy('nt_analyzer.compat_analyzer')
 def _pe_patcher():      return _lazy('nt_analyzer.pe_patcher')
+def _kdbg():            return _lazy('nt_analyzer.kernel_debugger')
 def _sym_loader():      return _lazy('nt_analyzer.symbol_loader')
 def _deep_analyzer():   return _lazy('nt_analyzer.deep_analyzer')
 def _emulator():        return _lazy('nt_analyzer.emulator')
@@ -349,6 +350,7 @@ class App(tk.Tk):
         self.tab_deep       = DeepAnalyzerTab(self.nb, self)
         self.tab_xref       = XRefScannerTab(self.nb, self)
         self.tab_patcher    = PEPatcherTab(self.nb, self)
+        self.tab_kdbg       = KernelDebuggerTab(self.nb, self)
 
         tabs = [
             (self.tab_exports,    " Exports "),
@@ -366,6 +368,7 @@ class App(tk.Tk):
             (self.tab_deep,       " Deep "),
             (self.tab_xref,       " XRefs "),
             (self.tab_patcher,    " PE Patch "),
+            (self.tab_kdbg,       " \U0001F41E KDebug "),
         ]
         for tab, text in tabs:
             self.nb.add(tab, text=text)
@@ -377,7 +380,7 @@ class App(tk.Tk):
         self.statusbar.pack_propagate(False)
 
         self.status_lbl = ttk.Label(self.statusbar,
-            text="  Ready  \u2022  15 analysis modules loaded  \u2022  Deep function analysis  \u2022  System-wide XRef scanning  \u2022  Symbol loading (.map/.pdb/.dbg)",
+            text="  Ready  \u2022  16 analysis modules loaded  \u2022  Live kernel debugger  \u2022  Deep function analysis  \u2022  System-wide XRef scanning  \u2022  Symbol loading (.map/.pdb/.dbg)",
             style="Status.TLabel")
         self.status_lbl.pack(side="left", padx=10, pady=4)
 
@@ -5106,8 +5109,544 @@ class PEPatcherTab(ttk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Launch
+#  Tab 16: Kernel Debugger
 # ══════════════════════════════════════════════════════════════════════════
+
+class KernelDebuggerTab(ttk.Frame):
+    """Live kernel‑state debugger — multi‑PE loader, breakpoints, stepping."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, style="TFrame")
+        self.app = app
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(8, weight=1)   # output area expands
+
+        self._env = None           # KernelEnvironment
+        self._dbg = None           # DebugSession
+        self._insp = None          # ObjectInspector
+        self._loaded = False
+
+        # Row 0 — system32 folder picker
+        _, self._get_sys32, self._sys32_var = make_dir_picker(
+            self, "System32 folder:", row=0,
+            placeholder=r"C:\Users\win2000\Desktop\2kDEBUG\system32",
+            app=app)
+
+        # Row 1 — load / unload / symbols
+        bf1 = make_button_bar(self, row=1)
+        ttk.Button(bf1, text="\u25B6 Load Core",
+                   command=self._load_core).pack(side="left", padx=2)
+        ttk.Button(bf1, text="\u2B07 Load Dependencies",
+                   command=self._load_deps).pack(side="left", padx=2)
+        ttk.Button(bf1, text="\U0001F50D Load Symbols \u2026",
+                   command=self._load_symbols).pack(side="left", padx=2)
+        ttk.Button(bf1, text="\u274C Unload",
+                   command=self._unload).pack(side="left", padx=2)
+
+        # Row 2 — function / args
+        func_frm = tk.Frame(self, bg=T["bg"])
+        func_frm.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
+        func_frm.columnconfigure(1, weight=1)
+        ttk.Label(func_frm, text="Function:").grid(row=0, column=0, padx=(0, 6))
+        self._func_var = tk.StringVar()
+        self._func_ent = PlaceholderEntry(func_frm, textvariable=self._func_var,
+                                          placeholder="NtPowerInformation")
+        self._func_ent.grid(row=0, column=1, sticky="ew")
+        app._placeholder_entries.append(self._func_ent)
+
+        ttk.Label(func_frm, text="  Args:").grid(row=0, column=2, padx=(8, 6))
+        self._args_var = tk.StringVar()
+        self._args_ent = PlaceholderEntry(func_frm, textvariable=self._args_var,
+                                          placeholder="0, 0, 0, 0x1000, 0x1000")
+        self._args_ent.grid(row=0, column=3, sticky="ew")
+        func_frm.columnconfigure(3, weight=1)
+        app._placeholder_entries.append(self._args_ent)
+
+        # Row 3 — run / step / continue / breakpoints
+        bf2 = make_button_bar(self, row=3)
+        ttk.Button(bf2, text="\u25B6 Run",
+                   command=self._run).pack(side="left", padx=2)
+        ttk.Button(bf2, text="\u23F8 Run+Break at Entry",
+                   command=self._run_break).pack(side="left", padx=2)
+        ttk.Button(bf2, text="\u23ED Step",
+                   command=self._step).pack(side="left", padx=2)
+        ttk.Button(bf2, text="\u25B6\u25B6 Continue",
+                   command=self._continue).pack(side="left", padx=2)
+        ttk.Separator(bf2, orient="vertical").pack(side="left", padx=6, fill="y")
+        ttk.Button(bf2, text="\U0001F6D1 Set Breakpoint",
+                   command=self._add_breakpoint).pack(side="left", padx=2)
+        ttk.Button(bf2, text="List BPs",
+                   command=self._list_breakpoints).pack(side="left", padx=2)
+
+        # Row 4 — options
+        opt_frm = tk.Frame(self, bg=T["bg"])
+        opt_frm.grid(row=4, column=0, sticky="w", padx=12, pady=2)
+        self._show_trace_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt_frm, text="Show instruction trace",
+                       variable=self._show_trace_var,
+                       bg=T["bg"], fg=T["fg"], selectcolor=T["bg_dark"],
+                       activebackground=T["bg"], activeforeground=T["fg"]
+                       ).pack(side="left", padx=4)
+        self._user_mode_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt_frm, text="User mode (PreviousMode=1)",
+                       variable=self._user_mode_var,
+                       bg=T["bg"], fg=T["fg"], selectcolor=T["bg_dark"],
+                       activebackground=T["bg"], activeforeground=T["fg"]
+                       ).pack(side="left", padx=4)
+
+        # Row 5 — breakpoint entry
+        bp_frm = tk.Frame(self, bg=T["bg"])
+        bp_frm.grid(row=5, column=0, sticky="ew", padx=12, pady=2)
+        bp_frm.columnconfigure(1, weight=1)
+        ttk.Label(bp_frm, text="Breakpoint:").grid(row=0, column=0, padx=(0, 6))
+        self._bp_var = tk.StringVar()
+        self._bp_ent = PlaceholderEntry(bp_frm, textvariable=self._bp_var,
+                                        placeholder="NtClose or 0x004DC97E")
+        self._bp_ent.grid(row=0, column=1, sticky="ew")
+        app._placeholder_entries.append(self._bp_ent)
+
+        # Row 6 — inspect buttons
+        bf3 = make_button_bar(self, row=6)
+        ttk.Button(bf3, text="Registers",
+                   command=self._show_regs).pack(side="left", padx=2)
+        ttk.Button(bf3, text="Call Stack",
+                   command=self._show_callstack).pack(side="left", padx=2)
+        ttk.Button(bf3, text="Stack Memory",
+                   command=self._show_stack_mem).pack(side="left", padx=2)
+        ttk.Button(bf3, text="Handle Table",
+                   command=self._show_handles).pack(side="left", padx=2)
+        ttk.Button(bf3, text="Env Info",
+                   command=self._show_env).pack(side="left", padx=2)
+
+        # Row 7 — status + progress
+        self.status_var, self._prog_start, self._prog_stop = \
+            make_status_with_progress(self, "Kernel debugger ready", row=7)
+
+        # Row 8 — output
+        self.output = TabbedOutput(self)
+        self.output.grid(row=8, column=0, sticky="nsew", padx=10, pady=(4, 10))
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    def _parse_args(self):
+        """Parse the args entry into a list of ints."""
+        raw = self._args_ent.get_value() if isinstance(
+            self._args_ent, PlaceholderEntry) else self._args_var.get()
+        if not raw.strip():
+            return []
+        parts = [p.strip() for p in raw.split(',')]
+        result = []
+        for p in parts:
+            if not p:
+                continue
+            result.append(int(p, 0))  # supports 0x hex
+        return result
+
+    def _get_func(self):
+        if isinstance(self._func_ent, PlaceholderEntry):
+            return self._func_ent.get_value()
+        return self._func_var.get()
+
+    def _ensure_env(self):
+        if self._env and self._loaded:
+            return True
+        self.status_var.set("\u26A0 Load core first (click Load Core)")
+        return False
+
+    # ── load / unload ─────────────────────────────────────────────────────
+
+    def _load_core(self):
+        sys32 = self._get_sys32()
+        if not sys32 or not os.path.isdir(sys32):
+            messagebox.showwarning("Missing", "Select a valid System32 folder.")
+            return
+        self.status_var.set("\u23F3 Loading kernel environment \u2026")
+        self.output.new_tab("Load Core")
+
+        def work():
+            kdbg = _kdbg()
+            env = kdbg.KernelEnvironment(sys32)
+            env.load_core()
+            return env
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            self._env = result
+            self._loaded = True
+            self._dbg = None
+            self._insp = _kdbg().ObjectInspector(self._env)
+            info = self._env.get_info()
+            output_write(self.output, "  KERNEL ENVIRONMENT LOADED\n\n", "title")
+            output_write(self.output, f"  System Root: {info['system_root']}\n", "ok")
+            output_write(self.output, f"  Modules: {info['modules_loaded']}\n", "ok")
+            output_write(self.output, f"  Available files: {info['available_files']}\n\n")
+            for m in info.get('modules', []):
+                output_write(self.output,
+                    f"  {m['name']:24s}  base=0x{m['base']:08X}  "
+                    f"exports={m['exports']:5d}  unresolved={m['unresolved']}\n")
+            self.status_var.set(
+                f"\u2705 Loaded: {info['modules_loaded']} modules, "
+                f"{info['available_files']} files available")
+
+        run_with_progress(self, work, done)
+
+    def _load_deps(self):
+        if not self._ensure_env():
+            return
+        self.status_var.set("\u23F3 Loading dependencies \u2026")
+        self.output.new_tab("Dependencies")
+
+        def work():
+            self._env.auto_load_dependencies()
+            return self._env.get_info()
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            output_write(self.output, "  DEPENDENCY RESOLUTION\n\n", "title")
+            for m in result.get('modules', []):
+                tag = "ok" if m['unresolved'] == 0 else "warn"
+                output_write(self.output,
+                    f"  {m['name']:24s}  base=0x{m['base']:08X}  "
+                    f"exports={m['exports']:5d}  unresolved={m['unresolved']}\n", tag)
+            unresolved = result.get('unresolved_imports', {})
+            if unresolved:
+                output_write(self.output, f"\n  Unresolved ({sum(len(v) for v in unresolved.values())}):\n", "error")
+                for dll, funcs in unresolved.items():
+                    output_write(self.output, f"    {dll}:\n", "warn")
+                    for fn in funcs:
+                        output_write(self.output, f"      \u2022 {fn}\n", "dim")
+            self.status_var.set(
+                f"\u2705 {result['modules_loaded']} modules loaded")
+
+        run_with_progress(self, work, done)
+
+    def _load_symbols(self):
+        if not self._ensure_env():
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("Symbol files", "*.map *.pdb *.dbg *.sym"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self.status_var.set("\u23F3 Loading symbols \u2026")
+
+        def work():
+            return self._env.load_symbols_from_file(path)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                return
+            self.status_var.set(f"\u2705 Symbols loaded: {result} symbols")
+
+        run_with_progress(self, work, done)
+
+    def _unload(self):
+        if self._env:
+            try:
+                self._env.close()
+            except Exception:
+                pass
+        self._env = None
+        self._dbg = None
+        self._insp = None
+        self._loaded = False
+        self.status_var.set("Environment unloaded")
+
+    # ── run / step / continue ─────────────────────────────────────────────
+
+    def _make_session(self):
+        """Create or reuse a DebugSession."""
+        kdbg = _kdbg()
+        if not self._dbg or self._dbg.state == kdbg.DebugState.STOPPED:
+            self._dbg = kdbg.DebugSession(self._env)
+        return self._dbg
+
+    def _run(self):
+        if not self._ensure_env():
+            return
+        func = self._get_func()
+        if not func:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+        args = self._parse_args()
+        show_trace = self._show_trace_var.get()
+        user_mode = self._user_mode_var.get()
+        self.status_var.set(f"\u23F3 Running {func} \u2026")
+        self.output.new_tab(f"Run: {func}")
+
+        def work():
+            dbg = self._make_session()
+            result = dbg.run(func, args=args, show_trace=show_trace,
+                             user_mode=user_mode)
+            return dbg.format_result(result, show_trace=show_trace)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            self._write_report(result)
+            self.status_var.set("\u2705 Run complete")
+
+        run_with_progress(self, work, done)
+
+    def _run_break(self):
+        if not self._ensure_env():
+            return
+        func = self._get_func()
+        if not func:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+        args = self._parse_args()
+        show_trace = self._show_trace_var.get()
+        user_mode = self._user_mode_var.get()
+        self.status_var.set(f"\u23F3 Running {func} (break at entry) \u2026")
+        self.output.new_tab(f"Debug: {func}")
+
+        def work():
+            dbg = self._make_session()
+            result = dbg.run(func, args=args, show_trace=show_trace,
+                             user_mode=user_mode, stop_at_entry=True)
+            return result
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            kdbg = _kdbg()
+            if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:
+                regs = self._dbg.inspect_registers()
+                eip = regs['eip']
+                eip_name = regs.get('eip_name', f'0x{eip:08X}')
+                output_write(self.output,
+                    f"  \u23F8 PAUSED at {eip_name}\n\n", "title")
+                self._write_regs(regs)
+                self.status_var.set(
+                    f"\u23F8 Paused at {eip_name} — use Step / Continue")
+            else:
+                report = self._dbg.format_result(result,
+                                                  show_trace=show_trace)
+                self._write_report(report)
+                self.status_var.set("\u2705 Run complete (no break)")
+
+        run_with_progress(self, work, done)
+
+    def _step(self):
+        kdbg = _kdbg()
+        if not self._dbg or self._dbg.state != kdbg.DebugState.PAUSED:
+            self.status_var.set("\u26A0 Not paused — use Run+Break first")
+            return
+        result = self._dbg.step()
+        if not result:
+            return
+        if result.get("state") == "completed":
+            retval = result.get("return_value", 0)
+            output_write(self.output,
+                f"\n  \u2705 Function returned: 0x{retval:08X} "
+                f"({kdbg.ntstatus_name(retval)})\n", "ok")
+            self.status_var.set(
+                f"\u2705 Completed: 0x{retval:08X} ({kdbg.ntstatus_name(retval)})")
+            return
+        if "error" in result:
+            output_write(self.output,
+                f"\n  \u274C Error: {result['error']}\n", "error")
+            return
+        eip = result['eip']
+        eip_name = result.get('eip_name', f'0x{eip:08X}')
+        output_write(self.output,
+            f"  \u25B6 0x{eip:08X}  {eip_name}\n")
+        self.status_var.set(f"\u23F8 Step: {eip_name}")
+
+    def _continue(self):
+        kdbg = _kdbg()
+        if not self._dbg or self._dbg.state != kdbg.DebugState.PAUSED:
+            self.status_var.set("\u26A0 Not paused — nothing to continue")
+            return
+        self.status_var.set("\u23F3 Continuing \u2026")
+
+        def work():
+            return self._dbg.continue_run()
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            kdbg2 = _kdbg()
+            if result.get("state") == "paused":
+                regs = self._dbg.inspect_registers()
+                eip = regs['eip']
+                eip_name = regs.get('eip_name', f'0x{eip:08X}')
+                output_write(self.output,
+                    f"\n  \u23F8 Breakpoint at {eip_name}\n", "title")
+                self._write_regs(regs)
+                self.status_var.set(f"\u23F8 Paused at {eip_name}")
+            else:
+                retval = result.get("return_value", 0)
+                output_write(self.output,
+                    f"\n  \u2705 Completed: 0x{retval:08X} "
+                    f"({kdbg2.ntstatus_name(retval)})\n", "ok")
+                output_write(self.output,
+                    f"  Instructions: {result.get('instructions', 0)}\n")
+                self.status_var.set(
+                    f"\u2705 Completed: 0x{retval:08X} "
+                    f"({kdbg2.ntstatus_name(retval)})")
+
+        run_with_progress(self, work, done)
+
+    # ── breakpoints ───────────────────────────────────────────────────────
+
+    def _add_breakpoint(self):
+        if not self._ensure_env():
+            return
+        raw = self._bp_ent.get_value() if isinstance(
+            self._bp_ent, PlaceholderEntry) else self._bp_var.get()
+        raw = raw.strip()
+        if not raw:
+            messagebox.showwarning("Missing", "Enter a breakpoint name or address.")
+            return
+        dbg = self._make_session()
+        # Parse hex address if applicable
+        target = raw
+        if raw.startswith("0x") or raw.startswith("0X"):
+            try:
+                target = int(raw, 16)
+            except ValueError:
+                pass
+        try:
+            bp_id = dbg.set_breakpoint(target)
+            self.status_var.set(f"\U0001F6D1 Breakpoint #{bp_id} set: {raw}")
+        except ValueError as e:
+            self.status_var.set(f"\u274C {e}")
+
+    def _list_breakpoints(self):
+        if not self._dbg:
+            self.status_var.set("No debug session active")
+            return
+        bps = self._dbg.list_breakpoints()
+        if not bps:
+            self.status_var.set("No breakpoints set")
+            return
+        self.output.new_tab("Breakpoints")
+        output_write(self.output, "  BREAKPOINTS\n\n", "title")
+        for bp in bps:
+            tag = "ok" if bp.enabled else "dim"
+            output_write(self.output,
+                f"  #{bp.id:2d}  0x{bp.address:08X}  {bp.name:30s}  "
+                f"hits={bp.hit_count}  "
+                f"{'enabled' if bp.enabled else 'disabled'}\n", tag)
+
+    # ── inspection ────────────────────────────────────────────────────────
+
+    def _write_regs(self, regs):
+        """Write register state to output."""
+        pairs = [
+            ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
+            ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
+            ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
+            ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
+            ("EIP", regs.get("eip", 0)),
+        ]
+        for name, val in pairs:
+            output_write(self.output, f"  {name}=0x{val:08X}", "ok")
+        output_write(self.output, "\n")
+
+    def _write_report(self, report_text):
+        """Write a formatted report string to output."""
+        for line in report_text.split('\n'):
+            if '\u2550' in line or '\u2500' in line:
+                output_write(self.output, line + '\n', "heading")
+            elif line.strip().startswith('\U0001F534') or \
+                 line.strip().startswith('\u26A0'):
+                output_write(self.output, line + '\n', "warn")
+            elif 'STATUS_SUCCESS' in line:
+                output_write(self.output, line + '\n', "ok")
+            elif 'ERROR' in line or '0xC' in line:
+                output_write(self.output, line + '\n', "error")
+            else:
+                output_write(self.output, line + '\n')
+
+    def _show_regs(self):
+        kdbg = _kdbg()
+        if not self._dbg or self._dbg.state not in (
+                kdbg.DebugState.PAUSED, kdbg.DebugState.STOPPED):
+            self.status_var.set("\u26A0 No active session")
+            return
+        regs = self._dbg.inspect_registers()
+        self.output.new_tab("Registers")
+        output_write(self.output, "  CPU REGISTERS\n\n", "title")
+        self._write_regs(regs)
+        efl = regs.get("eflags", 0)
+        output_write(self.output, f"\n  EFLAGS=0x{efl:08X}  ", "dim")
+        flags = []
+        if efl & 0x01: flags.append("CF")
+        if efl & 0x04: flags.append("PF")
+        if efl & 0x40: flags.append("ZF")
+        if efl & 0x80: flags.append("SF")
+        if efl & 0x800: flags.append("OF")
+        output_write(self.output, " ".join(flags) + "\n", "dim")
+
+    def _show_callstack(self):
+        kdbg = _kdbg()
+        if not self._dbg or self._dbg.state not in (
+                kdbg.DebugState.PAUSED, kdbg.DebugState.STOPPED):
+            self.status_var.set("\u26A0 No active session")
+            return
+        frames = self._dbg.get_call_stack()
+        self.output.new_tab("Call Stack")
+        output_write(self.output, "  CALL STACK\n\n", "title")
+        if not frames:
+            output_write(self.output, "  (empty)\n", "dim")
+            return
+        for i, f in enumerate(frames):
+            mod = f.module or "???"
+            func = f.function or f"0x{f.return_address:08X}"
+            output_write(self.output,
+                f"  #{i:2d}  {mod}!{func}  "
+                f"(FP=0x{f.frame_pointer:08X})\n", "ok")
+
+    def _show_stack_mem(self):
+        kdbg = _kdbg()
+        if not self._dbg or self._dbg.state not in (
+                kdbg.DebugState.PAUSED, kdbg.DebugState.STOPPED):
+            self.status_var.set("\u26A0 No active session")
+            return
+        entries = self._dbg.inspect_stack()
+        self.output.new_tab("Stack")
+        output_write(self.output, "  STACK MEMORY\n\n", "title")
+        for e in entries:
+            sym = e.get("symbol", "")
+            sym_str = f"  {sym}" if sym else ""
+            output_write(self.output,
+                f"  +0x{e['offset']:04X}  [0x{e['address']:08X}]  "
+                f"0x{e['value']:08X}{sym_str}\n")
+
+    def _show_handles(self):
+        if not self._insp:
+            self.status_var.set("\u26A0 Load core first")
+            return
+        self.output.new_tab("Handles")
+        output_write(self.output, "  HANDLE TABLE\n\n", "title")
+        rows = self._insp.walk_handle_table()
+        for row in rows:
+            output_write(self.output, f"  {row}\n")
+
+    def _show_env(self):
+        if not self._ensure_env():
+            return
+        dbg = self._make_session()
+        info = dbg.format_environment_info()
+        self.output.new_tab("Env Info")
+        self._write_report(info)
+        self.status_var.set("\u2705 Environment info displayed")
 
 if __name__ == '__main__':
     app = App()

@@ -2,9 +2,16 @@
 
 **The ultimate reverse-engineering and binary compatibility toolkit for porting ReactOS components to Windows 2000 SP4.**
 
-Analyze, compare, decompile, emulate, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (15 tabs)** and a **full CLI (27 commands)**.
+Analyze, compare, decompile, emulate, debug, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (16 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.2 — Kernel Function Emulator, SSDT Intelligence, Dual Symbols:**
+**NEW in v3.3 — Live Kernel Debugger:**
+- **Live Kernel State Debugger:** Point it at a Win2K System32 folder and it builds a complete kernel environment in RAM — loads ntoskrnl.exe + hal.dll + dependencies, resolves cross-module IAT imports, builds KPCR/EPROCESS/ETHREAD/handle tables, then lets you run any kernel function with breakpoints, single-stepping, register inspection, call stack reconstruction, and object inspection. Like a portable WinDbg — no live kernel, no VM, no debug cables.
+- **Multi-PE Loader:** Loads multiple PEs into a shared Unicorn x86 address space with real GDT/FS segment setup for kernel FS:[offset] access (KPCR at 0xFFDFF000).
+- **Breakpoints + Stepping:** Set breakpoints by name or address, step instruction-by-instruction, continue from pause, inspect registers/stack/memory at any point.
+- **Cross-Module Call Tracing:** Watch ntoskrnl call into HAL and back with real resolved import addresses — no stubs.
+- **Missing Module Detection:** Auto-detects when a dependency can't be loaded (e.g., bootvid.dll) and reports exactly which imports are affected.
+
+**Previously in v3.2 — Kernel Function Emulator, SSDT Intelligence, Dual Symbols:**
 - **Kernel Function Emulator:** WinDbg-like x86 emulation engine powered by Unicorn. Load any Win2K PE (ntoskrnl.exe, hal.dll, ntdll.dll, ...), emulate any kernel function with controlled inputs, auto-generate 12 test scenarios, verify NTSTATUS return values and API call patterns — all **before** patching a live system.
 - **SSDT Resolver (Zero-Symbol Kernel Intelligence):** Resolves ALL 248 private Nt* kernel functions (NtPowerInformation, NtQuerySystemInformation, NtClose, etc.) directly from the binary — no PDB/DBG symbols required. Scans KiServiceTable via Zw stub → syscall number → SSDT lookup.
 - **Dual Symbol Loading:** Behavior Analyzer now supports separate symbol files for DLL A (Win2K) and DLL B (ReactOS) with color-coded clickable links — blue for Win2K, green for ReactOS.
@@ -37,7 +44,8 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 - [Using the CLI](#using-the-cli)
 - [CLI Command Reference (All 27 Commands)](#cli-command-reference-all-27-commands)
 - [Patching NT System Internals (.sys / Kernel-Mode Binaries)](#patching-nt-system-internals-sys--kernel-mode-binaries)
-- [GUI Tab Reference (All 15 Tabs)](#gui-tab-reference-all-15-tabs)
+- [Kernel Debugger — Live Kernel State](#kernel-debugger--live-kernel-state)
+- [GUI Tab Reference (All 16 Tabs)](#gui-tab-reference-all-16-tabs)
 - [Deep Analyzer — IDA Pro-Level Analysis Without Symbols](#deep-analyzer--ida-pro-level-analysis-without-symbols)
 - [Symbol Loader — Enrich Disassembly With Debug Info](#symbol-loader--enrich-disassembly-with-debug-info)
 - [Decompiler Modes — Pseudo-C, Assembly, Hex Dump](#decompiler-modes--pseudo-c-assembly-hex-dump)
@@ -426,6 +434,10 @@ All long-running operations now show a **real-time progress dialog** with:
 | | Hex dump at RVA | `hex-dump` | — |
 | **Build** | Generate RosBE / MSVC / CMake build scripts | `build-script` | Tab 9 |
 | | ReactOS source tree auto-patcher | — | Tab 8 |
+| **Kernel Debugger** | **Live kernel-state debugger (multi-PE, breakpoints, stepping)** | Python API | Tab 16 |
+| | **Cross-module IAT resolution and call tracing** | Python API | Tab 16 |
+| | **Object inspector (EPROCESS, DRIVER_OBJECT, handle table)** | Python API | Tab 16 |
+| | **Missing module detection and dependency resolver** | Python API | Tab 16 |
 | **UI Features** | **Tabbed output — each action opens new closeable tab** | — | All tabs |
 | | **Right-click / middle-click to close tabs** | — | All tabs |
 | | **Progress dialogs with operation names + percentage** | — | Tab 10, 13 |
@@ -1066,7 +1078,78 @@ Our compatibility analyzer automatically detects these NT 5.0 vs 5.1 kernel-mode
 
 ---
 
-## GUI Tab Reference (All 15 Tabs)
+## Kernel Debugger — Live Kernel State
+
+The kernel debugger builds a complete NT kernel environment from real Win2K System32 files:
+
+```python
+from nt_analyzer.kernel_debugger import *
+
+# One-shot convenience
+report = quick_debug(r"C:\2kDEBUG\system32", "NtPowerInformation",
+                     args=[0, 0, 0, 0x1000, 0x1000])
+print(report)
+```
+
+Output:
+```
+════════════════════════════════════════════════════════════════════════
+  KERNEL ENVIRONMENT STATUS
+════════════════════════════════════════════════════════════════════════
+  System Root: C:\2kDEBUG\system32
+  Modules Loaded: 2
+  Available Files: 2142
+  KPCR: 0xFFDFF000
+  System EPROCESS: 0x81340000
+
+  Loaded Modules:
+  ntoskrnl.exe   base=0x00400000  exports=1258  unresolved=10
+  hal.dll        base=0x80010000  exports=95    unresolved=0
+
+════════════════════════════════════════════════════════════════════════
+  LIVE KERNEL DEBUG REPORT
+  Function: NtPowerInformation
+  Return: 0x00000000 (STATUS_SUCCESS)
+  Instructions: 276
+  Time: 0.011s
+════════════════════════════════════════════════════════════════════════
+```
+
+**Interactive debugging:**
+```python
+env = KernelEnvironment(r"C:\2kDEBUG\system32")
+env.load_core()                        # ntoskrnl + hal
+env.auto_load_dependencies()           # pull in what's needed
+
+dbg = DebugSession(env)
+dbg.set_breakpoint("NtClose")          # by name
+dbg.set_breakpoint(0x004DC97E)         # by address
+
+# Run with break at entry
+result = dbg.run("NtPowerInformation", args=[0, 0, 0, 0x1000, 0x1000],
+                 stop_at_entry=True)
+
+# Step through
+while dbg.state == DebugState.PAUSED:
+    regs = dbg.inspect_registers()     # EIP, ESP, EAX, ...
+    stack = dbg.get_call_stack()       # EBP chain walk
+    print(f"EIP=0x{regs['eip']:08X} ({regs['eip_name']})")
+    dbg.step()
+
+# Or continue to next breakpoint
+result = dbg.continue_run()
+```
+
+**What's built in memory:**
+- KPCR + KPRCB at 0xFFDFF000 (GDT with FS segment for kernel FS:[offset] access)
+- KUSER_SHARED_DATA at 0x7FFE0000 (NtMajorVersion=5, NtMinorVersion=0, 512MB RAM)
+- System EPROCESS (PID 4, ImageFileName="System"), ETHREAD, idle thread
+- Handle table with pseudo-handles (-1=process, -2=thread)
+- Full GDT: null + CS + DS + FS→KPCR
+
+---
+
+## GUI Tab Reference (All 16 Tabs)
 
 ### Tab 1: Exports / Imports
 - Browse to any PE file (.dll, .sys, .exe, .cpl)
@@ -1196,6 +1279,27 @@ System-wide cross-reference scanner:
 - **Inspect Tables** — view all PE internal tables (exports, imports, relocations, sections)
 - **Rebase** — change ImageBase and fix all relocations
 - Output file saved as `<name>_patched.<ext>` (original never modified)
+
+### Tab 16: 🐞 Kernel Debugger (NEW)
+Live kernel-state debugger — a portable WinDbg built entirely in Python:
+
+- **System32 folder picker** — point to any Win2K System32 directory
+- **Load Core** — loads ntoskrnl.exe + hal.dll into shared Unicorn x86 address space
+- **Load Dependencies** — auto-resolves imported DLLs across up to 3 dependency levels
+- **Load Symbols** — browse .map/.pdb/.dbg/.sym files for enhanced function names
+- **Function + Args** — enter function name and arguments (supports hex: `0x1000`)
+- **Run** — execute function to completion, get NTSTATUS return + instruction count
+- **Run+Break at Entry** — pause at first instruction, enables stepping
+- **Step** — execute one instruction at a time, inspect state after each
+- **Continue** — resume from breakpoint until next break or completion
+- **Set Breakpoint** — by function name (`NtClose`) or address (`0x004DC97E`)
+- **Registers** — view EAX/EBX/ECX/EDX/ESI/EDI/EBP/ESP/EIP/EFLAGS
+- **Call Stack** — EBP chain walk with module!function annotation
+- **Stack Memory** — hex dump of stack from ESP upward with symbol lookup
+- **Handle Table** — walk kernel object handle table
+- **Env Info** — full environment status (modules, exports, unresolved imports)
+- **Instruction trace** — optional per-instruction log with address + disassembly
+- **User/Kernel mode toggle** — set PreviousMode for testing different call paths
 
 ---
 
@@ -1540,11 +1644,11 @@ for name, code in functions.items():
 ```
 win2k_analyzer/
 ├── win2k_analyzer.py          # CLI frontend (27 commands)
-├── win2k_gui.py               # GUI frontend (15 tabs, dark theme, tabbed output)
+├── win2k_gui.py               # GUI frontend (16 tabs, dark theme, tabbed output)
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
 │
-├── nt_analyzer/               # Core analysis package (16 modules)
+├── nt_analyzer/               # Core analysis package (17 modules)
 │   ├── __init__.py            # Package init
 │   ├── pe_analyzer.py         # PE export/import/header analysis
 │   ├── syscall_extractor.py   # Syscall number extraction from ntdll stubs
@@ -1560,7 +1664,8 @@ win2k_analyzer/
 │   ├── pe_patcher.py          # KernelEx-inspired PE binary patcher (1900+ lines, 46 methods)
 │   ├── deep_analyzer.py       # IDA Pro-level function discovery, profiling, XRefs, deep compare
 │   ├── symbol_loader.py       # Multi-format symbol loader (.map/.pdb/.dbg/.sym)
-│   └── emulator.py            # (NEW) Unicorn-based kernel function emulator with API mocking
+│   ├── emulator.py            # Unicorn-based kernel function emulator with API mocking
+│   └── kernel_debugger.py     # (NEW) Live kernel-state debugger: multi-PE loader, breakpoints, stepping
 │
 ├── generated_headers/         # Output: generated C header files
 │   ├── peb_win2k.h
