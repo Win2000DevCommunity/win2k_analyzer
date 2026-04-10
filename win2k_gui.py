@@ -5864,23 +5864,33 @@ class KernelDebuggerTab(ttk.Frame):
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
-                output_write(self.output, f"ERROR: {result}\n", "error")
+                self.output.write_to_tab(self._trace_tab_title or "Debug",
+                    f"ERROR: {result}\n", "error")
                 return
             kdbg = _kdbg()
+            trace_tab = self._trace_tab_title or "Debug"
             if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:
                 regs = self._dbg.inspect_registers()
                 eip = regs['eip']
                 eip_name = regs.get('eip_name', f'0x{eip:08X}')
-                output_write(self.output,
+                self.output.write_to_tab(trace_tab,
                     f"  \u23F8 PAUSED at {eip_name}\n\n", "title")
-                self._write_regs(regs)
+                pairs = [
+                    ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
+                    ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
+                    ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
+                    ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
+                    ("EIP", regs.get("eip", 0)),
+                ]
+                reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
+                self.output.write_to_tab(trace_tab, reg_line + "\n", "ok")
                 self.status_var.set(
-                    f"\u23F8 Paused at {eip_name} — use Step / Continue")
+                    f"\u23F8 Paused at {eip_name} \u2014 use Step / Continue")
                 self._update_disasm_eip()
             else:
-                report = self._dbg.format_result(result,
-                                                  show_trace=show_trace)
-                self._write_report(report)
+                report = self._dbg.format_result(result, show_trace=show_trace)
+                for line in report.split('\n'):
+                    self.output.write_to_tab(trace_tab, line + '\n')
                 self.status_var.set("\u2705 Run complete (no break)")
 
         run_with_progress_dialog(self.app, f"Debugging {func}\u2026", work, done)
