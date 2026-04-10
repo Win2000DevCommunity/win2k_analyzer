@@ -6237,28 +6237,76 @@ class KernelDebuggerTab(ttk.Frame):
             self.output.new_tab(f"Callers: {func}")
             output_write(self.output,
                 f"  CROSS-REFERENCES: calls to {func}\n", "title")
+
+            # Separate by call type
+            direct = [c for c in callers if c.get('call_type') == 'direct']
+            ssdt = [c for c in callers if c.get('call_type') == 'ssdt']
+            stubs = [c for c in callers if c.get('call_type') == 'syscall_stub']
+
+            total = len(callers)
             output_write(self.output,
-                f"  Found {len(callers)} call site(s)\n\n", "ok")
+                f"  Found {total} caller(s): "
+                f"{len(direct)} direct, {len(ssdt)} SSDT, {len(stubs)} syscall stub(s)\n\n", "ok")
 
             if not callers:
                 output_write(self.output,
-                    "  No direct CALL instructions found.\n"
-                    "  (Indirect calls via function pointers are not tracked)\n",
+                    "  No callers found (direct or indirect).\n",
                     "dim")
                 self.status_var.set(f"\u26A0 No callers found for {func}")
                 return
 
-            output_write(self.output,
-                f"  {'Address':12s}  {'Module':16s}  {'Calling Function'}\n",
-                "heading")
-            output_write(self.output,
-                f"  {'─'*12}  {'─'*16}  {'─'*40}\n", "dim")
-
-            for c in callers:
-                addr_str = f"0x{c['caller_address']:08X}"
+            if direct:
                 output_write(self.output,
-                    f"  {addr_str:12s}  {c['caller_module']:16s}  "
-                    f"{c['caller_function']}\n")
+                    f"  ── Direct CALL Instructions ({len(direct)}) ──\n\n",
+                    "heading")
+                output_write(self.output,
+                    f"  {'Address':12s}  {'Module':16s}  {'Calling Function'}\n",
+                    "heading")
+                output_write(self.output,
+                    f"  {'─'*12}  {'─'*16}  {'─'*40}\n", "dim")
+                for c in direct:
+                    addr_str = f"0x{c['caller_address']:08X}"
+                    output_write(self.output,
+                        f"  {addr_str:12s}  {c['caller_module']:16s}  "
+                        f"{c['caller_function']}\n")
+                output_write(self.output, "\n")
+
+            if ssdt:
+                sc_num = ssdt[0].get('syscall_num')
+                output_write(self.output,
+                    f"  ── SSDT Dispatch (syscall 0x{sc_num:X} / {sc_num}) ──\n\n",
+                    "heading")
+                output_write(self.output,
+                    f"  {'Address':12s}  {'Module':16s}  {'Dispatch Path'}\n",
+                    "heading")
+                output_write(self.output,
+                    f"  {'─'*12}  {'─'*16}  {'─'*50}\n", "dim")
+                for c in ssdt:
+                    addr_str = f"0x{c['caller_address']:08X}" if c['caller_address'] else "(indirect)"
+                    output_write(self.output,
+                        f"  {addr_str:12s}  {c['caller_module']:16s}  "
+                        f"{c['caller_function']}\n", "warn")
+                output_write(self.output,
+                    f"\n  The kernel SSDT dispatches int 2e/sysenter calls to this function\n"
+                    f"  via KeServiceDescriptorTable[{sc_num}].\n"
+                    f"  Any user-mode NtXxx call with EAX={sc_num} reaches this function.\n\n", "dim")
+
+            if stubs:
+                sc_num = stubs[0].get('syscall_num')
+                output_write(self.output,
+                    f"  ── Syscall Stubs (mov eax, 0x{sc_num:X}; int 2e) ──\n\n",
+                    "heading")
+                output_write(self.output,
+                    f"  {'Address':12s}  {'Module':16s}  {'Stub Function'}\n",
+                    "heading")
+                output_write(self.output,
+                    f"  {'─'*12}  {'─'*16}  {'─'*50}\n", "dim")
+                for c in stubs:
+                    addr_str = f"0x{c['caller_address']:08X}"
+                    output_write(self.output,
+                        f"  {addr_str:12s}  {c['caller_module']:16s}  "
+                        f"{c['caller_function']}\n", "peach")
+                output_write(self.output, "\n")
 
             output_write(self.output,
                 f"\n  Tip: Copy an address above into the Breakpoint field "

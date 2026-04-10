@@ -2716,6 +2716,13 @@ class DebugSession:
     def find_callers(self, target: str) -> List[dict]:
         """Find all call sites to a function across all loaded modules.
 
+        Detects three types of callers:
+          1. Direct CALL instructions (call 0xNNNNNNNN)
+          2. SSDT dispatch — if the function is in the SSDT, reports the
+             KiSystemService dispatch path with the syscall number
+          3. User-mode syscall stubs — scans for 'mov eax, N; ... int 2e'
+             patterns in loaded user-mode modules (e.g. ntdll.dll)
+
         Returns list of dicts:
         {
             'caller_address': int,        # address of the CALL instruction
@@ -2723,6 +2730,8 @@ class DebugSession:
             'caller_function': str,       # nearest function name at call site
             'target_address': int,        # resolved target VA
             'target_name': str,           # target function name
+            'call_type': str,             # 'direct', 'ssdt', 'syscall_stub'
+            'syscall_num': int|None,      # syscall number (for ssdt/stub)
         }
         """
         # Resolve target to VA
@@ -2746,6 +2755,7 @@ class DebugSession:
         callers = []
         cs = self.env.cs
 
+        # ── 1. Direct CALL scan ──────────────────────────────────────
         for mod in self.env.modules.values():
             # Scan all executable sections
             if not mod.pe:
@@ -2783,10 +2793,159 @@ class DebugSession:
                             'caller_function': fi[0] if fi else f"sub_{insn.address:08X}",
                             'target_address': call_target,
                             'target_name': target_name,
+                            'call_type': 'direct',
+                            'syscall_num': None,
                         })
+
+        # ── 2. SSDT dispatch detection ───────────────────────────────
+        # Check if the function sits in the kernel SSDT table
+        ssdt_idx = None
+        kernel = self.env.modules.get('ntoskrnl.exe')
+        if kernel and kernel.ssdt_map:
+            for idx, va in kernel.ssdt_map.items():
+                if va in target_addrs:
+                    ssdt_idx = idx
+                    break
+
+        if ssdt_idx is None and target_name.startswith('Nt') and not target_name.startswith('Ntdll'):
+            # Try resolving via behavior analyzer
+            if kernel:
+                try:
+                    ssdt_result = _ba.resolve_nt_via_ssdt(kernel.path, target_name)
+                    if ssdt_result:
+                        ssdt_idx = ssdt_result[2]  # (rva, va, syscall_num)
+                except Exception:
+                    pass
+
+        if ssdt_idx is not None:
+            # The SSDT dispatcher (KiSystemService) calls this indirectly
+            # Find KiSystemService address if possible
+            ki_addr = None
+            ki_name = 'KiSystemService'
+            for mod in self.env.modules.values():
+                if ki_name in mod.exports:
+                    ki_addr = mod.exports[ki_name]
+                    break
+                for va, sym in mod.symbols.items():
+                    if sym == ki_name:
+                        ki_addr = va
+                        break
+                if ki_addr:
+                    break
+
+            callers.append({
+                'caller_address': ki_addr or 0,
+                'caller_module': 'ntoskrnl.exe',
+                'caller_function': f'KiSystemService (SSDT[{ssdt_idx}])',
+                'target_address': target_va,
+                'target_name': target_name,
+                'call_type': 'ssdt',
+                'syscall_num': ssdt_idx,
+            })
+
+            # Also look for Zw* wrapper export — Zw stubs are direct SSDT dispatchers
+            zw_name = 'Zw' + target_name[2:] if target_name.startswith('Nt') else None
+            if zw_name and kernel and zw_name in kernel.exports:
+                callers.append({
+                    'caller_address': kernel.exports[zw_name],
+                    'caller_module': 'ntoskrnl.exe',
+                    'caller_function': f'{zw_name} (Zw stub → SSDT[{ssdt_idx}])',
+                    'target_address': target_va,
+                    'target_name': target_name,
+                    'call_type': 'ssdt',
+                    'syscall_num': ssdt_idx,
+                })
+
+        # ── 3. User-mode syscall stub scan (int 2e / sysenter) ───────
+        # If we know the syscall number, scan loaded modules for stubs
+        # that set EAX = syscall_num then do int 0x2e or sysenter
+        if ssdt_idx is not None:
+            for mod in self.env.modules.values():
+                if not mod.pe:
+                    continue
+                # Check if it's a user-mode module (ImageBase < 0x80000000)
+                if mod.image_base >= 0x80000000:
+                    continue
+                for sec in mod.pe.sections:
+                    chars = sec.Characteristics
+                    if not (chars & 0x20000000):
+                        continue
+                    sec_va = mod.image_base + sec.VirtualAddress
+                    sec_size = sec.Misc_VirtualSize or sec.SizeOfRawData
+                    try:
+                        code = bytes(self.env.uc.mem_read(sec_va, sec_size))
+                    except Exception:
+                        continue
+
+                    self._scan_syscall_stubs(
+                        code, sec_va, mod.name, ssdt_idx,
+                        target_name, target_va, callers)
+
+            # Also scan kernel-mode modules for Zw* stubs that
+            # do mov eax, N; lea edx, [esp+4]; int 2e style
+            for mod in self.env.modules.values():
+                if not mod.pe:
+                    continue
+                if mod.image_base < 0x80000000:
+                    continue
+                for sec in mod.pe.sections:
+                    chars = sec.Characteristics
+                    if not (chars & 0x20000000):
+                        continue
+                    sec_va = mod.image_base + sec.VirtualAddress
+                    sec_size = sec.Misc_VirtualSize or sec.SizeOfRawData
+                    try:
+                        code = bytes(self.env.uc.mem_read(sec_va, sec_size))
+                    except Exception:
+                        continue
+
+                    self._scan_syscall_stubs(
+                        code, sec_va, mod.name, ssdt_idx,
+                        target_name, target_va, callers)
 
         callers.sort(key=lambda c: c['caller_address'])
         return callers
+
+    def _scan_syscall_stubs(self, code: bytes, base_va: int,
+                            mod_name: str, syscall_num: int,
+                            target_name: str, target_va: int,
+                            callers: List[dict]):
+        """Scan binary code for 'mov eax, syscall_num' followed by 'int 0x2e'
+        or 'sysenter' within a short window. Appends matches to callers."""
+        # Pattern: B8 xx xx xx xx = mov eax, imm32
+        sc_bytes = struct.pack('<I', syscall_num)
+        search_from = 0
+        while True:
+            pos = code.find(b'\xB8' + sc_bytes, search_from)
+            if pos < 0:
+                break
+            search_from = pos + 5
+
+            # Look ahead up to 32 bytes for int 0x2e (CD 2E) or sysenter (0F 34)
+            window = code[pos:pos + 32]
+            found_int2e = b'\xCD\x2E' in window
+            found_sysenter = b'\x0F\x34' in window
+            if not (found_int2e or found_sysenter):
+                continue
+
+            stub_va = base_va + pos
+            # Find function name at this address
+            fi = self.env.find_function_at(stub_va)
+            stub_func = fi[0] if fi else f"sub_{stub_va:08X}"
+
+            mechanism = "int 2e" if found_int2e else "sysenter"
+            # Avoid duplicates (Zw stubs already added above)
+            already = any(c['caller_address'] == stub_va for c in callers)
+            if not already:
+                callers.append({
+                    'caller_address': stub_va,
+                    'caller_module': mod_name,
+                    'caller_function': f'{stub_func} ({mechanism} → SSDT[{syscall_num}])',
+                    'target_address': target_va,
+                    'target_name': target_name,
+                    'call_type': 'syscall_stub',
+                    'syscall_num': syscall_num,
+                })
 
     # ----------------------------------------------------------- events
 
