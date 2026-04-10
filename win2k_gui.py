@@ -5969,9 +5969,64 @@ class KernelDebuggerTab(ttk.Frame):
         run_with_progress_dialog(self.app, "Continuing execution\u2026", work, done)
 
     def _run_until_bp(self):
-        """Run function freely — only stops at breakpoints (like WinDbg 'g')."""
+        """Run function until next breakpoint (like WinDbg 'g').
+        If already paused, continues from current position to next BP."""
         if not self._ensure_env():
             return
+        kdbg = _kdbg()
+
+        # If already paused — just continue to next breakpoint (same as Continue)
+        if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:
+            trace_tab = self._trace_tab_title or "Trace"
+
+            def work_cont(progress_cb):
+                progress_cb("Continuing to next breakpoint\u2026", 30)
+                result = self._dbg.continue_run()
+                progress_cb("Done", 100)
+                return result
+
+            def done_cont(result):
+                if isinstance(result, Exception):
+                    self.status_var.set(f"\u274C {result}")
+                    self.output.write_to_tab(trace_tab,
+                        f"ERROR: {result}\n", "error")
+                    return
+                tab = self._trace_tab_title or "Trace"
+                kdbg2 = _kdbg()
+                if self._dbg and self._dbg.state == kdbg2.DebugState.PAUSED:
+                    regs = self._dbg.inspect_registers()
+                    eip = regs['eip']
+                    eip_name = regs.get('eip_name', f'0x{eip:08X}')
+                    self.output.write_to_tab(tab,
+                        f"  \u23F8 BREAKPOINT HIT at {eip_name}\n\n", "title")
+                    pairs = [
+                        ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
+                        ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
+                        ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
+                        ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
+                        ("EIP", regs.get("eip", 0)),
+                    ]
+                    reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
+                    self.output.write_to_tab(tab, reg_line + "\n", "ok")
+                    self.status_var.set(
+                        f"\u23F8 Paused at {eip_name} \u2014 use Step / Run Until BP")
+                    self._update_disasm_eip()
+                else:
+                    retval = result.get("return_value", 0) if isinstance(result, dict) else 0
+                    show_trace = self._show_trace_var.get()
+                    if isinstance(result, dict):
+                        report = self._dbg.format_result(result, show_trace=show_trace)
+                        for line in report.split('\n'):
+                            self.output.write_to_tab(tab, line + '\n')
+                    self.status_var.set(
+                        f"\u2705 Completed: 0x{retval:08X} "
+                        f"({kdbg2.ntstatus_name(retval)})")
+
+            run_with_progress_dialog(self.app,
+                "Continuing to next breakpoint\u2026", work_cont, done_cont)
+            return
+
+        # Not paused — start fresh run until a breakpoint fires
         func = self._get_func()
         if not func:
             messagebox.showwarning("Missing", "Enter a function name.")
