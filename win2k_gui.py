@@ -5805,14 +5805,18 @@ class KernelDebuggerTab(ttk.Frame):
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
-                output_write(self.output, f"ERROR: {result}\n", "error")
+                self.output.write_to_tab(self._trace_tab_title or "Run",
+                    f"ERROR: {result}\n", "error")
                 return
             if isinstance(result, dict) and 'error' in result:
                 self.status_var.set(f"\u274C {result['error']}")
-                output_write(self.output,
+                self.output.write_to_tab(self._trace_tab_title or "Run",
                     f"  \u274C {result['error']}\n", "error")
                 return
-            self._write_report(result)
+            # Write report to trace tab without switching
+            trace_tab = self._trace_tab_title or "Run"
+            for line in result.split('\n'):
+                self.output.write_to_tab(trace_tab, line + '\n')
             self.status_var.set("\u2705 Run complete")
 
         run_with_progress_dialog(self.app, f"Running {func}\u2026", work, done)
@@ -5973,28 +5977,39 @@ class KernelDebuggerTab(ttk.Frame):
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
-                output_write(self.output, f"ERROR: {result}\n", "error")
+                self.output.write_to_tab(self._trace_tab_title or "Run\u2192BP",
+                    f"ERROR: {result}\n", "error")
                 return
             if isinstance(result, dict) and 'error' in result:
                 self.status_var.set(f"\u274C {result['error']}")
-                output_write(self.output,
+                self.output.write_to_tab(self._trace_tab_title or "Run\u2192BP",
                     f"  \u274C {result['error']}\n", "error")
                 return
             kdbg = _kdbg()
+            trace_tab = self._trace_tab_title or "Run\u2192BP"
             if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:
                 regs = self._dbg.inspect_registers()
                 eip = regs['eip']
                 eip_name = regs.get('eip_name', f'0x{eip:08X}')
-                output_write(self.output,
+                self.output.write_to_tab(trace_tab,
                     f"  \u23F8 BREAKPOINT HIT at {eip_name}\n\n", "title")
-                self._write_regs(regs)
+                pairs = [
+                    ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
+                    ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
+                    ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
+                    ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
+                    ("EIP", regs.get("eip", 0)),
+                ]
+                reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
+                self.output.write_to_tab(trace_tab, reg_line + "\n", "ok")
                 self.status_var.set(
                     f"\u23F8 Paused at {eip_name} \u2014 use Step / Continue")
                 self._update_disasm_eip()
             else:
                 report = self._dbg.format_result(result,
                                                   show_trace=show_trace)
-                self._write_report(report)
+                for line in report.split('\n'):
+                    self.output.write_to_tab(trace_tab, line + '\n')
                 self.status_var.set("\u2705 Run complete (no BP hit)")
 
         run_with_progress_dialog(self.app,
@@ -6300,6 +6315,24 @@ class KernelDebuggerTab(ttk.Frame):
             messagebox.showwarning("Missing", "Enter a function name.")
             return
 
+        # If a disasm tab for this function already exists, just switch to it
+        tab_title = f"Disasm: {func}"
+        existing_id, existing_w = self.output.find_tab(tab_title)
+        if existing_id and isinstance(existing_w, DisassemblyView):
+            self.output._nb.select(existing_id)
+            self._disasm_view = existing_w
+            # Refresh EIP arrow if paused
+            kdbg = _kdbg()
+            if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:
+                regs = self._dbg.inspect_registers()
+                existing_w.update_eip(regs['eip'])
+            total_insn = sum(len(f['instructions'])
+                             for f in (existing_w._functions or []))
+            self.status_var.set(
+                f"\u2705 Disasm: {func}  ({total_insn} instructions) "
+                f"\u2014 click gutter to set breakpoints")
+            return
+
         def work(progress_cb):
             progress_cb(f"Disassembling {func}\u2026", 20)
             dbg = self._make_session()
@@ -6319,38 +6352,28 @@ class KernelDebuggerTab(ttk.Frame):
                 self.status_var.set("\u26A0 No code found for function")
                 return
 
-            # Reuse existing disassembly tab or create a new one
-            tab_title = f"Disasm: {func}"
-            existing_id, existing_w = self.output.find_tab(tab_title)
-            if existing_id and isinstance(existing_w, DisassemblyView):
-                # Reuse — just select and update
-                self.output._nb.select(existing_id)
-                dv = existing_w
-                self._disasm_view = dv
-                dv.load_functions(functions)
-            else:
-                # Create a new tab with DisassemblyView
-                self.output._counter += 1
-                frm = ttk.Frame(self.output._nb)
-                frm.columnconfigure(0, weight=1)
-                frm.rowconfigure(0, weight=1)
+            # Create a new tab with DisassemblyView
+            self.output._counter += 1
+            frm = ttk.Frame(self.output._nb)
+            frm.columnconfigure(0, weight=1)
+            frm.rowconfigure(0, weight=1)
 
-                dv = DisassemblyView(frm, self)
-                dv.grid(row=0, column=0, sticky="nsew")
+            dv = DisassemblyView(frm, self)
+            dv.grid(row=0, column=0, sticky="nsew")
 
-                # Auto-close oldest if too many tabs
-                tab_ids = self.output._nb.tabs()
-                if len(tab_ids) >= 20:
-                    oldest = tab_ids[0]
-                    self.output._nb.forget(oldest)
-                    self.output._tabs.pop(oldest, None)
+            # Auto-close oldest if too many tabs
+            tab_ids = self.output._nb.tabs()
+            if len(tab_ids) >= 20:
+                oldest = tab_ids[0]
+                self.output._nb.forget(oldest)
+                self.output._tabs.pop(oldest, None)
 
-                self.output._nb.add(frm, text=f"  {tab_title}  ")
-                self.output._nb.select(frm)
-                self._disasm_view = dv
-                self.output._tabs[str(frm)] = dv
+            self.output._nb.add(frm, text=f"  {tab_title}  ")
+            self.output._nb.select(frm)
+            self._disasm_view = dv
+            self.output._tabs[str(frm)] = dv
 
-                dv.load_functions(functions)
+            dv.load_functions(functions)
 
             # Show EIP if paused
             kdbg = _kdbg()
@@ -6361,7 +6384,7 @@ class KernelDebuggerTab(ttk.Frame):
             total_insn = sum(len(f['instructions']) for f in functions)
             self.status_var.set(
                 f"\u2705 Disassembled {len(functions)} function(s), "
-                f"{total_insn} instructions — click gutter to set breakpoints")
+                f"{total_insn} instructions \u2014 click gutter to set breakpoints")
 
         run_with_progress_dialog(self.app, f"Disassembling {func}\u2026", work, done)
 
