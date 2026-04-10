@@ -2384,10 +2384,12 @@ class DebugSession:
     def continue_run(self) -> Optional[dict]:
         """Continue execution from PAUSED state until next breakpoint or end."""
         if self.state != DebugState.PAUSED:
+            print(f"[DBG] continue_run: state={self.state}, not PAUSED — aborting", flush=True)
             return None
 
         uc = self.env.uc
         eip = uc.reg_read(UC_X86_REG_EIP)
+        print(f"[DBG] continue_run: EIP=0x{eip:08X}  breakpoints={[hex(a) for a in self._breakpoints]}", flush=True)
 
         # If paused at a breakpoint, single-step past it first so we don't
         # re-trigger the same breakpoint immediately.
@@ -2433,6 +2435,8 @@ class DebugSession:
 
         if self.state == DebugState.PAUSED:
             # Hit another breakpoint
+            eip2 = uc.reg_read(UC_X86_REG_EIP)
+            print(f"[DBG] continue_run: hit BP at EIP=0x{eip2:08X}", flush=True)
             return {
                 "state": "paused",
                 "return_value": eax,
@@ -2443,6 +2447,7 @@ class DebugSession:
 
         self._cleanup_hooks()
         self.state = DebugState.STOPPED
+        print(f"[DBG] continue_run: function completed, stop_reason={self._stop_reason!r}", flush=True)
         rs = self._run_state or {}
         return {
             "function": rs.get("func_name", "?"),

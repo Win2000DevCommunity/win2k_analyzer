@@ -6005,7 +6005,12 @@ class KernelDebuggerTab(ttk.Frame):
                     return
                 tab = self._trace_tab_title or "Trace"
                 kdbg2 = _kdbg()
-                if self._dbg and self._dbg.state == kdbg2.DebugState.PAUSED:
+                # Use result dict state as primary truth (consistent with _continue)
+                got_bp = (isinstance(result, dict) and
+                          result.get("state") == "paused") or (
+                          self._dbg and
+                          self._dbg.state == kdbg2.DebugState.PAUSED)
+                if got_bp and self._dbg:
                     regs = self._dbg.inspect_registers()
                     eip = regs['eip']
                     eip_name = regs.get('eip_name', f'0x{eip:08X}')
@@ -6024,9 +6029,18 @@ class KernelDebuggerTab(ttk.Frame):
                         f"\u23F8 Paused at {eip_name} \u2014 use Step / Run Until BP")
                     self._update_disasm_eip()
                 else:
+                    # Function completed — clear EIP arrow in disassembly
+                    if self._disasm_view:
+                        try:
+                            self._disasm_view.clear_eip()
+                        except Exception:
+                            pass
                     retval = result.get("return_value", 0) if isinstance(result, dict) else 0
                     show_trace = self._show_trace_var.get()
                     if isinstance(result, dict):
+                        self.output.write_to_tab(tab,
+                            f"\n  \u26A0 No more breakpoints hit on this code path "
+                            f"(args may skip some branches)\n", "error")
                         report = self._dbg.format_result(result, show_trace=show_trace)
                         for line in report.split('\n'):
                             self.output.write_to_tab(tab, line + '\n')
