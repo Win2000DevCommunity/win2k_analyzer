@@ -636,6 +636,33 @@ class TabbedOutput(ttk.Frame):
                     return txt
         return self.new_tab(title)
 
+    def write_to_tab(self, title, content, tag=None):
+        """Write *content* to the tab named *title* WITHOUT switching to it.
+        Creates the tab (hidden) if it doesn't exist yet."""
+        target = None
+        for tab_id in self._nb.tabs():
+            if self._nb.tab(tab_id, "text").strip() == title:
+                target = self._tabs.get(tab_id)
+                break
+        if target is None:
+            # Tab doesn't exist — create it but stay on current tab
+            cur_sel = self._nb.select()
+            target = self.new_tab(title)
+            if cur_sel:
+                self._nb.select(cur_sel)
+        # Write to the target tab directly
+        target.configure(state="normal")
+        target.insert("end", content, (tag,) if tag else ())
+        target.see("end")
+        target.configure(state="disabled")
+
+    def find_tab(self, title):
+        """Return (tab_id, widget) for a tab with given title, or (None, None)."""
+        for tab_id in self._nb.tabs():
+            if self._nb.tab(tab_id, "text").strip() == title:
+                return tab_id, self._tabs.get(tab_id)
+        return None, None
+
     def clear_current(self):
         """Clear the currently active tab's text."""
         c = self._cur()
@@ -5512,6 +5539,8 @@ class KernelDebuggerTab(ttk.Frame):
                    command=self._step).pack(side="left", padx=2)
         ttk.Button(bf2, text="\u25B6\u25B6 Continue",
                    command=self._continue).pack(side="left", padx=2)
+        ttk.Button(bf2, text="\u25B6 Run Until BP",
+                   command=self._run_until_bp).pack(side="left", padx=2)
         ttk.Separator(bf2, orient="vertical").pack(side="left", padx=6, fill="y")
         ttk.Button(bf2, text="\U0001F6D1 Set Breakpoint",
                    command=self._add_breakpoint).pack(side="left", padx=2)
@@ -5872,35 +5901,93 @@ class KernelDebuggerTab(ttk.Frame):
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
-                if self._trace_tab_title:
-                    self.output.get_or_create_tab(self._trace_tab_title)
-                output_write(self.output, f"ERROR: {result}\n", "error")
+                trace_tab = self._trace_tab_title or "Trace"
+                self.output.write_to_tab(trace_tab,
+                    f"ERROR: {result}\n", "error")
                 return
-            # Switch to trace tab for continue output
-            if self._trace_tab_title:
-                self.output.get_or_create_tab(self._trace_tab_title)
+            # Write continue output to trace tab WITHOUT switching
+            trace_tab = self._trace_tab_title or "Trace"
             kdbg2 = _kdbg()
             if result.get("state") == "paused":
                 regs = self._dbg.inspect_registers()
                 eip = regs['eip']
                 eip_name = regs.get('eip_name', f'0x{eip:08X}')
-                output_write(self.output,
+                self.output.write_to_tab(trace_tab,
                     f"\n  \u23F8 Breakpoint at {eip_name}\n", "title")
-                self._write_regs(regs)
+                # Write registers to trace tab
+                pairs = [
+                    ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
+                    ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
+                    ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
+                    ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
+                    ("EIP", regs.get("eip", 0)),
+                ]
+                reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
+                self.output.write_to_tab(trace_tab, reg_line + "\n", "ok")
                 self.status_var.set(f"\u23F8 Paused at {eip_name}")
                 self._update_disasm_eip()
             else:
                 retval = result.get("return_value", 0)
-                # Full report with registers/stack/call stack
                 show_trace = self._show_trace_var.get()
                 report = self._dbg.format_result(result,
                                                   show_trace=show_trace)
-                self._write_report(report)
+                # Write completion report to trace tab
+                for line in report.split('\n'):
+                    self.output.write_to_tab(trace_tab, line + '\n')
                 self.status_var.set(
                     f"\u2705 Completed: 0x{retval:08X} "
                     f"({kdbg2.ntstatus_name(retval)})")
 
         run_with_progress_dialog(self.app, "Continuing execution\u2026", work, done)
+
+    def _run_until_bp(self):
+        """Run function freely — only stops at breakpoints (like WinDbg 'g')."""
+        if not self._ensure_env():
+            return
+        func = self._get_func()
+        if not func:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+        args = self._parse_args()
+        show_trace = self._show_trace_var.get()
+        user_mode = self._user_mode_var.get()
+        tab_title = f"Run\u2192BP: {func}"
+        self.output.new_tab(tab_title)
+        self._trace_tab_title = tab_title
+
+        def work(progress_cb):
+            progress_cb(f"Resolving {func}\u2026", 10)
+            dbg = self._make_session()
+            progress_cb(f"Running {func} until breakpoint\u2026", 30)
+            result = dbg.run(func, args=args, show_trace=show_trace,
+                             user_mode=user_mode)
+            progress_cb("Done", 100)
+            return result
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            kdbg = _kdbg()
+            if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:
+                regs = self._dbg.inspect_registers()
+                eip = regs['eip']
+                eip_name = regs.get('eip_name', f'0x{eip:08X}')
+                output_write(self.output,
+                    f"  \u23F8 BREAKPOINT HIT at {eip_name}\n\n", "title")
+                self._write_regs(regs)
+                self.status_var.set(
+                    f"\u23F8 Paused at {eip_name} \u2014 use Step / Continue")
+                self._update_disasm_eip()
+            else:
+                report = self._dbg.format_result(result,
+                                                  show_trace=show_trace)
+                self._write_report(report)
+                self.status_var.set("\u2705 Run complete (no BP hit)")
+
+        run_with_progress_dialog(self.app,
+            f"Running {func} until breakpoint\u2026", work, done)
 
     # ── breakpoints ───────────────────────────────────────────────────────
 
@@ -6221,30 +6308,38 @@ class KernelDebuggerTab(ttk.Frame):
                 self.status_var.set("\u26A0 No code found for function")
                 return
 
-            # Create a new tab with DisassemblyView
+            # Reuse existing disassembly tab or create a new one
             tab_title = f"Disasm: {func}"
-            self.output._counter += 1
-            frm = ttk.Frame(self.output._nb)
-            frm.columnconfigure(0, weight=1)
-            frm.rowconfigure(0, weight=1)
+            existing_id, existing_w = self.output.find_tab(tab_title)
+            if existing_id and isinstance(existing_w, DisassemblyView):
+                # Reuse — just select and update
+                self.output._nb.select(existing_id)
+                dv = existing_w
+                self._disasm_view = dv
+                dv.load_functions(functions)
+            else:
+                # Create a new tab with DisassemblyView
+                self.output._counter += 1
+                frm = ttk.Frame(self.output._nb)
+                frm.columnconfigure(0, weight=1)
+                frm.rowconfigure(0, weight=1)
 
-            dv = DisassemblyView(frm, self)
-            dv.grid(row=0, column=0, sticky="nsew")
+                dv = DisassemblyView(frm, self)
+                dv.grid(row=0, column=0, sticky="nsew")
 
-            # Auto-close oldest if too many tabs
-            tab_ids = self.output._nb.tabs()
-            if len(tab_ids) >= 20:
-                oldest = tab_ids[0]
-                self.output._nb.forget(oldest)
-                self.output._tabs.pop(oldest, None)
+                # Auto-close oldest if too many tabs
+                tab_ids = self.output._nb.tabs()
+                if len(tab_ids) >= 20:
+                    oldest = tab_ids[0]
+                    self.output._nb.forget(oldest)
+                    self.output._tabs.pop(oldest, None)
 
-            self.output._nb.add(frm, text=f"  {tab_title}  ")
-            self.output._nb.select(frm)
-            # Store reference for later (e.g., EIP updates)
-            self._disasm_view = dv
-            self.output._tabs[str(frm)] = dv
+                self.output._nb.add(frm, text=f"  {tab_title}  ")
+                self.output._nb.select(frm)
+                self._disasm_view = dv
+                self.output._tabs[str(frm)] = dv
 
-            dv.load_functions(functions)
+                dv.load_functions(functions)
 
             # Show EIP if paused
             kdbg = _kdbg()
