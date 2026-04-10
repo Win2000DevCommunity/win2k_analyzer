@@ -1097,6 +1097,36 @@ class KernelEnvironment:
                 return mod
         return None
 
+    def describe_address(self, va: int) -> str:
+        """Return a human-readable label for any address in the environment."""
+        # Check modules first
+        mod = self.find_module_at(va)
+        if mod:
+            fi = self.find_function_at(va)
+            if fi:
+                return f"{fi[1]}!{fi[0]}"
+            return f"{mod.name}+0x{va - mod.image_base:X}"
+        # Stub hooks
+        if va in self._stub_hooks:
+            dll, func = self._stub_hooks[va]
+            return f"[stub] {dll}!{func}"
+        # Return sled
+        if hasattr(self, '_ret_sled') and va == self._ret_sled:
+            return "[return sled]"
+        # Stack
+        if hasattr(self, '_stack_base') and self._stack_base <= va < self._stack_top:
+            return f"[stack]+0x{va - self._stack_base:X}"
+        # Heap
+        if hasattr(self, '_heap_base') and self._heap_base <= va < self._heap_base + _ENV_HEAP_SIZE:
+            return f"[heap]+0x{va - self._heap_base:X}"
+        # Stubs area
+        if hasattr(self, '_stub_base') and self._stub_base <= va < self._stub_base + _ENV_STUB_SIZE:
+            return f"[import stub]+0x{va - self._stub_base:X}"
+        # Object pool
+        if hasattr(self, '_obj_pool_base') and self._obj_pool_base <= va < self._obj_pool_base + _ENV_OBJ_POOL_SIZE:
+            return f"[obj pool]+0x{va - self._obj_pool_base:X}"
+        return f"0x{va:08X}"
+
     def find_function_at(self, va: int) -> Optional[Tuple[str, str]]:
         """Find function name + module at VA, searching exports and symbols."""
         mod = self.find_module_at(va)
@@ -2518,11 +2548,12 @@ class DebugSession:
         # Current frame
         func_info = self.env.find_function_at(eip)
         mod = self.env.find_module_at(eip)
+        label = self.env.describe_address(eip)
         frames.append(StackFrame(
             return_address=eip,
             frame_pointer=ebp,
             module=mod.name if mod else "",
-            function=func_info[0] if func_info else f"0x{eip:08X}",
+            function=func_info[0] if func_info else label,
         ))
 
         # Walk EBP chain
@@ -2539,11 +2570,12 @@ class DebugSession:
 
             func_info = self.env.find_function_at(ret_addr)
             mod = self.env.find_module_at(ret_addr)
+            label = self.env.describe_address(ret_addr)
             frames.append(StackFrame(
                 return_address=ret_addr,
                 frame_pointer=next_ebp,
                 module=mod.name if mod else "",
-                function=func_info[0] if func_info else f"0x{ret_addr:08X}",
+                function=func_info[0] if func_info else label,
             ))
 
             ebp = next_ebp
@@ -2678,6 +2710,83 @@ class DebugSession:
         # Sort by address for stable display
         results.sort(key=lambda r: r['address'])
         return results
+
+    # ----------------------------------------------------------- cross-references
+
+    def find_callers(self, target: str) -> List[dict]:
+        """Find all call sites to a function across all loaded modules.
+
+        Returns list of dicts:
+        {
+            'caller_address': int,        # address of the CALL instruction
+            'caller_module': str,         # module containing the call
+            'caller_function': str,       # nearest function name at call site
+            'target_address': int,        # resolved target VA
+            'target_name': str,           # target function name
+        }
+        """
+        # Resolve target to VA
+        if isinstance(target, str):
+            result = self.env.resolve_function(target)
+            if result is None:
+                raise ValueError(f"Cannot resolve function: {target}")
+            target_va = result[0]
+            target_name = target
+        else:
+            target_va = target
+            fi = self.env.find_function_at(target_va)
+            target_name = fi[0] if fi else f"0x{target_va:08X}"
+
+        # Also find stub addresses for this function (in case calls go through IAT)
+        target_addrs = {target_va}
+        for stub_va, (dll, func) in self.env._stub_hooks.items():
+            if func == target_name:
+                target_addrs.add(stub_va)
+
+        callers = []
+        cs = self.env.cs
+
+        for mod in self.env.modules.values():
+            # Scan all executable sections
+            if not mod.pe:
+                continue
+            for sec in mod.pe.sections:
+                chars = sec.Characteristics
+                # IMAGE_SCN_MEM_EXECUTE = 0x20000000
+                if not (chars & 0x20000000):
+                    continue
+
+                sec_va = mod.image_base + sec.VirtualAddress
+                sec_size = sec.Misc_VirtualSize or sec.SizeOfRawData
+                try:
+                    code = bytes(self.env.uc.mem_read(sec_va, sec_size))
+                except Exception:
+                    continue
+
+                for insn in cs.disasm(code, sec_va):
+                    if insn.mnemonic != 'call':
+                        continue
+                    # Parse call target
+                    op = insn.op_str.strip()
+                    call_target = None
+                    if op.startswith('0x') or op.startswith('0X'):
+                        try:
+                            call_target = int(op, 16)
+                        except ValueError:
+                            pass
+
+                    if call_target and call_target in target_addrs:
+                        fi = self.env.find_function_at(insn.address)
+                        callers.append({
+                            'caller_address': insn.address,
+                            'caller_module': mod.name,
+                            'caller_function': fi[0] if fi else f"sub_{insn.address:08X}",
+                            'target_address': call_target,
+                            'target_name': target_name,
+                        })
+
+        callers.sort(key=lambda c: c['caller_address'])
+        return callers
 
     # ----------------------------------------------------------- events
 

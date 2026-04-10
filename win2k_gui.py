@@ -5539,6 +5539,8 @@ class KernelDebuggerTab(ttk.Frame):
         ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
         ttk.Button(bf3, text="\U0001F4CB Disassemble",
                    command=self._disassemble).pack(side="left", padx=2)
+        ttk.Button(bf3, text="\U0001F50D Find Callers",
+                   command=self._find_callers).pack(side="left", padx=2)
 
         # Row 7 — status + progress
         self.status_var, self._prog_start, self._prog_stop = \
@@ -5891,14 +5893,147 @@ class KernelDebuggerTab(ttk.Frame):
         if not bps:
             self.status_var.set("No breakpoints set")
             return
-        self.output.new_tab("Breakpoints")
-        output_write(self.output, "  BREAKPOINTS\n\n", "title")
+
+        # Create interactive breakpoint tab
+        self.output._counter += 1
+        frm = ttk.Frame(self.output._nb)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        # Toolbar
+        tb = tk.Frame(frm, bg=T["bg"])
+        tb.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ttk.Button(tb, text="Delete All",
+                   command=lambda: self._bp_delete_all(frm)).pack(side="right", padx=4)
+        ttk.Button(tb, text="Refresh",
+                   command=lambda: self._bp_refresh(frm, bp_list)).pack(side="right", padx=4)
+
+        # Scrollable list
+        canvas = tk.Canvas(frm, bg=T["bg_dark"], highlightthickness=0)
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=canvas.yview)
+        bp_list = tk.Frame(canvas, bg=T["bg_dark"])
+        bp_list.bind("<Configure>",
+                     lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=bp_list, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        vsb.grid(row=1, column=1, sticky="ns")
+        frm.columnconfigure(0, weight=1)
+
+        # Auto-close oldest
+        tab_ids = self.output._nb.tabs()
+        if len(tab_ids) >= 20:
+            oldest = tab_ids[0]
+            self.output._nb.forget(oldest)
+            self.output._tabs.pop(oldest, None)
+
+        self.output._nb.add(frm, text="  Breakpoints  ")
+        self.output._nb.select(frm)
+        self.output._tabs[str(frm)] = canvas  # store for tab tracking
+
+        self._bp_refresh(frm, bp_list)
+
+    def _bp_refresh(self, frm, bp_list):
+        """Refresh the interactive breakpoint list."""
+        for w in bp_list.winfo_children():
+            w.destroy()
+
+        if not self._dbg:
+            return
+        bps = self._dbg.list_breakpoints()
+
+        if not bps:
+            lbl = tk.Label(bp_list, text="  No breakpoints set",
+                           bg=T["bg_dark"], fg="#888888",
+                           font=("Consolas", 10))
+            lbl.pack(anchor="w", padx=8, pady=8)
+            return
+
+        # Header
+        hdr = tk.Frame(bp_list, bg=T["bg"])
+        hdr.pack(fill="x", padx=4, pady=(4, 2))
+        for col, w in [("ID", 4), ("Address", 12), ("Name", 36),
+                        ("Hits", 6), ("State", 8), ("", 14)]:
+            tk.Label(hdr, text=col, bg=T["bg"], fg="#AAAAAA",
+                     font=("Consolas", 9, "bold"), width=w,
+                     anchor="w").pack(side="left")
+
         for bp in bps:
-            tag = "ok" if bp.enabled else "dim"
-            output_write(self.output,
-                f"  #{bp.id:2d}  0x{bp.address:08X}  {bp.name:30s}  "
-                f"hits={bp.hit_count}  "
-                f"{'enabled' if bp.enabled else 'disabled'}\n", tag)
+            row = tk.Frame(bp_list, bg=T["bg_dark"])
+            row.pack(fill="x", padx=4, pady=1)
+
+            fg = T["fg"] if bp.enabled else "#666666"
+            tk.Label(row, text=f"#{bp.id}", bg=T["bg_dark"], fg=fg,
+                     font=("Consolas", 10), width=4,
+                     anchor="w").pack(side="left")
+            tk.Label(row, text=f"0x{bp.address:08X}", bg=T["bg_dark"],
+                     fg="#DCDCAA", font=("Consolas", 10), width=12,
+                     anchor="w").pack(side="left")
+            tk.Label(row, text=bp.name, bg=T["bg_dark"], fg=fg,
+                     font=("Consolas", 10), width=36,
+                     anchor="w").pack(side="left")
+            tk.Label(row, text=str(bp.hit_count), bg=T["bg_dark"],
+                     fg="#888888", font=("Consolas", 10), width=6,
+                     anchor="w").pack(side="left")
+
+            state_text = "enabled" if bp.enabled else "disabled"
+            state_fg = "#4EC9B0" if bp.enabled else "#D16969"
+            tk.Label(row, text=state_text, bg=T["bg_dark"], fg=state_fg,
+                     font=("Consolas", 10), width=8,
+                     anchor="w").pack(side="left")
+
+            # Toggle button
+            toggle_text = "Disable" if bp.enabled else "Enable"
+            bp_id = bp.id
+            ttk.Button(row, text=toggle_text, width=7,
+                       command=lambda bid=bp_id: self._bp_toggle(bid, frm, bp_list)
+                       ).pack(side="left", padx=2)
+
+            # Delete button
+            ttk.Button(row, text="\u2716", width=3,
+                       command=lambda bid=bp_id: self._bp_delete(bid, frm, bp_list)
+                       ).pack(side="left", padx=2)
+
+    def _bp_toggle(self, bp_id, frm, bp_list):
+        """Toggle a breakpoint enabled/disabled."""
+        if not self._dbg:
+            return
+        for bp in self._dbg.list_breakpoints():
+            if bp.id == bp_id:
+                bp.enabled = not bp.enabled
+                break
+        if self._disasm_view:
+            self._disasm_view._refresh_breakpoint_markers()
+        self._bp_refresh(frm, bp_list)
+
+    def _bp_delete(self, bp_id, frm, bp_list):
+        """Delete a single breakpoint."""
+        if not self._dbg:
+            return
+        self._dbg.remove_breakpoint(bp_id)
+        if self._disasm_view:
+            self._disasm_view._refresh_breakpoint_markers()
+        self._bp_refresh(frm, bp_list)
+        self.status_var.set(f"Breakpoint #{bp_id} deleted")
+
+    def _bp_delete_all(self, frm):
+        """Delete all breakpoints."""
+        if not self._dbg:
+            return
+        for bp in list(self._dbg.list_breakpoints()):
+            self._dbg.remove_breakpoint(bp.id)
+        if self._disasm_view:
+            self._disasm_view._refresh_breakpoint_markers()
+        # Find bp_list frame inside frm
+        for w in frm.winfo_children():
+            if isinstance(w, tk.Canvas):
+                for child_id in w.find_all():
+                    widget = w.nametowidget(w.itemcget(child_id, 'window'))
+                    if isinstance(widget, tk.Frame):
+                        self._bp_refresh(frm, widget)
+                        break
+                break
+        self.status_var.set("All breakpoints deleted")
 
     # ── inspection ────────────────────────────────────────────────────────
 
@@ -5963,10 +6098,14 @@ class KernelDebuggerTab(ttk.Frame):
             output_write(self.output, "  (empty)\n", "dim")
             return
         for i, f in enumerate(frames):
-            mod = f.module or "???"
-            func = f.function or f"0x{f.return_address:08X}"
+            mod = f.module or ""
+            func = f.function or self._env.describe_address(f.return_address)
+            if mod:
+                display = f"{mod}!{func}"
+            else:
+                display = func
             output_write(self.output,
-                f"  #{i:2d}  {mod}!{func}  "
+                f"  #{i:2d}  {display}  "
                 f"(FP=0x{f.frame_pointer:08X})\n", "ok")
 
     def _show_stack_mem(self):
@@ -6070,6 +6209,66 @@ class KernelDebuggerTab(ttk.Frame):
                 f"{total_insn} instructions — click gutter to set breakpoints")
 
         run_with_progress_dialog(self.app, f"Disassembling {func}\u2026", work, done)
+
+    # ── cross-references ──────────────────────────────────────────────────
+
+    def _find_callers(self):
+        if not self._ensure_env():
+            return
+        func = self._get_func()
+        if not func:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+
+        def work(progress_cb):
+            progress_cb(f"Scanning all modules for calls to {func}\u2026", 20)
+            dbg = self._make_session()
+            callers = dbg.find_callers(func)
+            progress_cb("Done", 100)
+            return callers
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+
+            callers = result
+            self.output.new_tab(f"Callers: {func}")
+            output_write(self.output,
+                f"  CROSS-REFERENCES: calls to {func}\n", "title")
+            output_write(self.output,
+                f"  Found {len(callers)} call site(s)\n\n", "ok")
+
+            if not callers:
+                output_write(self.output,
+                    "  No direct CALL instructions found.\n"
+                    "  (Indirect calls via function pointers are not tracked)\n",
+                    "dim")
+                self.status_var.set(f"\u26A0 No callers found for {func}")
+                return
+
+            output_write(self.output,
+                f"  {'Address':12s}  {'Module':16s}  {'Calling Function'}\n",
+                "heading")
+            output_write(self.output,
+                f"  {'─'*12}  {'─'*16}  {'─'*40}\n", "dim")
+
+            for c in callers:
+                addr_str = f"0x{c['caller_address']:08X}"
+                output_write(self.output,
+                    f"  {addr_str:12s}  {c['caller_module']:16s}  "
+                    f"{c['caller_function']}\n")
+
+            output_write(self.output,
+                f"\n  Tip: Copy an address above into the Breakpoint field "
+                f"to break when {func} is called from that site.\n", "dim")
+
+            self.status_var.set(
+                f"\U0001F50D {len(callers)} call site(s) found for {func}")
+
+        run_with_progress_dialog(self.app,
+            f"Scanning for callers of {func}\u2026", work, done)
 
 if __name__ == '__main__':
     app = App()
