@@ -818,6 +818,15 @@ class KernelEnvironment:
 
     def _resolve_all_imports(self):
         """Wire up IAT entries across all loaded modules."""
+        # Clear unresolved lists — we rebuild them fresh each pass
+        for mod in self.modules.values():
+            mod.unresolved.clear()
+
+        # Track which IAT slots already have stubs to avoid duplicates
+        iat_stubbed: Dict[int, int] = {}  # imp.address -> stub_va
+        for stub_va, info in self._stub_hooks.items():
+            pass  # we'll rebuild from scratch below
+
         for mod in self.modules.values():
             if not hasattr(mod.pe, 'DIRECTORY_ENTRY_IMPORT'):
                 continue
@@ -848,10 +857,19 @@ class KernelEnvironment:
                         self._write_iat(imp.address, resolved_va)
                         self._resolved_imports[resolved_va] = (dll, func_name)
                     else:
-                        # Unresolved — create stub for mock hooking
-                        stub = self._alloc_stub()
-                        self._write_iat(imp.address, stub)
-                        self._stub_hooks[stub] = (dll, func_name)
+                        # Unresolved — reuse existing stub or create new one
+                        key = (dll, func_name)
+                        existing = None
+                        for sva, sinfo in self._stub_hooks.items():
+                            if sinfo == key:
+                                existing = sva
+                                break
+                        if existing:
+                            self._write_iat(imp.address, existing)
+                        else:
+                            stub = self._alloc_stub()
+                            self._write_iat(imp.address, stub)
+                            self._stub_hooks[stub] = key
                         mod.unresolved.append((dll, func_name))
 
     def _find_target_module(self, dll_name: str) -> Optional[LoadedModule]:
