@@ -5109,6 +5109,324 @@ class PEPatcherTab(ttk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Interactive Disassembly View (used by Kernel Debugger)
+# ══════════════════════════════════════════════════════════════════════════
+
+class DisassemblyView(tk.Frame):
+    """Interactive disassembly view with clickable breakpoint gutter.
+
+    Shows disassembled functions with:
+    - Line numbers in the left margin
+    - Red breakpoint dots (●) that can be toggled by clicking
+    - Address, hex bytes, mnemonic, operands for each instruction
+    - Call target annotations with function names
+    - Current EIP indicator (yellow arrow ►)
+    """
+
+    # Breakpoint dot character and colors
+    _BP_CHAR = "\u25CF"   # ● filled circle
+    _BP_COLOR = "#E51400"  # red
+    _EIP_CHAR = "\u25B6"  # ► arrow
+    _EIP_COLOR = "#FFD700"  # gold
+
+    def __init__(self, parent, debugger_tab):
+        super().__init__(parent, bg=T["bg_dark"])
+        self._dtab = debugger_tab
+        self._functions = []    # list of dicts from disassemble_function
+        self._addr_to_line = {} # address -> line number (1-based)
+        self._line_to_addr = {} # line number -> address
+        self._bp_lines = set()  # lines with breakpoints
+        self._eip_line = None   # line with current EIP
+
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        # Gutter (breakpoints + line numbers)
+        self._gutter = tk.Text(
+            self, width=8, bg=T["bg"], fg="#888888",
+            font=("Consolas", 10), relief="flat", bd=4,
+            cursor="hand2", state="disabled",
+            wrap="none", highlightthickness=0,
+            selectbackground=T["bg"], selectforeground="#888888",
+        )
+        self._gutter.grid(row=0, column=0, sticky="ns")
+
+        # Main disassembly text
+        self._text = tk.Text(
+            self, bg=T["bg_dark"], fg=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=8,
+            wrap="none", state="disabled",
+            insertbackground=T["fg"], highlightthickness=0,
+        )
+        self._text.grid(row=0, column=1, sticky="nsew")
+
+        # Scrollbar
+        self._sb = ttk.Scrollbar(self, command=self._on_scroll)
+        self._sb.grid(row=0, column=2, sticky="ns")
+        self._text.configure(yscrollcommand=self._sync_scroll)
+
+        # Horizontal scrollbar
+        self._hsb = ttk.Scrollbar(self, orient="horizontal",
+                                   command=self._text.xview)
+        self._hsb.grid(row=1, column=1, sticky="ew")
+        self._text.configure(xscrollcommand=self._hsb.set)
+
+        # Configure tags
+        self._text.tag_configure("func_header", foreground="#569CD6",
+                                  font=("Consolas", 10, "bold"))
+        self._text.tag_configure("address", foreground="#DCDCAA")
+        self._text.tag_configure("hexbytes", foreground="#666666")
+        self._text.tag_configure("mnemonic", foreground="#C586C0")
+        self._text.tag_configure("mnemonic_call", foreground="#4EC9B0",
+                                  font=("Consolas", 10, "bold"))
+        self._text.tag_configure("mnemonic_jmp", foreground="#CE9178")
+        self._text.tag_configure("mnemonic_ret", foreground="#D16969",
+                                  font=("Consolas", 10, "bold"))
+        self._text.tag_configure("operand", foreground="#D4D4D4")
+        self._text.tag_configure("call_target", foreground="#4EC9B0")
+        self._text.tag_configure("separator", foreground="#444444")
+        self._text.tag_configure("eip_line", background="#3A3A00")
+        self._text.tag_configure("bp_line", background="#3A1010")
+
+        self._gutter.tag_configure("bp_dot", foreground=self._BP_COLOR,
+                                    font=("Consolas", 10, "bold"))
+        self._gutter.tag_configure("eip_arrow", foreground=self._EIP_COLOR,
+                                    font=("Consolas", 10, "bold"))
+        self._gutter.tag_configure("linenum", foreground="#555555")
+
+        # Bind click on gutter
+        self._gutter.bind("<Button-1>", self._on_gutter_click)
+
+        # Sync scrolling
+        self._text.bind("<MouseWheel>", self._on_mousewheel)
+        self._gutter.bind("<MouseWheel>", self._on_mousewheel)
+
+    def _on_scroll(self, *args):
+        self._text.yview(*args)
+        self._gutter.yview(*args)
+
+    def _sync_scroll(self, first, last):
+        self._sb.set(first, last)
+        self._gutter.yview_moveto(first)
+
+    def _on_mousewheel(self, event):
+        delta = -1 * (event.delta // 120)
+        self._text.yview_scroll(delta, "units")
+        self._gutter.yview_scroll(delta, "units")
+        return "break"
+
+    def load_functions(self, functions: list):
+        """Load disassembled functions into the view."""
+        self._functions = functions
+        self._addr_to_line.clear()
+        self._line_to_addr.clear()
+        self._bp_lines.clear()
+        self._eip_line = None
+
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        self._gutter.configure(state="normal")
+        self._gutter.delete("1.0", "end")
+
+        line_num = 0
+
+        for fi, func in enumerate(functions):
+            if fi > 0:
+                # Separator between functions
+                line_num += 1
+                self._text.insert("end",
+                    "\u2500" * 80 + "\n", "separator")
+                self._gutter.insert("end", "\n")
+
+            # Function header
+            line_num += 1
+            header = f"  {func['module']}!{func['name']}  (0x{func['address']:08X})\n"
+            self._text.insert("end", header, "func_header")
+            self._gutter.insert("end", "\n")
+
+            # Instructions
+            for insn in func['instructions']:
+                line_num += 1
+                self._addr_to_line[insn['address']] = line_num
+                self._line_to_addr[line_num] = insn['address']
+
+                # Address column
+                addr_str = f"  {insn['address']:08X}  "
+                self._text.insert("end", addr_str, "address")
+
+                # Hex bytes
+                hex_str = insn['bytes'].hex().upper()
+                hex_str = ' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))
+                hex_col = f"{hex_str:24s} "
+                self._text.insert("end", hex_col, "hexbytes")
+
+                # Mnemonic
+                mn = insn['mnemonic']
+                if mn in ('call',):
+                    mn_tag = "mnemonic_call"
+                elif mn in ('jmp', 'je', 'jne', 'jz', 'jnz', 'ja', 'jb',
+                            'jae', 'jbe', 'jg', 'jl', 'jge', 'jle',
+                            'jna', 'jnb', 'jnae', 'jnbe', 'jng', 'jnl',
+                            'jnge', 'jnle', 'jo', 'jno', 'js', 'jns',
+                            'jp', 'jnp', 'jcxz', 'jecxz', 'loop',
+                            'loope', 'loopne'):
+                    mn_tag = "mnemonic_jmp"
+                elif mn in ('ret', 'retn', 'retf'):
+                    mn_tag = "mnemonic_ret"
+                else:
+                    mn_tag = "mnemonic"
+                self._text.insert("end", f"{mn:8s}", mn_tag)
+
+                # Operands
+                op_str = insn['op_str']
+                self._text.insert("end", f" {op_str}", "operand")
+
+                # Call target annotation
+                if insn.get('call_name'):
+                    self._text.insert("end",
+                        f"    ; {insn['call_name']}", "call_target")
+
+                self._text.insert("end", "\n")
+
+                # Gutter line number
+                self._gutter.insert("end",
+                    f" {line_num:5d} \n", "linenum")
+
+        self._text.configure(state="disabled")
+        self._gutter.configure(state="disabled")
+
+        # Now mark existing breakpoints
+        self._refresh_breakpoint_markers()
+
+    def _on_gutter_click(self, event):
+        """Toggle breakpoint on clicked line."""
+        # Get line number from click position
+        idx = self._gutter.index(f"@{event.x},{event.y}")
+        line = int(idx.split('.')[0])
+
+        addr = self._line_to_addr.get(line)
+        if addr is None:
+            return  # clicked on non-instruction line
+
+        dbg = self._dtab._dbg
+        if not dbg:
+            dbg = self._dtab._make_session()
+
+        if line in self._bp_lines:
+            # Remove breakpoint
+            for bp in dbg.list_breakpoints():
+                if bp.address == addr:
+                    dbg.remove_breakpoint(bp.id)
+                    break
+            self._bp_lines.discard(line)
+        else:
+            # Set breakpoint
+            try:
+                dbg.set_breakpoint(addr)
+                self._bp_lines.add(line)
+            except Exception as e:
+                self._dtab.status_var.set(f"\u274C {e}")
+                return
+
+        self._refresh_breakpoint_markers()
+        self._refresh_line_highlights()
+
+        # Update status
+        bp_count = len(self._bp_lines)
+        self._dtab.status_var.set(
+            f"\U0001F6D1 {bp_count} breakpoint{'s' if bp_count != 1 else ''} set")
+
+    def _refresh_breakpoint_markers(self):
+        """Refresh breakpoint dots in gutter and sync with debugger state."""
+        dbg = self._dtab._dbg
+        bp_addrs = set()
+        if dbg:
+            for bp in dbg.list_breakpoints():
+                if bp.enabled:
+                    bp_addrs.add(bp.address)
+
+        self._bp_lines.clear()
+        for addr in bp_addrs:
+            if addr in self._addr_to_line:
+                self._bp_lines.add(self._addr_to_line[addr])
+
+        # Redraw gutter
+        self._gutter.configure(state="normal")
+
+        # Remove old bp_dot tags
+        self._gutter.tag_remove("bp_dot", "1.0", "end")
+
+        for line in self._bp_lines:
+            # Replace the first char of the gutter line with a red dot
+            line_start = f"{line}.0"
+            line_end = f"{line}.1"
+            self._gutter.delete(line_start, line_end)
+            self._gutter.insert(line_start, self._BP_CHAR, "bp_dot")
+
+        self._gutter.configure(state="disabled")
+        self._refresh_line_highlights()
+
+    def _refresh_line_highlights(self):
+        """Highlight lines with breakpoints and EIP."""
+        self._text.configure(state="normal")
+        self._text.tag_remove("bp_line", "1.0", "end")
+        self._text.tag_remove("eip_line", "1.0", "end")
+
+        for line in self._bp_lines:
+            self._text.tag_add("bp_line", f"{line}.0", f"{line}.end")
+
+        if self._eip_line:
+            self._text.tag_add("eip_line",
+                f"{self._eip_line}.0", f"{self._eip_line}.end")
+
+        self._text.configure(state="disabled")
+
+    def update_eip(self, eip_addr: int):
+        """Update the current EIP indicator."""
+        # Remove old EIP marker
+        if self._eip_line:
+            self._gutter.configure(state="normal")
+            self._gutter.tag_remove("eip_arrow", "1.0", "end")
+            self._gutter.configure(state="disabled")
+
+        self._eip_line = self._addr_to_line.get(eip_addr)
+        if self._eip_line:
+            self._gutter.configure(state="normal")
+            # Put arrow at position 0 of the EIP line
+            line_start = f"{self._eip_line}.0"
+            line_char = f"{self._eip_line}.1"
+            old_char = self._gutter.get(line_start, line_char)
+            if old_char != self._BP_CHAR:
+                self._gutter.delete(line_start, line_char)
+                self._gutter.insert(line_start, self._EIP_CHAR, "eip_arrow")
+            else:
+                # Has breakpoint — show both (bp dot takes priority, but add arrow tag)
+                pass
+            self._gutter.configure(state="disabled")
+
+            # Scroll to make EIP visible
+            self._text.see(f"{self._eip_line}.0")
+            self._gutter.see(f"{self._eip_line}.0")
+
+        self._refresh_line_highlights()
+
+    def clear_eip(self):
+        """Remove EIP indicator."""
+        if self._eip_line:
+            self._gutter.configure(state="normal")
+            self._gutter.tag_remove("eip_arrow", "1.0", "end")
+            # Restore line number char if no breakpoint
+            if self._eip_line not in self._bp_lines:
+                line_start = f"{self._eip_line}.0"
+                line_char = f"{self._eip_line}.1"
+                self._gutter.delete(line_start, line_char)
+                self._gutter.insert(line_start, " ")
+            self._gutter.configure(state="disabled")
+            self._eip_line = None
+            self._refresh_line_highlights()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Tab 16: Kernel Debugger
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -5125,6 +5443,7 @@ class KernelDebuggerTab(ttk.Frame):
         self._dbg = None           # DebugSession
         self._insp = None          # ObjectInspector
         self._loaded = False
+        self._disasm_view = None   # DisassemblyView (if open)
 
         # Row 0 — system32 folder picker
         _, self._get_sys32, self._sys32_var = make_dir_picker(
@@ -5217,6 +5536,9 @@ class KernelDebuggerTab(ttk.Frame):
                    command=self._show_handles).pack(side="left", padx=2)
         ttk.Button(bf3, text="Env Info",
                    command=self._show_env).pack(side="left", padx=2)
+        ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
+        ttk.Button(bf3, text="\U0001F4CB Disassemble",
+                   command=self._disassemble).pack(side="left", padx=2)
 
         # Row 7 — status + progress
         self.status_var, self._prog_start, self._prog_stop = \
@@ -5252,6 +5574,15 @@ class KernelDebuggerTab(ttk.Frame):
             return True
         self.status_var.set("\u26A0 Load core first (click Load Core)")
         return False
+
+    def _update_disasm_eip(self):
+        """Update EIP marker in disassembly view if one is open."""
+        if self._disasm_view and self._dbg:
+            try:
+                regs = self._dbg.inspect_registers()
+                self._disasm_view.update_eip(regs['eip'])
+            except Exception:
+                pass
 
     # ── load / unload ─────────────────────────────────────────────────────
 
@@ -5447,6 +5778,7 @@ class KernelDebuggerTab(ttk.Frame):
                 self._write_regs(regs)
                 self.status_var.set(
                     f"\u23F8 Paused at {eip_name} — use Step / Continue")
+                self._update_disasm_eip()
             else:
                 report = self._dbg.format_result(result,
                                                   show_trace=show_trace)
@@ -5480,6 +5812,7 @@ class KernelDebuggerTab(ttk.Frame):
         output_write(self.output,
             f"  \u25B6 0x{eip:08X}  {eip_name}\n")
         self.status_var.set(f"\u23F8 Step: {eip_name}")
+        self._update_disasm_eip()
 
     def _continue(self):
         kdbg = _kdbg()
@@ -5507,6 +5840,7 @@ class KernelDebuggerTab(ttk.Frame):
                     f"\n  \u23F8 Breakpoint at {eip_name}\n", "title")
                 self._write_regs(regs)
                 self.status_var.set(f"\u23F8 Paused at {eip_name}")
+                self._update_disasm_eip()
             else:
                 retval = result.get("return_value", 0)
                 # Full report with registers/stack/call stack
@@ -5542,6 +5876,8 @@ class KernelDebuggerTab(ttk.Frame):
         try:
             bp_id = dbg.set_breakpoint(target)
             self.status_var.set(f"\U0001F6D1 Breakpoint #{bp_id} set: {raw}")
+            if self._disasm_view:
+                self._disasm_view._refresh_breakpoint_markers()
         except ValueError as e:
             self.status_var.set(f"\u274C {e}")
 
@@ -5665,6 +6001,73 @@ class KernelDebuggerTab(ttk.Frame):
         self.output.new_tab("Env Info")
         self._write_report(info)
         self.status_var.set("\u2705 Environment info displayed")
+
+    # ── interactive disassembly ───────────────────────────────────────────
+
+    def _disassemble(self):
+        if not self._ensure_env():
+            return
+        func = self._get_func()
+        if not func:
+            messagebox.showwarning("Missing", "Enter a function name.")
+            return
+
+        def work(progress_cb):
+            progress_cb(f"Disassembling {func}\u2026", 20)
+            dbg = self._make_session()
+            progress_cb(f"Resolving calls recursively\u2026", 40)
+            functions = dbg.disassemble_function(func)
+            progress_cb("Building view\u2026", 80)
+            return functions
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+
+            functions = result
+            if not functions:
+                self.status_var.set("\u26A0 No code found for function")
+                return
+
+            # Create a new tab with DisassemblyView
+            tab_title = f"Disasm: {func}"
+            self.output._counter += 1
+            frm = ttk.Frame(self.output._nb)
+            frm.columnconfigure(0, weight=1)
+            frm.rowconfigure(0, weight=1)
+
+            dv = DisassemblyView(frm, self)
+            dv.grid(row=0, column=0, sticky="nsew")
+
+            # Auto-close oldest if too many tabs
+            tab_ids = self.output._nb.tabs()
+            if len(tab_ids) >= 20:
+                oldest = tab_ids[0]
+                self.output._nb.forget(oldest)
+                self.output._tabs.pop(oldest, None)
+
+            self.output._nb.add(frm, text=f"  {tab_title}  ")
+            self.output._nb.select(frm)
+            # Store reference for later (e.g., EIP updates)
+            self._disasm_view = dv
+            self.output._tabs[str(frm)] = dv
+
+            dv.load_functions(functions)
+
+            # Show EIP if paused
+            kdbg = _kdbg()
+            if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:
+                regs = self._dbg.inspect_registers()
+                dv.update_eip(regs['eip'])
+
+            total_insn = sum(len(f['instructions']) for f in functions)
+            self.status_var.set(
+                f"\u2705 Disassembled {len(functions)} function(s), "
+                f"{total_insn} instructions — click gutter to set breakpoints")
+
+        run_with_progress_dialog(self.app, f"Disassembling {func}\u2026", work, done)
 
 if __name__ == '__main__':
     app = App()

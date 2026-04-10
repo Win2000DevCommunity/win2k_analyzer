@@ -617,6 +617,65 @@ class KernelEnvironment:
 
     # ---------------------------------------------------------------- PE load
 
+    def _find_free_base(self, size: int, preferred: int = 0) -> int:
+        """Find a free address range for a PE that needs relocation."""
+        aligned_size = (size + 0xFFFF) & ~0xFFFF  # 64KB aligned size
+        # Collect all occupied ranges
+        occupied = []
+        for m in self.modules.values():
+            occupied.append((m.image_base, m.image_base + ((m.image_size + 0xFFF) & ~0xFFF)))
+        occupied.sort()
+
+        # Try near the preferred base first (scan upward in 64KB steps)
+        candidate = ((preferred + 0xFFFF) & ~0xFFFF) if preferred else 0x70000000
+        for _ in range(4096):
+            end = candidate + aligned_size
+            if end > 0xFFC00000:
+                break
+            conflict = False
+            for (ob, oe) in occupied:
+                if candidate < oe and end > ob:
+                    conflict = True
+                    candidate = (oe + 0xFFFF) & ~0xFFFF
+                    break
+            if not conflict:
+                return candidate
+        raise RuntimeError(f"Cannot find free address space for {aligned_size:#x} bytes")
+
+    def _apply_relocations(self, pe: pefile.PE, old_base: int, new_base: int):
+        """Apply PE base relocations to adjust for new load address."""
+        delta = new_base - old_base
+        if delta == 0 or not hasattr(pe, 'DIRECTORY_ENTRY_BASERELOC'):
+            return
+        for reloc_block in pe.DIRECTORY_ENTRY_BASERELOC:
+            for entry in reloc_block.entries:
+                if entry.type == pefile.RELOCATION_TYPE['IMAGE_REL_BASED_HIGHLOW']:
+                    rva = entry.rva
+                    addr = new_base + rva
+                    try:
+                        val = struct.unpack_from('<I', bytes(self.uc.mem_read(addr, 4)))[0]
+                        val += delta
+                        self.uc.mem_write(addr, struct.pack('<I', val & 0xFFFFFFFF))
+                    except Exception:
+                        pass
+                elif entry.type == pefile.RELOCATION_TYPE['IMAGE_REL_BASED_HIGH']:
+                    addr = new_base + entry.rva
+                    try:
+                        val = struct.unpack_from('<H', bytes(self.uc.mem_read(addr, 2)))[0]
+                        val += (delta >> 16) & 0xFFFF
+                        self.uc.mem_write(addr, struct.pack('<H', val & 0xFFFF))
+                    except Exception:
+                        pass
+                elif entry.type == pefile.RELOCATION_TYPE['IMAGE_REL_BASED_LOW']:
+                    addr = new_base + entry.rva
+                    try:
+                        val = struct.unpack_from('<H', bytes(self.uc.mem_read(addr, 2)))[0]
+                        val += delta & 0xFFFF
+                        self.uc.mem_write(addr, struct.pack('<H', val & 0xFFFF))
+                    except Exception:
+                        pass
+                # type 0 = IMAGE_REL_BASED_ABSOLUTE = padding, skip
+
     def _load_pe(self, path: str, force_name: Optional[str] = None):
         """Load a single PE into the Unicorn address space."""
         pe = pefile.PE(path, fast_load=False)
@@ -625,15 +684,25 @@ class KernelEnvironment:
         size = pe.OPTIONAL_HEADER.SizeOfImage
         aligned = (size + 0xFFF) & ~0xFFF
 
-        # Check for overlap with already loaded modules
+        # Check for overlap with already loaded modules — relocate if needed
+        needs_reloc = False
         for m in self.modules.values():
             if (ib < m.image_base + m.image_size and
                     ib + size > m.image_base):
-                raise RuntimeError(
-                    f"Address space collision: {name} at 0x{ib:08X}-0x{ib + size:08X} "
-                    f"overlaps {m.name} at 0x{m.image_base:08X}-0x{m.image_base + m.image_size:08X}")
+                if hasattr(pe, 'DIRECTORY_ENTRY_BASERELOC') and pe.DIRECTORY_ENTRY_BASERELOC:
+                    old_base = ib
+                    ib = self._find_free_base(size, ib)
+                    needs_reloc = True
+                    self._progress(f"Relocating {name}: 0x{old_base:08X} → 0x{ib:08X}", 0)
+                    break
+                else:
+                    raise RuntimeError(
+                        f"Address space collision: {name} at 0x{pe.OPTIONAL_HEADER.ImageBase:08X}-"
+                        f"0x{pe.OPTIONAL_HEADER.ImageBase + size:08X} "
+                        f"overlaps {m.name} at 0x{m.image_base:08X}-0x{m.image_base + m.image_size:08X} "
+                        f"(no relocation data)")
 
-        # Check if this region is already mapped (KPCR, SharedUserData, etc.)
+        # Map memory
         try:
             self.uc.mem_map(ib, aligned)
         except Exception:
@@ -656,6 +725,10 @@ class KernelEnvironment:
                 self.uc.mem_write(va, raw)
             except Exception:
                 pass  # may extend beyond mapped region
+
+        # Apply relocations if we moved the image
+        if needs_reloc:
+            self._apply_relocations(pe, pe.OPTIONAL_HEADER.ImageBase, ib)
 
         # Build export map
         mod = LoadedModule(name=name, path=path, image_base=ib,
@@ -2458,6 +2531,135 @@ class DebugSession:
             ebp = next_ebp
 
         return frames
+
+    # ----------------------------------------------------------- disassembly
+
+    def disassemble_function(self, target: str, max_call_depth: int = 8) -> List[dict]:
+        """Disassemble a function and all called functions recursively.
+
+        Returns list of dicts, each representing a disassembled function:
+        {
+            'name': str, 'module': str, 'address': int,
+            'instructions': [{'address': int, 'size': int,
+                               'mnemonic': str, 'op_str': str,
+                               'bytes': bytes, 'call_target': int|None,
+                               'call_name': str|None}]
+        }
+        """
+        # Resolve target
+        if isinstance(target, str):
+            result = self.env.resolve_function(target)
+            if result is None:
+                raise ValueError(f"Cannot resolve function: {target}")
+            addr = result[0]
+        else:
+            addr = target
+
+        results = []
+        visited = set()
+        queue = [(addr, target if isinstance(target, str) else None, 0)]
+
+        while queue:
+            func_addr, func_name, depth = queue.pop(0)
+            if func_addr in visited:
+                continue
+            visited.add(func_addr)
+
+            # Check if this address is in an import stub — skip disassembly
+            if hasattr(self.env, '_stub_base') and self.env._stub_base:
+                stub_end = getattr(self.env, '_stub_ptr', self.env._stub_base)
+                if self.env._stub_base <= func_addr < stub_end:
+                    continue
+
+            # Find containing module
+            mod = self.env.find_module_at(func_addr)
+            if not mod:
+                continue
+
+            # Resolve name if not known
+            if not func_name:
+                fi = self.env.find_function_at(func_addr)
+                func_name = fi[0] if fi else f"sub_{func_addr:08X}"
+
+            # Disassemble from function start
+            instructions = []
+            try:
+                # Read up to 16KB of code from the function start
+                max_size = 0x4000
+                # Don't read past module end
+                mod_end = mod.image_base + mod.image_size
+                read_size = min(max_size, mod_end - func_addr)
+                if read_size <= 0:
+                    continue
+                code = bytes(self.env.uc.mem_read(func_addr, read_size))
+            except Exception:
+                continue
+
+            # Disassemble until ret or end
+            for insn in self.env.cs.disasm(code, func_addr):
+                call_target = None
+                call_name = None
+
+                # Detect call targets
+                if insn.mnemonic == 'call':
+                    # Try to parse immediate call target from op_str
+                    op = insn.op_str.strip()
+                    if op.startswith('0x') or op.startswith('0X'):
+                        try:
+                            call_target = int(op, 16)
+                        except ValueError:
+                            pass
+
+                    if call_target:
+                        fi = self.env.find_function_at(call_target)
+                        if fi:
+                            call_name = f"{fi[1]}!{fi[0]}"
+                        else:
+                            call_name = f"sub_{call_target:08X}"
+                        # Queue for recursive disassembly
+                        if depth < max_call_depth and call_target not in visited:
+                            queue.append((call_target, fi[0] if fi else None, depth + 1))
+
+                instructions.append({
+                    'address': insn.address,
+                    'size': insn.size,
+                    'mnemonic': insn.mnemonic,
+                    'op_str': insn.op_str,
+                    'bytes': bytes(insn.bytes),
+                    'call_target': call_target,
+                    'call_name': call_name,
+                })
+
+                # Stop at ret/retn
+                if insn.mnemonic in ('ret', 'retn', 'retf'):
+                    break
+                # Stop at int3 (padding)
+                if insn.mnemonic == 'int3':
+                    break
+                # Stop at jmp to another function (tail call) — but not short jumps
+                if insn.mnemonic == 'jmp' and insn.op_str.strip().startswith('0x'):
+                    try:
+                        jmp_target = int(insn.op_str.strip(), 16)
+                        # If jumping far away (>4KB), likely a tail call
+                        if abs(jmp_target - func_addr) > 0x1000:
+                            if depth < max_call_depth and jmp_target not in visited:
+                                fi = self.env.find_function_at(jmp_target)
+                                queue.append((jmp_target, fi[0] if fi else None, depth + 1))
+                            break
+                    except ValueError:
+                        pass
+
+            if instructions:
+                results.append({
+                    'name': func_name,
+                    'module': mod.name if mod else '???',
+                    'address': func_addr,
+                    'instructions': instructions,
+                })
+
+        # Sort by address for stable display
+        results.sort(key=lambda r: r['address'])
+        return results
 
     # ----------------------------------------------------------- events
 
