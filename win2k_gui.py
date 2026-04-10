@@ -5597,6 +5597,8 @@ class KernelDebuggerTab(ttk.Frame):
             kdbg = _kdbg()
             env = kdbg.KernelEnvironment(sys32)
             env.load_core(progress_cb=progress_cb)
+            progress_cb("Loading dependencies\u2026", 75)
+            env.auto_load_dependencies(progress_cb=progress_cb)
             return env
 
         def done(result):
@@ -5611,7 +5613,7 @@ class KernelDebuggerTab(ttk.Frame):
             info = self._env.get_info()
             output_write(self.output, "  KERNEL ENVIRONMENT LOADED\n\n", "title")
             output_write(self.output, f"  System Root: {info['system_root']}\n", "ok")
-            output_write(self.output, f"  Modules: {info['modules_loaded']}\n", "ok")
+            output_write(self.output, f"  Modules: {info['modules_loaded']} (with dependencies)\n", "ok")
             output_write(self.output, f"  Available files: {info['available_files']}\n\n")
             for name, m in info.get('modules', {}).items():
                 output_write(self.output,
@@ -5621,7 +5623,7 @@ class KernelDebuggerTab(ttk.Frame):
                 f"\u2705 Loaded: {info['modules_loaded']} modules, "
                 f"{info['available_files']} files available")
 
-        run_with_progress_dialog(self.app, "Loading kernel environment\u2026", work, done)
+        run_with_progress_dialog(self.app, "Loading kernel environment + dependencies\u2026", work, done)
 
     def _load_deps(self):
         if not self._ensure_env():
