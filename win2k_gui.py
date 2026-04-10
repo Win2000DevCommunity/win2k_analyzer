@@ -624,6 +624,26 @@ class TabbedOutput(ttk.Frame):
         self._current = txt
         return txt
 
+    def get_or_create_tab(self, title):
+        """Find existing tab by *title*; select it and return its ScrolledText.
+        If no tab with that title exists, create a new one."""
+        for tab_id in self._nb.tabs():
+            if self._nb.tab(tab_id, "text").strip() == title:
+                self._nb.select(tab_id)
+                txt = self._tabs.get(tab_id)
+                if txt:
+                    self._current = txt
+                    return txt
+        return self.new_tab(title)
+
+    def clear_current(self):
+        """Clear the currently active tab's text."""
+        c = self._cur()
+        if c:
+            c.configure(state="normal")
+            c.delete("1.0", "end")
+            c.configure(state="disabled")
+
     def close_all(self):
         for t in list(self._nb.tabs()):
             self._nb.forget(t)
@@ -5444,6 +5464,7 @@ class KernelDebuggerTab(ttk.Frame):
         self._insp = None          # ObjectInspector
         self._loaded = False
         self._disasm_view = None   # DisassemblyView (if open)
+        self._trace_tab_title = None  # title of debug/trace tab
 
         # Row 0 — system32 folder picker
         _, self._get_sys32, self._sys32_var = make_dir_picker(
@@ -5541,6 +5562,9 @@ class KernelDebuggerTab(ttk.Frame):
                    command=self._disassemble).pack(side="left", padx=2)
         ttk.Button(bf3, text="\U0001F50D Find Callers",
                    command=self._find_callers).pack(side="left", padx=2)
+        ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
+        ttk.Button(bf3, text="\U0001F9F9 Clear",
+                   command=self._clear_output).pack(side="left", padx=2)
 
         # Row 7 — status + progress
         self.status_var, self._prog_start, self._prog_stop = \
@@ -5736,6 +5760,7 @@ class KernelDebuggerTab(ttk.Frame):
         show_trace = self._show_trace_var.get()
         user_mode = self._user_mode_var.get()
         self.output.new_tab(f"Run: {func}")
+        self._trace_tab_title = f"Run: {func}"
 
         def work(progress_cb):
             progress_cb(f"Resolving {func}\u2026", 10)
@@ -5767,6 +5792,7 @@ class KernelDebuggerTab(ttk.Frame):
         show_trace = self._show_trace_var.get()
         user_mode = self._user_mode_var.get()
         self.output.new_tab(f"Debug: {func}")
+        self._trace_tab_title = f"Debug: {func}"
 
         def work(progress_cb):
             progress_cb(f"Resolving {func}\u2026", 10)
@@ -5806,6 +5832,9 @@ class KernelDebuggerTab(ttk.Frame):
         if not self._dbg or self._dbg.state != kdbg.DebugState.PAUSED:
             self.status_var.set("\u26A0 Not paused — use Run+Break first")
             return
+        # Always write trace to the debug/trace tab
+        if self._trace_tab_title:
+            self.output.get_or_create_tab(self._trace_tab_title)
         result = self._dbg.step()
         if not result:
             return
@@ -5843,8 +5872,13 @@ class KernelDebuggerTab(ttk.Frame):
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
+                if self._trace_tab_title:
+                    self.output.get_or_create_tab(self._trace_tab_title)
                 output_write(self.output, f"ERROR: {result}\n", "error")
                 return
+            # Switch to trace tab for continue output
+            if self._trace_tab_title:
+                self.output.get_or_create_tab(self._trace_tab_title)
             kdbg2 = _kdbg()
             if result.get("state") == "paused":
                 regs = self._dbg.inspect_registers()
@@ -6047,6 +6081,10 @@ class KernelDebuggerTab(ttk.Frame):
 
     # ── inspection ────────────────────────────────────────────────────────
 
+    def _clear_output(self):
+        """Clear the currently active output tab."""
+        self.output.clear_current()
+
     def _write_regs(self, regs):
         """Write register state to output."""
         pairs = [
@@ -6082,8 +6120,8 @@ class KernelDebuggerTab(ttk.Frame):
             self.status_var.set("\u26A0 No active session")
             return
         regs = self._dbg.inspect_registers()
-        self.output.new_tab("Registers")
-        output_write(self.output, "  CPU REGISTERS\n\n", "title")
+        self.output.get_or_create_tab("Registers")
+        output_write(self.output, "\n  \u2500\u2500\u2500 CPU REGISTERS \u2500\u2500\u2500\n\n", "title")
         self._write_regs(regs)
         efl = regs.get("eflags", 0)
         output_write(self.output, f"\n  EFLAGS=0x{efl:08X}  ", "dim")
@@ -6102,8 +6140,8 @@ class KernelDebuggerTab(ttk.Frame):
             self.status_var.set("\u26A0 No active session")
             return
         frames = self._dbg.get_call_stack()
-        self.output.new_tab("Call Stack")
-        output_write(self.output, "  CALL STACK\n\n", "title")
+        self.output.get_or_create_tab("Call Stack")
+        output_write(self.output, "\n  \u2500\u2500\u2500 CALL STACK \u2500\u2500\u2500\n\n", "title")
         if not frames:
             output_write(self.output, "  (empty)\n", "dim")
             return
@@ -6125,8 +6163,8 @@ class KernelDebuggerTab(ttk.Frame):
             self.status_var.set("\u26A0 No active session")
             return
         entries = self._dbg.inspect_stack()
-        self.output.new_tab("Stack")
-        output_write(self.output, "  STACK MEMORY\n\n", "title")
+        self.output.get_or_create_tab("Stack")
+        output_write(self.output, "\n  \u2500\u2500\u2500 STACK MEMORY \u2500\u2500\u2500\n\n", "title")
         for e in entries:
             sym = e.get("symbol", "")
             sym_str = f"  {sym}" if sym else ""
@@ -6138,8 +6176,8 @@ class KernelDebuggerTab(ttk.Frame):
         if not self._insp:
             self.status_var.set("\u26A0 Load core first")
             return
-        self.output.new_tab("Handles")
-        output_write(self.output, "  HANDLE TABLE\n\n", "title")
+        self.output.get_or_create_tab("Handles")
+        output_write(self.output, "\n  \u2500\u2500\u2500 HANDLE TABLE \u2500\u2500\u2500\n\n", "title")
         rows = self._insp.walk_handle_table()
         for row in rows:
             output_write(self.output, f"  {row}\n")
@@ -6149,7 +6187,8 @@ class KernelDebuggerTab(ttk.Frame):
             return
         dbg = self._make_session()
         info = dbg.format_environment_info()
-        self.output.new_tab("Env Info")
+        self.output.get_or_create_tab("Env Info")
+        output_write(self.output, "\n  \u2500\u2500\u2500 ENVIRONMENT INFO \u2500\u2500\u2500\n", "title")
         self._write_report(info)
         self.status_var.set("\u2705 Environment info displayed")
 
