@@ -5709,10 +5709,20 @@ class KernelDebuggerTab(ttk.Frame):
     # ── run / step / continue ─────────────────────────────────────────────
 
     def _make_session(self):
-        """Create or reuse a DebugSession."""
+        """Create or reuse a DebugSession, preserving breakpoints."""
         kdbg = _kdbg()
         if not self._dbg or self._dbg.state == kdbg.DebugState.STOPPED:
+            old_bps = None
+            if self._dbg:
+                old_bps = self._dbg.list_breakpoints()
             self._dbg = kdbg.DebugSession(self._env)
+            # Carry forward breakpoints from previous session
+            if old_bps:
+                for bp in old_bps:
+                    try:
+                        self._dbg.set_breakpoint(bp.address)
+                    except Exception:
+                        pass
         return self._dbg
 
     def _run(self):
