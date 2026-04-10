@@ -5448,25 +5448,27 @@ class DisassemblyView(tk.Frame):
 
     def update_eip(self, eip_addr: int):
         """Update the current EIP indicator."""
-        # Remove old EIP marker
-        if self._eip_line:
+        # Restore old EIP line's gutter character (remove arrow, put back ● or space)
+        if self._eip_line is not None:
             self._gutter.configure(state="normal")
             self._gutter.tag_remove("eip_arrow", "1.0", "end")
+            line_start = f"{self._eip_line}.0"
+            line_char  = f"{self._eip_line}.1"
+            self._gutter.delete(line_start, line_char)
+            if self._eip_line in self._bp_lines:
+                self._gutter.insert(line_start, self._BP_CHAR, "bp_dot")
+            else:
+                self._gutter.insert(line_start, " ")
             self._gutter.configure(state="disabled")
 
         self._eip_line = self._addr_to_line.get(eip_addr)
-        if self._eip_line:
+        if self._eip_line is not None:
             self._gutter.configure(state="normal")
-            # Put arrow at position 0 of the EIP line
+            # Always place the arrow (overrides ● if EIP is at a BP line)
             line_start = f"{self._eip_line}.0"
-            line_char = f"{self._eip_line}.1"
-            old_char = self._gutter.get(line_start, line_char)
-            if old_char != self._BP_CHAR:
-                self._gutter.delete(line_start, line_char)
-                self._gutter.insert(line_start, self._EIP_CHAR, "eip_arrow")
-            else:
-                # Has breakpoint — show both (bp dot takes priority, but add arrow tag)
-                pass
+            line_char  = f"{self._eip_line}.1"
+            self._gutter.delete(line_start, line_char)
+            self._gutter.insert(line_start, self._EIP_CHAR, "eip_arrow")
             self._gutter.configure(state="disabled")
 
             # Scroll to make EIP visible
