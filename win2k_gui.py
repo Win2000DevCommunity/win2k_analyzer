@@ -624,6 +624,24 @@ class TabbedOutput(ttk.Frame):
         self._current = txt
         return txt
 
+    def new_tab_hidden(self, title):
+        """Create a new output tab WITHOUT switching to it. Returns the title."""
+        # If already exists, keep it as-is
+        for tab_id in self._nb.tabs():
+            if self._nb.tab(tab_id, "text").strip() == title:
+                return title
+        # Save current selection
+        cur_sel = self._nb.select()
+        self.new_tab(title)
+        # Restore previous tab
+        if cur_sel:
+            try:
+                self._nb.select(cur_sel)
+                self._current = self._tabs.get(cur_sel)
+            except Exception:
+                pass
+        return title
+
     def get_or_create_tab(self, title):
         """Find existing tab by *title*; select it and return its ScrolledText.
         If no tab with that title exists, create a new one."""
@@ -5788,7 +5806,7 @@ class KernelDebuggerTab(ttk.Frame):
         args = self._parse_args()
         show_trace = self._show_trace_var.get()
         user_mode = self._user_mode_var.get()
-        self.output.new_tab(f"Run: {func}")
+        self.output.new_tab_hidden(f"Run: {func}")
         self._trace_tab_title = f"Run: {func}"
 
         def work(progress_cb):
@@ -5831,7 +5849,7 @@ class KernelDebuggerTab(ttk.Frame):
         args = self._parse_args()
         show_trace = self._show_trace_var.get()
         user_mode = self._user_mode_var.get()
-        self.output.new_tab(f"Debug: {func}")
+        self.output.new_tab_hidden(f"Debug: {func}")
         self._trace_tab_title = f"Debug: {func}"
 
         def work(progress_cb):
@@ -5962,7 +5980,7 @@ class KernelDebuggerTab(ttk.Frame):
         show_trace = self._show_trace_var.get()
         user_mode = self._user_mode_var.get()
         tab_title = f"Run\u2192BP: {func}"
-        self.output.new_tab(tab_title)
+        self.output.new_tab_hidden(tab_title)
         self._trace_tab_title = tab_title
 
         def work(progress_cb):
