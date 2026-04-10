@@ -5868,27 +5868,26 @@ class KernelDebuggerTab(ttk.Frame):
         if not self._dbg or self._dbg.state != kdbg.DebugState.PAUSED:
             self.status_var.set("\u26A0 Not paused — use Run+Break first")
             return
-        # Always write trace to the debug/trace tab
-        if self._trace_tab_title:
-            self.output.get_or_create_tab(self._trace_tab_title)
         result = self._dbg.step()
         if not result:
             return
+        # Write trace to the debug tab WITHOUT switching away from current tab
+        trace_tab = self._trace_tab_title or "Trace"
         if result.get("state") == "completed":
             retval = result.get("return_value", 0)
-            output_write(self.output,
+            self.output.write_to_tab(trace_tab,
                 f"\n  \u2705 Function returned: 0x{retval:08X} "
                 f"({kdbg.ntstatus_name(retval)})\n", "ok")
             self.status_var.set(
                 f"\u2705 Completed: 0x{retval:08X} ({kdbg.ntstatus_name(retval)})")
             return
         if "error" in result:
-            output_write(self.output,
+            self.output.write_to_tab(trace_tab,
                 f"\n  \u274C Error: {result['error']}\n", "error")
             return
         eip = result['eip']
         eip_name = result.get('eip_name', f'0x{eip:08X}')
-        output_write(self.output,
+        self.output.write_to_tab(trace_tab,
             f"  \u25B6 0x{eip:08X}  {eip_name}\n")
         self.status_var.set(f"\u23F8 Step: {eip_name}")
         self._update_disasm_eip()
