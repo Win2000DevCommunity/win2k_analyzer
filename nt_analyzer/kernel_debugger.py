@@ -902,11 +902,14 @@ class KernelEnvironment:
         except Exception:
             return None
 
-    def auto_load_dependencies(self, max_depth: int = 3):
+    def auto_load_dependencies(self, max_depth: int = 3, progress_cb=None):
         """
         Iteratively load missing modules up to max_depth levels.
         Returns list of modules that could NOT be found.
         """
+        if progress_cb:
+            self.on_progress = progress_cb
+
         truly_missing = set()
 
         for depth in range(max_depth):
@@ -921,9 +924,11 @@ class KernelEnvironment:
                 break
 
             loaded_any = False
-            for dll in needed:
-                self._progress(f"Loading dependency: {dll}…",
-                               70 + int(20 * depth / max_depth))
+            total_needed = len(needed)
+            for i, dll in enumerate(needed):
+                pct = 70 + int(25 * (depth * total_needed + i) /
+                               (max_depth * max(total_needed, 1)))
+                self._progress(f"Loading dependency: {dll}…", pct)
                 result = self.load_module(dll)
                 if result:
                     loaded_any = True
@@ -933,6 +938,7 @@ class KernelEnvironment:
             if not loaded_any:
                 break
 
+        self._progress("Dependencies resolved.", 100)
         return sorted(truly_missing)
 
     # ---------------------------------------------------------------- symbols
@@ -1739,6 +1745,9 @@ class DebugSession:
         self._paused = False
         self._pause_reason = ""
 
+        # Exception-raising function addresses (populated at run time)
+        self._exception_func_addrs: Dict[int, str] = {}
+
     # ----------------------------------------------------------- breakpoints
 
     def set_breakpoint(self, target, condition=None, callback=None) -> int:
@@ -1825,6 +1834,7 @@ class DebugSession:
         self._paused = False
         self.events.clear()
         self.mocks.reset()
+        self._pre_return_snapshot = None  # registers just before final ret
 
         # Set PreviousMode
         if self.env.kstate:
@@ -1849,6 +1859,9 @@ class DebugSession:
             bp = Breakpoint(id=0, address=func_va, name=func_name,
                             temporary=True)
             self._breakpoints[func_va] = bp
+
+        # Resolve exception-raising functions for interception
+        self._resolve_exception_funcs()
 
         # Install hooks
         h_code = uc.hook_add(UC_HOOK_CODE, self._hook_code)
@@ -1905,6 +1918,7 @@ class DebugSession:
 
         return {
             "function": func_name,
+            "args": list(args),
             "return_value": eax,
             "return_status": ntstatus_name(eax),
             "instructions": self._insn_count,
@@ -1914,6 +1928,7 @@ class DebugSession:
             "api_calls": list(self._api_calls),
             "events": list(self.events),
             "breakpoint_hits": sum(bp.hit_count for bp in self._breakpoints.values()),
+            "pre_return_snapshot": self._pre_return_snapshot,
         }
 
     # ----------------------------------------------------------- hooks
@@ -1975,6 +1990,11 @@ class DebugSession:
             uc.emu_stop()
             return
 
+        # Exception-raising function interception (ExRaiseStatus etc.)
+        if address in self._exception_func_addrs:
+            self._intercept_exception_raise(uc, address)
+            return
+
         # Import stub hook
         if address in self.env._stub_hooks:
             dll_name, func_name = self.env._stub_hooks[address]
@@ -1995,8 +2015,119 @@ class DebugSession:
                         "op_str": insn.op_str,
                         "size": size,
                     })
+                    # Capture state at leave/pop ebp (pre-epilogue, stack still intact)
+                    if insn.mnemonic == "leave" or (
+                            insn.mnemonic == "pop" and insn.op_str == "ebp"):
+                        regs = self._get_regs(uc)
+                        func_info = self.env.find_function_at(address)
+                        regs["eip_name"] = (f"{func_info[1]}!{func_info[0]}"
+                                            if func_info else f"0x{address:08X}")
+                        try:
+                            frames = self.get_call_stack()
+                        except Exception:
+                            frames = []
+                        try:
+                            stack_entries = self.inspect_stack(depth=16)
+                        except Exception:
+                            stack_entries = []
+                        self._pre_return_snapshot = {
+                            "regs": regs,
+                            "call_stack": frames,
+                            "stack_memory": stack_entries,
+                        }
+                    # Also capture at ret as fallback if no leave/pop ebp was seen
+                    elif insn.mnemonic == "ret" and self._pre_return_snapshot is None:
+                        regs = self._get_regs(uc)
+                        func_info = self.env.find_function_at(address)
+                        regs["eip_name"] = (f"{func_info[1]}!{func_info[0]}"
+                                            if func_info else f"0x{address:08X}")
+                        try:
+                            frames = self.get_call_stack()
+                        except Exception:
+                            frames = []
+                        try:
+                            stack_entries = self.inspect_stack(depth=16)
+                        except Exception:
+                            stack_entries = []
+                        self._pre_return_snapshot = {
+                            "regs": regs,
+                            "call_stack": frames,
+                            "stack_memory": stack_entries,
+                        }
             except Exception:
                 pass
+
+    # --------------------------------------------------------- exception interception
+
+    def _resolve_exception_funcs(self):
+        """Resolve addresses of exception-raising functions for interception."""
+        self._exception_func_addrs.clear()
+        for name in ("ExRaiseStatus", "RtlRaiseStatus"):
+            result = self.env.resolve_function(name)
+            if result:
+                self._exception_func_addrs[result[0]] = name
+
+    def _intercept_exception_raise(self, uc, address):
+        """
+        Intercept ExRaiseStatus / RtlRaiseStatus at entry.
+        Reads the NTSTATUS arg, unwinds the SEH chain, sets EAX,
+        and cleanly terminates execution with the exception status.
+        """
+        esp = uc.reg_read(UC_X86_REG_ESP)
+        func_name = self._exception_func_addrs.get(address, "ExRaiseStatus")
+
+        # Read NTSTATUS argument ([ESP+4], first arg after return address)
+        try:
+            ntstatus = struct.unpack('<I', bytes(uc.mem_read(esp + 4, 4)))[0]
+        except Exception:
+            ntstatus = 0xC0000001  # STATUS_UNSUCCESSFUL
+
+        # Record event
+        self._raise_event(DebugEvent(
+            event_type="exception",
+            address=address,
+            message=f"{func_name}(0x{ntstatus:08X}) — {ntstatus_name(ntstatus)} — SEH unwind",
+            details={"ntstatus": ntstatus}))
+
+        # Capture pre-exception snapshot for the report
+        regs = self._get_regs(uc)
+        func_info = self.env.find_function_at(address)
+        regs["eip_name"] = (f"{func_info[1]}!{func_info[0]}"
+                            if func_info else f"0x{address:08X}")
+        try:
+            frames = self.get_call_stack()
+        except Exception:
+            frames = []
+        try:
+            stack_entries = self.inspect_stack(depth=16)
+        except Exception:
+            stack_entries = []
+        self._pre_return_snapshot = {
+            "regs": regs,
+            "call_stack": frames,
+            "stack_memory": stack_entries,
+        }
+
+        # SEH unwind: walk fs:[0] to restore the nearest handler frame
+        try:
+            seh_ptr = struct.unpack('<I',
+                bytes(uc.mem_read(KPCR_BASE, 4)))[0]  # fs:[0]
+
+            if seh_ptr not in (0xFFFFFFFF, 0):
+                next_seh = struct.unpack('<I',
+                    bytes(uc.mem_read(seh_ptr, 4)))[0]
+                # Restore fs:[0] to next handler (unwind this SEH level)
+                uc.mem_write(KPCR_BASE, struct.pack('<I', next_seh))
+                # Standard __except_handler3 frame: EBP = seh_ptr + 0x10
+                frame_ebp = seh_ptr + 0x10
+                uc.reg_write(UC_X86_REG_EBP, frame_ebp)
+                uc.reg_write(UC_X86_REG_ESP, frame_ebp + 4)
+        except Exception:
+            pass
+
+        # Set return value to the exception NTSTATUS and stop
+        uc.reg_write(UC_X86_REG_EAX, ntstatus)
+        uc.emu_stop()
 
     def _handle_stub_call(self, uc, api_name, stub_addr):
         """Handle a call to an unresolved import stub."""
@@ -2340,10 +2471,14 @@ class DebugSession:
 
     def format_result(self, result: dict, show_trace: bool = False) -> str:
         """Format a run result into a readable report."""
+        func = result.get('function', '?')
+        args = result.get('args', [])
+        args_str = ', '.join(f'0x{a:X}' for a in args) if args else '(none)'
         lines = [
             "═" * 72,
             "  LIVE KERNEL DEBUG REPORT",
-            f"  Function: {result.get('function', '?')}",
+            f"  Function: {func}",
+            f"  Args: {args_str}",
             f"  Return: 0x{result.get('return_value', 0):08X} "
             f"({result.get('return_status', '?')})",
             f"  Instructions: {result.get('instructions', 0)}",
@@ -2356,6 +2491,8 @@ class DebugSession:
 
         # Events
         events = result.get('events', [])
+        if not events:
+            lines.append("\n  Debug Events: none")
         if events:
             lines.append(f"\n  Debug Events ({len(events)}):")
             lines.append(f"  {'─' * 60}")
@@ -2371,12 +2508,14 @@ class DebugSession:
                 }.get(ev.event_type, "•")
                 lines.append(f"    {icon} [{ev.event_type}] {ev.message}")
                 if ev.address:
-                    func = self.env.find_function_at(ev.address)
-                    if func:
-                        lines.append(f"       at {func[1]}!{func[0]}")
+                    ev_func = self.env.find_function_at(ev.address)
+                    if ev_func:
+                        lines.append(f"       at {ev_func[1]}!{ev_func[0]}")
 
         # API calls summary
         api_calls = result.get('api_calls', [])
+        if not api_calls:
+            lines.append("\n  API Calls: none (no external stubs hit)")
         if api_calls:
             lines.append(f"\n  API Calls ({len(api_calls)}):")
             seen = {}
@@ -2392,7 +2531,7 @@ class DebugSession:
             lines.append(f"\n  Execution Trace ({len(trace)} entries):")
             lines.append(f"    {'VA':<12}| {'Instruction':<40}")
             lines.append(f"    {'-' * 11}+{'-' * 40}")
-            for t in trace[:500]:
+            for t in trace:
                 instr = f"{t['mnemonic']} {t['op_str']}".strip()
                 tag = ""
                 if t['mnemonic'] == "ret":
@@ -2402,10 +2541,63 @@ class DebugSession:
                 elif t['mnemonic'] == "call":
                     tag = "  <-- CALL"
                 lines.append(f"    0x{t['address']:08X} | {instr}{tag}")
-            if len(trace) > 500:
-                lines.append(f"    ... {len(trace) - 500} more entries")
 
-        # Call stack
+        # Use pre-return snapshot if available (captured at last ret instruction)
+        snap = result.get('pre_return_snapshot')
+
+        # ── Final registers ──────────────────────────────────────────────
+        try:
+            regs = snap['regs'] if snap else self.inspect_registers()
+            lines.append("\n  Final Registers (before epilogue):")
+            lines.append(f"  {'─' * 60}")
+            reg_names = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip"]
+            row = "   "
+            for i, rn in enumerate(reg_names):
+                row += f" {rn.upper()}=0x{regs.get(rn, 0):08X}"
+                if (i + 1) % 4 == 0:
+                    lines.append(row)
+                    row = "   "
+            if row.strip():
+                lines.append(row)
+            # Use original function name if the resolved name is an offset approx
+            eip_name = regs.get("eip_name", "")
+            if eip_name and '+' in eip_name and func != '?':
+                # The resolved name is e.g. PoShutdownBugCheck+0x19A8 — show both
+                lines.append(f"    EIP → {func} (nearest export: {eip_name})")
+            elif eip_name:
+                lines.append(f"    EIP → {eip_name}")
+        except Exception:
+            pass
+
+        # ── Call stack ────────────────────────────────────────────────────
+        try:
+            frames = snap['call_stack'] if snap else self.get_call_stack()
+            if frames:
+                lines.append(f"\n  Call Stack ({len(frames)} frames):")
+                lines.append(f"  {'─' * 60}")
+                for i, fr in enumerate(frames):
+                    mod = fr.module or "???"
+                    lines.append(
+                        f"    #{i:<2d}  0x{fr.return_address:08X}  "
+                        f"{mod}!{fr.function}")
+        except Exception:
+            pass
+
+        # ── Stack memory ──────────────────────────────────────────────────
+        try:
+            stack_entries = snap['stack_memory'] if snap else self.inspect_stack(depth=16)
+            if stack_entries:
+                lines.append(f"\n  Stack Memory (top 16 DWORDs):")
+                lines.append(f"  {'─' * 60}")
+                lines.append(f"    {'Offset':>6}  {'Address':<12} {'Value':<12} {'Symbol'}")
+                for e in stack_entries:
+                    sym = e.get('symbol', '')
+                    lines.append(
+                        f"    +{e['offset']:04X}   0x{e['address']:08X}  "
+                        f"0x{e['value']:08X}  {sym}")
+        except Exception:
+            pass
+
         lines.append("")
 
         return '\n'.join(lines)

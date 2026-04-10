@@ -5260,13 +5260,12 @@ class KernelDebuggerTab(ttk.Frame):
         if not sys32 or not os.path.isdir(sys32):
             messagebox.showwarning("Missing", "Select a valid System32 folder.")
             return
-        self.status_var.set("\u23F3 Loading kernel environment \u2026")
         self.output.new_tab("Load Core")
 
-        def work():
+        def work(progress_cb):
             kdbg = _kdbg()
             env = kdbg.KernelEnvironment(sys32)
-            env.load_core()
+            env.load_core(progress_cb=progress_cb)
             return env
 
         def done(result):
@@ -5283,24 +5282,23 @@ class KernelDebuggerTab(ttk.Frame):
             output_write(self.output, f"  System Root: {info['system_root']}\n", "ok")
             output_write(self.output, f"  Modules: {info['modules_loaded']}\n", "ok")
             output_write(self.output, f"  Available files: {info['available_files']}\n\n")
-            for m in info.get('modules', []):
+            for name, m in info.get('modules', {}).items():
                 output_write(self.output,
-                    f"  {m['name']:24s}  base=0x{m['base']:08X}  "
+                    f"  {name:24s}  base={m['base']}  "
                     f"exports={m['exports']:5d}  unresolved={m['unresolved']}\n")
             self.status_var.set(
                 f"\u2705 Loaded: {info['modules_loaded']} modules, "
                 f"{info['available_files']} files available")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, "Loading kernel environment\u2026", work, done)
 
     def _load_deps(self):
         if not self._ensure_env():
             return
-        self.status_var.set("\u23F3 Loading dependencies \u2026")
         self.output.new_tab("Dependencies")
 
-        def work():
-            self._env.auto_load_dependencies()
+        def work(progress_cb):
+            self._env.auto_load_dependencies(progress_cb=progress_cb)
             return self._env.get_info()
 
         def done(result):
@@ -5309,22 +5307,23 @@ class KernelDebuggerTab(ttk.Frame):
                 output_write(self.output, f"ERROR: {result}\n", "error")
                 return
             output_write(self.output, "  DEPENDENCY RESOLUTION\n\n", "title")
-            for m in result.get('modules', []):
+            for name, m in result.get('modules', {}).items():
                 tag = "ok" if m['unresolved'] == 0 else "warn"
                 output_write(self.output,
-                    f"  {m['name']:24s}  base=0x{m['base']:08X}  "
+                    f"  {name:24s}  base={m['base']}  "
                     f"exports={m['exports']:5d}  unresolved={m['unresolved']}\n", tag)
-            unresolved = result.get('unresolved_imports', {})
-            if unresolved:
-                output_write(self.output, f"\n  Unresolved ({sum(len(v) for v in unresolved.values())}):\n", "error")
-                for dll, funcs in unresolved.items():
-                    output_write(self.output, f"    {dll}:\n", "warn")
-                    for fn in funcs:
-                        output_write(self.output, f"      \u2022 {fn}\n", "dim")
+            # Gather unresolved imports from modules
+            any_unresolved = False
+            for name, m in result.get('modules', {}).items():
+                if m['unresolved'] > 0:
+                    any_unresolved = True
+            if any_unresolved:
+                output_write(self.output, f"\n  Some imports remain unresolved "
+                    f"(DLLs not found in system32 folder)\n", "warn")
             self.status_var.set(
                 f"\u2705 {result['modules_loaded']} modules loaded")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, "Loading dependencies\u2026", work, done)
 
     def _load_symbols(self):
         if not self._ensure_env():
@@ -5334,18 +5333,31 @@ class KernelDebuggerTab(ttk.Frame):
                        ("All files", "*.*")])
         if not path:
             return
-        self.status_var.set("\u23F3 Loading symbols \u2026")
 
-        def work():
-            return self._env.load_symbols_from_file(path)
+        # Auto-detect module name from symbol filename
+        sym_base = os.path.splitext(os.path.basename(path))[0].lower()
+        # Find matching module
+        mod_name = None
+        for name in self._env.modules:
+            if os.path.splitext(name)[0].lower() == sym_base:
+                mod_name = name
+                break
+        if not mod_name:
+            mod_name = list(self._env.modules.keys())[0] if self._env.modules else sym_base
+
+        def work(progress_cb):
+            progress_cb(f"Loading symbols for {mod_name}\u2026", 30)
+            count = self._env.load_symbols_from_file(mod_name, path)
+            progress_cb("Done", 100)
+            return count
 
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
                 return
-            self.status_var.set(f"\u2705 Symbols loaded: {result} symbols")
+            self.status_var.set(f"\u2705 Symbols loaded: {result} symbols for {mod_name}")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, "Loading symbols\u2026", work, done)
 
     def _unload(self):
         if self._env:
@@ -5378,13 +5390,15 @@ class KernelDebuggerTab(ttk.Frame):
         args = self._parse_args()
         show_trace = self._show_trace_var.get()
         user_mode = self._user_mode_var.get()
-        self.status_var.set(f"\u23F3 Running {func} \u2026")
         self.output.new_tab(f"Run: {func}")
 
-        def work():
+        def work(progress_cb):
+            progress_cb(f"Resolving {func}\u2026", 10)
             dbg = self._make_session()
+            progress_cb(f"Running {func}\u2026", 30)
             result = dbg.run(func, args=args, show_trace=show_trace,
                              user_mode=user_mode)
+            progress_cb("Formatting results\u2026", 90)
             return dbg.format_result(result, show_trace=show_trace)
 
         def done(result):
@@ -5395,7 +5409,7 @@ class KernelDebuggerTab(ttk.Frame):
             self._write_report(result)
             self.status_var.set("\u2705 Run complete")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Running {func}\u2026", work, done)
 
     def _run_break(self):
         if not self._ensure_env():
@@ -5407,13 +5421,15 @@ class KernelDebuggerTab(ttk.Frame):
         args = self._parse_args()
         show_trace = self._show_trace_var.get()
         user_mode = self._user_mode_var.get()
-        self.status_var.set(f"\u23F3 Running {func} (break at entry) \u2026")
         self.output.new_tab(f"Debug: {func}")
 
-        def work():
+        def work(progress_cb):
+            progress_cb(f"Resolving {func}\u2026", 10)
             dbg = self._make_session()
+            progress_cb(f"Running {func} (break at entry)\u2026", 30)
             result = dbg.run(func, args=args, show_trace=show_trace,
                              user_mode=user_mode, stop_at_entry=True)
+            progress_cb("Done", 100)
             return result
 
         def done(result):
@@ -5437,7 +5453,7 @@ class KernelDebuggerTab(ttk.Frame):
                 self._write_report(report)
                 self.status_var.set("\u2705 Run complete (no break)")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, f"Debugging {func}\u2026", work, done)
 
     def _step(self):
         kdbg = _kdbg()
@@ -5470,10 +5486,12 @@ class KernelDebuggerTab(ttk.Frame):
         if not self._dbg or self._dbg.state != kdbg.DebugState.PAUSED:
             self.status_var.set("\u26A0 Not paused — nothing to continue")
             return
-        self.status_var.set("\u23F3 Continuing \u2026")
 
-        def work():
-            return self._dbg.continue_run()
+        def work(progress_cb):
+            progress_cb("Continuing execution\u2026", 30)
+            result = self._dbg.continue_run()
+            progress_cb("Done", 100)
+            return result
 
         def done(result):
             if isinstance(result, Exception):
@@ -5491,16 +5509,16 @@ class KernelDebuggerTab(ttk.Frame):
                 self.status_var.set(f"\u23F8 Paused at {eip_name}")
             else:
                 retval = result.get("return_value", 0)
-                output_write(self.output,
-                    f"\n  \u2705 Completed: 0x{retval:08X} "
-                    f"({kdbg2.ntstatus_name(retval)})\n", "ok")
-                output_write(self.output,
-                    f"  Instructions: {result.get('instructions', 0)}\n")
+                # Full report with registers/stack/call stack
+                show_trace = self._show_trace_var.get()
+                report = self._dbg.format_result(result,
+                                                  show_trace=show_trace)
+                self._write_report(report)
                 self.status_var.set(
                     f"\u2705 Completed: 0x{retval:08X} "
                     f"({kdbg2.ntstatus_name(retval)})")
 
-        run_with_progress(self, work, done)
+        run_with_progress_dialog(self.app, "Continuing execution\u2026", work, done)
 
     # ── breakpoints ───────────────────────────────────────────────────────
 
