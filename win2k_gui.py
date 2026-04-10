@@ -5797,6 +5797,8 @@ class KernelDebuggerTab(ttk.Frame):
             progress_cb(f"Running {func}\u2026", 30)
             result = dbg.run(func, args=args, show_trace=show_trace,
                              user_mode=user_mode)
+            if 'error' in result:
+                return result  # pass error dict through
             progress_cb("Formatting results\u2026", 90)
             return dbg.format_result(result, show_trace=show_trace)
 
@@ -5804,6 +5806,11 @@ class KernelDebuggerTab(ttk.Frame):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
                 output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if isinstance(result, dict) and 'error' in result:
+                self.status_var.set(f"\u274C {result['error']}")
+                output_write(self.output,
+                    f"  \u274C {result['error']}\n", "error")
                 return
             self._write_report(result)
             self.status_var.set("\u2705 Run complete")
@@ -5968,6 +5975,11 @@ class KernelDebuggerTab(ttk.Frame):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C {result}")
                 output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            if isinstance(result, dict) and 'error' in result:
+                self.status_var.set(f"\u274C {result['error']}")
+                output_write(self.output,
+                    f"  \u274C {result['error']}\n", "error")
                 return
             kdbg = _kdbg()
             if self._dbg and self._dbg.state == kdbg.DebugState.PAUSED:

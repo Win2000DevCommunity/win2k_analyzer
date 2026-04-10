@@ -2959,6 +2959,21 @@ class DebugSession:
 
     def format_result(self, result: dict, show_trace: bool = False) -> str:
         """Format a run result into a readable report."""
+        # Handle error results (e.g. function not found)
+        if 'error' in result:
+            lines = [
+                "═" * 72,
+                "  LIVE KERNEL DEBUG REPORT",
+                f"  ❌ ERROR: {result['error']}",
+                "═" * 72,
+            ]
+            events = result.get('events', [])
+            if events:
+                lines.append(f"\n  Debug Events ({len(events)}):")
+                for ev in events[:20]:
+                    lines.append(f"    • {ev.message if hasattr(ev, 'message') else ev}")
+            return '\n'.join(lines) + '\n'
+
         func = result.get('function', '?')
         args = result.get('args', [])
         args_str = ', '.join(f'0x{a:X}' for a in args) if args else '(none)'
