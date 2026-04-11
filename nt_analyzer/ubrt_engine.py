@@ -18,6 +18,7 @@ import subprocess
 import json
 import time
 import copy
+import bisect
 import threading
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Set
@@ -73,6 +74,21 @@ class RefType(enum.Enum):
     INIT_FINI_PTR   = "init_fini_ptr"
     ELF_RELATIVE    = "elf_relative"
     SYMBOL_REF      = "symbol_ref"
+    # v7: indirect control flow
+    INDIRECT_CALL   = "indirect_call"
+    INDIRECT_JUMP   = "indirect_jump"
+    FUNC_POINTER    = "func_pointer"
+    # v7: PE-specific structures
+    TLS_DIR_ENTRY   = "tls_dir_entry"
+    LOAD_CONFIG_ENTRY = "load_config_entry"
+    DELAY_IMPORT    = "delay_import"
+    RESOURCE_ENTRY  = "resource_entry"
+    DEBUG_DIR_ENTRY = "debug_dir_entry"
+    BOUND_IMPORT    = "bound_import"
+    # v7: ELF dynamic
+    ELF_DYNAMIC_TAG = "elf_dynamic_tag"
+    # v7: Mach-O specific
+    MACHO_REBASE    = "macho_rebase"
 
 
 class RefSource(enum.Enum):
@@ -83,6 +99,8 @@ class RefSource(enum.Enum):
     DYNAMIC_TRACE = "dynamic_trace"
     ELF_RELOC     = "elf_reloc"
     ELF_TABLE     = "elf_table"
+    DATAFLOW      = "dataflow"       # v7: backward dataflow analysis
+    MACHO_TABLE   = "macho_table"    # v7: Mach-O load command tables
 
 
 class ShiftOp(enum.Enum):
@@ -155,7 +173,12 @@ class TraceBlock:
 # ─── Reference Database ──────────────────────────────────────────────────
 
 class ReferenceDatabase:
-    """Indexed database of all address references in a binary."""
+    """
+    Indexed database of all address references in a binary.
+
+    v7: Adds bisect-based spatial index for O(log N) range queries,
+    integrity validation, and batch-friendly bulk operations.
+    """
 
     def __init__(self):
         self._refs: List[Reference] = []
@@ -163,6 +186,9 @@ class ReferenceDatabase:
         self._by_type: Dict[RefType, List[int]] = defaultdict(list)
         self._by_section: Dict[str, List[int]] = defaultdict(list)
         self._by_offset: Dict[Tuple[int, int], int] = {}  # (file_offset, size) → idx
+        # v7: sorted index for range queries
+        self._sorted_by_rva: List[Tuple[int, int]] = []   # (ref_rva, idx) sorted
+        self._sorted_dirty = True
 
     def add(self, ref: Reference):
         # Deduplicate by (file_offset, size_bytes) — prevents double-writes
@@ -186,6 +212,7 @@ class ReferenceDatabase:
         self._by_section[ref.section_name].append(idx)
         if ref.file_offset > 0:
             self._by_offset[(ref.file_offset, ref.size_bytes)] = idx
+        self._sorted_dirty = True
 
     def get_all(self) -> List[Reference]:
         return list(self._refs)
@@ -214,6 +241,52 @@ class ReferenceDatabase:
             self._by_section[ref.section_name].append(i)
             if ref.file_offset > 0:
                 self._by_offset[(ref.file_offset, ref.size_bytes)] = i
+        self._sorted_dirty = True
+
+    def _ensure_sorted(self):
+        """Rebuild the sorted RVA index if dirty."""
+        if self._sorted_dirty:
+            self._sorted_by_rva = sorted(
+                ((ref.ref_rva, i) for i, ref in enumerate(self._refs)),
+                key=lambda x: x[0]
+            )
+            self._sorted_dirty = False
+
+    def get_refs_in_range(self, lo: int, hi: int) -> List[Reference]:
+        """O(log N + k) range query: all refs with ref_rva in [lo, hi)."""
+        self._ensure_sorted()
+        left = bisect.bisect_left(self._sorted_by_rva, (lo,))
+        right = bisect.bisect_left(self._sorted_by_rva, (hi,))
+        return [self._refs[self._sorted_by_rva[i][1]]
+                for i in range(left, right)]
+
+    def get_refs_targeting_range(self, lo: int, hi: int) -> List[Reference]:
+        """All refs whose target_rva falls in [lo, hi)."""
+        return [r for r in self._refs if lo <= r.target_rva < hi]
+
+    def validate_targets(self, valid_ranges: List[Tuple[int, int]]) -> List[Tuple[Reference, str]]:
+        """
+        Validate that all reference targets land in valid address ranges.
+        Returns list of (ref, reason) for invalid refs.
+        """
+        invalid = []
+        for ref in self._refs:
+            target = ref.target_rva
+            in_range = any(lo <= target < hi for lo, hi in valid_ranges)
+            if not in_range:
+                invalid.append((ref, f"target 0x{target:X} outside valid ranges"))
+        return invalid
+
+    def bulk_shift(self, shift_addr: int, delta: int):
+        """Shift all refs >= shift_addr by delta. Used by batch operations."""
+        for ref in self._refs:
+            if ref.ref_rva >= shift_addr:
+                ref.ref_rva += delta
+                ref.file_offset += delta
+            if ref.target_rva >= shift_addr:
+                ref.target_rva += delta
+        self._sorted_dirty = True
+        self.rebuild_indices()
 
     def stats(self) -> Dict:
         by_type = defaultdict(int)
@@ -245,6 +318,8 @@ class ReferenceDatabase:
         self._by_type.clear()
         self._by_section.clear()
         self._by_offset.clear()
+        self._sorted_by_rva.clear()
+        self._sorted_dirty = True
 
 
 # ─── PE Reference Finder ─────────────────────────────────────────────────
@@ -288,6 +363,12 @@ class PEReferenceFinder:
             ("Jump tables (switch/case)", self._find_jump_tables),
             ("Vtables (C++ virtual)", self._find_vtables),
             ("Data pointers (heuristic)", self._find_data_pointers),
+            # v7: additional structure passes
+            ("TLS directory", self._find_tls_entries),
+            ("Load config directory", self._find_load_config_entries),
+            ("Delay-load imports", self._find_delay_imports),
+            ("Debug directory", self._find_debug_entries),
+            ("Indirect control flow", self._find_indirect_control_flow),
         ]
         for i, (name, func) in enumerate(steps):
             if callback:
@@ -637,7 +718,13 @@ class PEReferenceFinder:
 
     # ── 6. Jump Table Detection ────────────────────────────────────
     def _find_jump_tables(self) -> List[Reference]:
-        """Detect switch/case jump tables: JMP DWORD PTR [reg*4 + table_addr]."""
+        """
+        Detect switch/case jump tables.
+        v7: Enhanced with multiple pattern matchers:
+        - MSVC: JMP DWORD PTR [reg*4 + table_addr]
+        - GCC/Clang PIC: MOVSXD reg, [table+idx*4]; ADD reg, base; JMP reg
+        - x64 RIP-relative: JMP [rip+disp + idx*scale]
+        """
         refs = []
         arch = capstone.CS_ARCH_X86
         mode = capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32
@@ -654,66 +741,130 @@ class PEReferenceFinder:
             code = section.get_data()
             base_va = self.image_base + section.VirtualAddress
 
+            insn_window = []  # v7: keep window for PIC pattern detection
+
             for insn in md.disasm(code, base_va):
-                # Pattern: JMP [reg*4 + disp32] or JMP [reg*4 + reg + disp32]
+                if insn.id == 0:
+                    continue
+                insn_window.append(insn)
+                if len(insn_window) > 6:
+                    insn_window.pop(0)
+
+                # Pattern 1: JMP [reg*4 + disp32] or JMP [reg*4 + reg + disp32]
                 if insn.id != cs_x86.X86_INS_JMP or len(insn.operands) != 1:
                     continue
                 op = insn.operands[0]
-                if op.type != cs_x86.X86_OP_MEM:
-                    continue
-                # Must have scale == 4 (or 8 for x64) — the index*scale pattern
-                if op.mem.scale not in (4, 8):
-                    continue
-                # The displacement is the table base address
-                table_va = op.mem.disp
-                if table_va == 0:
-                    continue
 
-                if self.is_64 and op.mem.base == cs_x86.X86_REG_RIP:
-                    # x64: RIP-relative jump table
-                    insn_rva = insn.address - self.image_base
-                    table_rva = insn_rva + insn.size + table_va
-                else:
-                    table_rva = table_va - self.image_base
+                # Pattern 1a: Direct memory with scale (MSVC pattern)
+                if op.type == cs_x86.X86_OP_MEM and op.mem.scale in (4, 8):
+                    table_va = op.mem.disp
+                    if table_va == 0:
+                        continue
 
-                if not (0 < table_rva < size_of_image):
-                    continue
-
-                # Read entries from the table until they stop pointing to code
-                table_foff = self._rva_to_offset(table_rva)
-                if table_foff is None:
-                    continue
-
-                entry_size = 4  # RVA entries are 32-bit even in x64 PE
-                table_sec = self._section_for_rva(table_rva)
-                max_entries = 1024  # safety cap
-
-                for idx in range(max_entries):
-                    off = table_foff + idx * entry_size
-                    if off + entry_size > len(self.data):
-                        break
                     if self.is_64 and op.mem.base == cs_x86.X86_REG_RIP:
-                        # x64 relative jump tables: entries are RVA offsets from table base
-                        entry_val = struct.unpack_from('<i', self.data, off)[0]
-                        target_rva = table_rva + entry_val
+                        insn_rva = insn.address - self.image_base
+                        table_rva = insn_rva + insn.size + table_va
                     else:
-                        entry_val = struct.unpack_from('<I', self.data, off)[0]
-                        target_rva = entry_val - self.image_base
+                        table_rva = table_va - self.image_base
 
-                    if not self._is_executable_rva(target_rva):
-                        break  # end of table
+                    if 0 < table_rva < size_of_image:
+                        table_refs = self._read_jump_table_entries(
+                            table_rva, sec_name, size_of_image,
+                            is_relative=(self.is_64 and op.mem.base == cs_x86.X86_REG_RIP)
+                        )
+                        refs.extend(table_refs)
 
-                    refs.append(Reference(
-                        file_offset=off,
-                        ref_type=RefType.JUMP_TABLE,
-                        target_rva=target_rva,
-                        ref_rva=table_rva + idx * entry_size,
-                        size_bytes=entry_size,
-                        is_relative=(self.is_64 and op.mem.base == cs_x86.X86_REG_RIP),
-                        insn_size=entry_size,
-                        section_name=table_sec,
-                        confidence=0.90, source=RefSource.STATIC_DISASM,
-                    ))
+                # Pattern 1b: JMP reg — trace back to find table load (GCC PIC)
+                elif op.type == cs_x86.X86_OP_REG:
+                    jmp_reg = op.reg
+                    table_refs = self._detect_pic_jump_table(
+                        insn_window[:-1], jmp_reg, insn, sec_name, size_of_image
+                    )
+                    refs.extend(table_refs)
+
+        return refs
+
+    def _read_jump_table_entries(self, table_rva: int, sec_name: str,
+                                  size_of_image: int, is_relative: bool) -> List[Reference]:
+        """Read entries from a jump table at the given RVA."""
+        refs = []
+        table_foff = self._rva_to_offset(table_rva)
+        if table_foff is None:
+            return refs
+
+        entry_size = 4
+        max_entries = 1024
+
+        for idx in range(max_entries):
+            off = table_foff + idx * entry_size
+            if off + entry_size > len(self.data):
+                break
+            if is_relative:
+                entry_val = struct.unpack_from('<i', self.data, off)[0]
+                target_rva = table_rva + entry_val
+            else:
+                entry_val = struct.unpack_from('<I', self.data, off)[0]
+                target_rva = entry_val - self.image_base
+
+            if not self._is_executable_rva(target_rva):
+                break
+
+            refs.append(Reference(
+                file_offset=off, ref_type=RefType.JUMP_TABLE,
+                target_rva=target_rva, ref_rva=table_rva + idx * entry_size,
+                size_bytes=entry_size, is_relative=is_relative,
+                insn_size=entry_size, section_name=sec_name,
+                confidence=0.90, source=RefSource.STATIC_DISASM,
+            ))
+        return refs
+
+    def _detect_pic_jump_table(self, window: list, jmp_reg: int,
+                                jmp_insn, sec_name: str,
+                                size_of_image: int) -> List[Reference]:
+        """
+        v7: Detect GCC/Clang PIC jump table pattern:
+        LEA rbase, [rip+table]
+        MOVSXD ridx, DWORD PTR [rbase+rindex*4]
+        ADD ridx, rbase
+        JMP ridx
+        """
+        refs = []
+        # Look for ADD reg, reg pattern followed by a MOVSXD or MOV with scaled index
+        add_insn = None
+        movsxd_insn = None
+        lea_insn = None
+        base_reg = None
+
+        for prev in reversed(window):
+            if prev.id == 0:
+                continue
+            if prev.id == cs_x86.X86_INS_ADD and len(prev.operands) == 2:
+                if prev.operands[0].type == cs_x86.X86_OP_REG and prev.operands[0].reg == jmp_reg:
+                    if prev.operands[1].type == cs_x86.X86_OP_REG:
+                        add_insn = prev
+                        base_reg = prev.operands[1].reg
+            elif prev.id == cs_x86.X86_INS_MOVSXD and len(prev.operands) == 2 and add_insn:
+                if prev.operands[0].type == cs_x86.X86_OP_REG and prev.operands[0].reg == jmp_reg:
+                    if prev.operands[1].type == cs_x86.X86_OP_MEM:
+                        movsxd_insn = prev
+            elif prev.id == cs_x86.X86_INS_LEA and len(prev.operands) == 2 and base_reg:
+                if prev.operands[0].type == cs_x86.X86_OP_REG and prev.operands[0].reg == base_reg:
+                    if prev.operands[1].type == cs_x86.X86_OP_MEM:
+                        mem = prev.operands[1].mem
+                        if self.is_64 and mem.base == cs_x86.X86_REG_RIP:
+                            lea_insn = prev
+                            break
+
+        if lea_insn and movsxd_insn:
+            # Compute table base from LEA [rip+disp]
+            mem = lea_insn.operands[1].mem
+            table_va = lea_insn.address + lea_insn.size + mem.disp
+            table_rva = table_va - self.image_base
+            if 0 < table_rva < size_of_image:
+                refs = self._read_jump_table_entries(
+                    table_rva, sec_name, size_of_image, is_relative=True
+                )
+
         return refs
 
     # ── 7. Vtable Scanner ─────────────────────────────────────────
@@ -833,8 +984,389 @@ class PEReferenceFinder:
                         ))
         return refs
 
+    # ── v7: 9. TLS Directory ──────────────────────────────────────────
+    def _find_tls_entries(self) -> List[Reference]:
+        """Parse TLS directory and callback array."""
+        refs = []
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 9:
+            return refs
+        tls_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[9]
+        if tls_dir.VirtualAddress == 0 or tls_dir.Size == 0:
+            return refs
+        rva = tls_dir.VirtualAddress
+        foff = self._rva_to_offset(rva)
+        if foff is None:
+            return refs
+        if self.is_64:
+            # IMAGE_TLS_DIRECTORY64: StartAddressOfRawData(8), EndAddressOfRawData(8),
+            # AddressOfIndex(8), AddressOfCallbacks(8), ...
+            if foff + 40 > len(self.data):
+                return refs
+            start_raw = struct.unpack_from('<Q', self.data, foff)[0]
+            end_raw = struct.unpack_from('<Q', self.data, foff + 8)[0]
+            addr_index = struct.unpack_from('<Q', self.data, foff + 16)[0]
+            addr_callbacks = struct.unpack_from('<Q', self.data, foff + 24)[0]
+            ptr_size = 8
+            fmt = '<Q'
+        else:
+            if foff + 24 > len(self.data):
+                return refs
+            start_raw = struct.unpack_from('<I', self.data, foff)[0]
+            end_raw = struct.unpack_from('<I', self.data, foff + 4)[0]
+            addr_index = struct.unpack_from('<I', self.data, foff + 8)[0]
+            addr_callbacks = struct.unpack_from('<I', self.data, foff + 12)[0]
+            ptr_size = 4
+            fmt = '<I'
 
-# ─── ELF Reference Finder ────────────────────────────────────────────────
+        # TLS directory fields point to VAs
+        for field_off, va in [(0, start_raw), (ptr_size, end_raw),
+                              (ptr_size * 2, addr_index), (ptr_size * 3, addr_callbacks)]:
+            if va == 0:
+                continue
+            target_rva = va - self.image_base
+            if 0 < target_rva < self.pe.OPTIONAL_HEADER.SizeOfImage:
+                refs.append(Reference(
+                    file_offset=foff + field_off, ref_type=RefType.TLS_DIR_ENTRY,
+                    target_rva=target_rva, ref_rva=rva + field_off,
+                    size_bytes=ptr_size, is_relative=False, insn_size=ptr_size,
+                    section_name=self._section_for_rva(rva),
+                    confidence=1.0, source=RefSource.PE_TABLE,
+                ))
+
+        # Parse TLS callback array
+        if addr_callbacks != 0:
+            cb_rva = addr_callbacks - self.image_base
+            cb_foff = self._rva_to_offset(cb_rva)
+            if cb_foff is not None:
+                for i in range(256):  # safety cap
+                    off = cb_foff + i * ptr_size
+                    if off + ptr_size > len(self.data):
+                        break
+                    val = struct.unpack_from(fmt, self.data, off)[0]
+                    if val == 0:
+                        break  # null-terminated array
+                    target_rva = val - self.image_base
+                    if 0 < target_rva < self.pe.OPTIONAL_HEADER.SizeOfImage:
+                        refs.append(Reference(
+                            file_offset=off, ref_type=RefType.TLS_CALLBACK,
+                            target_rva=target_rva, ref_rva=cb_rva + i * ptr_size,
+                            size_bytes=ptr_size, is_relative=False, insn_size=ptr_size,
+                            section_name=self._section_for_rva(cb_rva),
+                            confidence=1.0, source=RefSource.PE_TABLE,
+                            symbol_name=f"TlsCallback_{i}",
+                        ))
+        return refs
+
+    # ── v7: 10. Load Config Directory ─────────────────────────────────
+    def _find_load_config_entries(self) -> List[Reference]:
+        """Parse Load Configuration directory (SEH handler table, Guard CF)."""
+        refs = []
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 10:
+            return refs
+        lc_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[10]
+        if lc_dir.VirtualAddress == 0 or lc_dir.Size == 0:
+            return refs
+        rva = lc_dir.VirtualAddress
+        foff = self._rva_to_offset(rva)
+        if foff is None:
+            return refs
+
+        if self.is_64:
+            ptr_size = 8
+            fmt = '<Q'
+            # Key offsets in IMAGE_LOAD_CONFIG_DIRECTORY64
+            # SecurityCookie @ 88, SEHandlerTable @ 96, SEHandlerCount @ 104
+            # GuardCFCheckFunctionPointer @ 112, GuardCFDispatchFunctionPointer @ 120
+            # GuardCFFunctionTable @ 128, GuardCFFunctionCount @ 136
+            field_offsets = [
+                (88, "SecurityCookie"), (96, "SEHandlerTable"),
+                (112, "GuardCFCheckFunctionPointer"),
+                (120, "GuardCFDispatchFunctionPointer"),
+                (128, "GuardCFFunctionTable"),
+            ]
+        else:
+            ptr_size = 4
+            fmt = '<I'
+            field_offsets = [
+                (56, "SecurityCookie"), (60, "SEHandlerTable"),
+                (72, "GuardCFCheckFunctionPointer"),
+                (76, "GuardCFDispatchFunctionPointer"),
+                (80, "GuardCFFunctionTable"),
+            ]
+
+        for field_off, name in field_offsets:
+            if foff + field_off + ptr_size > len(self.data):
+                continue
+            va = struct.unpack_from(fmt, self.data, foff + field_off)[0]
+            if va == 0:
+                continue
+            target_rva = va - self.image_base
+            if 0 < target_rva < self.pe.OPTIONAL_HEADER.SizeOfImage:
+                refs.append(Reference(
+                    file_offset=foff + field_off, ref_type=RefType.LOAD_CONFIG_ENTRY,
+                    target_rva=target_rva, ref_rva=rva + field_off,
+                    size_bytes=ptr_size, is_relative=False, insn_size=ptr_size,
+                    section_name=self._section_for_rva(rva),
+                    confidence=1.0, source=RefSource.PE_TABLE,
+                    symbol_name=name,
+                ))
+
+        # Parse SEH handler table if present
+        if self.is_64 and foff + 104 <= len(self.data):
+            seh_table_va = struct.unpack_from('<Q', self.data, foff + 96)[0]
+            seh_count = struct.unpack_from('<Q', self.data, foff + 104)[0]
+        elif not self.is_64 and foff + 68 <= len(self.data):
+            seh_table_va = struct.unpack_from('<I', self.data, foff + 60)[0]
+            seh_count = struct.unpack_from('<I', self.data, foff + 64)[0]
+        else:
+            seh_table_va, seh_count = 0, 0
+
+        if seh_table_va != 0 and 0 < seh_count < 10000:
+            seh_rva = seh_table_va - self.image_base
+            seh_foff = self._rva_to_offset(seh_rva)
+            if seh_foff is not None:
+                for i in range(seh_count):
+                    off = seh_foff + i * 4  # RVA entries are 32-bit
+                    if off + 4 > len(self.data):
+                        break
+                    handler_rva = struct.unpack_from('<I', self.data, off)[0]
+                    if 0 < handler_rva < self.pe.OPTIONAL_HEADER.SizeOfImage:
+                        refs.append(Reference(
+                            file_offset=off, ref_type=RefType.LOAD_CONFIG_ENTRY,
+                            target_rva=handler_rva, ref_rva=seh_rva + i * 4,
+                            size_bytes=4, is_relative=False, insn_size=4,
+                            section_name=self._section_for_rva(seh_rva),
+                            confidence=1.0, source=RefSource.PE_TABLE,
+                            symbol_name=f"SEHandler_{i}",
+                        ))
+
+        # Parse Guard CF function table if present
+        if self.is_64:
+            cfguard_table_off = 128
+            cfguard_count_off = 136
+        else:
+            cfguard_table_off = 80
+            cfguard_count_off = 84
+
+        if foff + cfguard_count_off + ptr_size <= len(self.data):
+            cf_table_va = struct.unpack_from(fmt, self.data, foff + cfguard_table_off)[0]
+            cf_count = struct.unpack_from(fmt, self.data, foff + cfguard_count_off)[0]
+            if cf_table_va != 0 and 0 < cf_count < 500000:
+                cf_rva = cf_table_va - self.image_base
+                cf_foff = self._rva_to_offset(cf_rva)
+                if cf_foff is not None:
+                    # Guard CF entries are RVA + flags (4 bytes + optional extra)
+                    entry_size = 4
+                    # Check for STRIDE info in load config (GuardFlags at offset 144/88)
+                    for i in range(cf_count):
+                        off = cf_foff + i * entry_size
+                        if off + 4 > len(self.data):
+                            break
+                        func_rva = struct.unpack_from('<I', self.data, off)[0]
+                        if 0 < func_rva < self.pe.OPTIONAL_HEADER.SizeOfImage:
+                            refs.append(Reference(
+                                file_offset=off, ref_type=RefType.LOAD_CONFIG_ENTRY,
+                                target_rva=func_rva, ref_rva=cf_rva + i * entry_size,
+                                size_bytes=4, is_relative=False, insn_size=entry_size,
+                                section_name=self._section_for_rva(cf_rva),
+                                confidence=1.0, source=RefSource.PE_TABLE,
+                                symbol_name=f"GuardCF_{i}",
+                            ))
+        return refs
+
+    # ── v7: 11. Delay-Load Imports ────────────────────────────────────
+    def _find_delay_imports(self) -> List[Reference]:
+        """Parse delay-load import directory."""
+        refs = []
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_DELAY_IMPORT'):
+            return refs
+        for dll_entry in self.pe.DIRECTORY_ENTRY_DELAY_IMPORT:
+            dll_name = dll_entry.dll.decode('ascii', errors='replace') if dll_entry.dll else "?"
+            for entry in dll_entry.imports:
+                if entry.address is None:
+                    continue
+                iat_rva = entry.address - self.image_base
+                eof = self._rva_to_offset(iat_rva)
+                if eof is not None:
+                    sym_name = entry.name.decode('ascii', errors='replace') if entry.name else f"ord_{entry.ordinal}"
+                    refs.append(Reference(
+                        file_offset=eof, ref_type=RefType.DELAY_IMPORT,
+                        target_rva=iat_rva, ref_rva=iat_rva,
+                        size_bytes=self.ptr_size, is_relative=False,
+                        insn_size=self.ptr_size,
+                        section_name=self._section_for_rva(iat_rva),
+                        confidence=1.0, source=RefSource.PE_TABLE,
+                        symbol_name=f"delay!{dll_name}!{sym_name}",
+                    ))
+        return refs
+
+    # ── v7: 12. Debug Directory ───────────────────────────────────────
+    def _find_debug_entries(self) -> List[Reference]:
+        """Parse debug directory entries."""
+        refs = []
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 6:
+            return refs
+        dbg_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[6]
+        if dbg_dir.VirtualAddress == 0 or dbg_dir.Size == 0:
+            return refs
+        rva = dbg_dir.VirtualAddress
+        foff = self._rva_to_offset(rva)
+        if foff is None:
+            return refs
+        num_entries = dbg_dir.Size // 28  # IMAGE_DEBUG_DIRECTORY is 28 bytes
+        for i in range(num_entries):
+            off = foff + i * 28
+            if off + 28 > len(self.data):
+                break
+            addr_rva = struct.unpack_from('<I', self.data, off + 20)[0]
+            pointer_raw = struct.unpack_from('<I', self.data, off + 24)[0]
+            if addr_rva > 0 and addr_rva < self.pe.OPTIONAL_HEADER.SizeOfImage:
+                refs.append(Reference(
+                    file_offset=off + 20, ref_type=RefType.DEBUG_DIR_ENTRY,
+                    target_rva=addr_rva, ref_rva=rva + i * 28 + 20,
+                    size_bytes=4, is_relative=False, insn_size=4,
+                    section_name=self._section_for_rva(rva),
+                    confidence=1.0, source=RefSource.PE_TABLE,
+                    symbol_name=f"DebugDir_{i}_RVA",
+                ))
+        return refs
+
+    # ── v7: 13. Indirect Control Flow (call rax, jmp [reg]) ──────────
+    def _find_indirect_control_flow(self) -> List[Reference]:
+        """
+        Track indirect calls/jumps: call rax, jmp [rbx+8], etc.
+        Uses backward dataflow to resolve the target when possible.
+        """
+        refs = []
+        arch = capstone.CS_ARCH_X86
+        mode = capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32
+        md = capstone.Cs(arch, mode)
+        md.detail = True
+        md.skipdata = True
+
+        size_of_image = self.pe.OPTIONAL_HEADER.SizeOfImage
+
+        for section in self.pe.sections:
+            if not self._is_code_section(section):
+                continue
+            sec_name = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+            code = section.get_data()
+            base_va = self.image_base + section.VirtualAddress
+
+            # Collect a small backward window of instructions for dataflow
+            insn_window = []
+            window_size = 8  # look back 8 instructions
+
+            for insn in md.disasm(code, base_va):
+                # Skip SKIPDATA pseudo-instructions (id==0) — no detail info
+                if insn.id == 0:
+                    continue
+                insn_window.append(insn)
+                if len(insn_window) > window_size:
+                    insn_window.pop(0)
+
+                if insn.id not in (cs_x86.X86_INS_CALL, cs_x86.X86_INS_JMP):
+                    continue
+                if len(insn.operands) != 1:
+                    continue
+                op = insn.operands[0]
+
+                # Direct register: call rax, jmp rcx
+                if op.type == cs_x86.X86_OP_REG:
+                    target_reg = op.reg
+                    resolved_va = self._trace_reg_load(insn_window[:-1], target_reg)
+                    ref_type = (RefType.INDIRECT_CALL
+                                if insn.id == cs_x86.X86_INS_CALL
+                                else RefType.INDIRECT_JUMP)
+                    insn_rva = insn.address - self.image_base
+                    foff = self._rva_to_offset(insn_rva)
+                    if foff is None:
+                        continue
+
+                    if resolved_va is not None:
+                        target_rva = resolved_va - self.image_base
+                        if 0 < target_rva < size_of_image:
+                            refs.append(Reference(
+                                file_offset=foff, ref_type=ref_type,
+                                target_rva=target_rva, ref_rva=insn_rva,
+                                size_bytes=0, is_relative=False, insn_size=insn.size,
+                                section_name=sec_name,
+                                confidence=0.7, source=RefSource.DATAFLOW,
+                            ))
+
+                # Memory indirect: call [rax+8], jmp QWORD PTR [rip+0x1234]
+                elif op.type == cs_x86.X86_OP_MEM:
+                    # RIP-relative memory indirect is already caught by disassembly pass
+                    if self.is_64 and op.mem.base == cs_x86.X86_REG_RIP:
+                        continue
+                    # For other reg+disp patterns, try to resolve base register
+                    if op.mem.base != 0 and op.mem.disp != 0:
+                        base_reg = op.mem.base
+                        resolved_base = self._trace_reg_load(insn_window[:-1], base_reg)
+                        if resolved_base is not None:
+                            effective_va = resolved_base + op.mem.disp
+                            target_rva = effective_va - self.image_base
+                            ref_type = (RefType.INDIRECT_CALL
+                                        if insn.id == cs_x86.X86_INS_CALL
+                                        else RefType.INDIRECT_JUMP)
+                            insn_rva = insn.address - self.image_base
+                            foff = self._rva_to_offset(insn_rva)
+                            if foff and 0 < target_rva < size_of_image:
+                                refs.append(Reference(
+                                    file_offset=foff, ref_type=ref_type,
+                                    target_rva=target_rva, ref_rva=insn_rva,
+                                    size_bytes=0, is_relative=False,
+                                    insn_size=insn.size, section_name=sec_name,
+                                    confidence=0.5, source=RefSource.DATAFLOW,
+                                ))
+        return refs
+
+    def _trace_reg_load(self, window: list, target_reg: int) -> Optional[int]:
+        """
+        Backward dataflow: trace a register to find its most recent load value.
+        Handles: MOV reg, imm; LEA reg, [rip+disp]; MOV reg, [rip+disp].
+        Returns the resolved VA or None.
+        """
+        for insn in reversed(window):
+            if insn.id == 0:
+                continue
+            if len(insn.operands) < 2:
+                continue
+            dst = insn.operands[0]
+            if dst.type != cs_x86.X86_OP_REG or dst.reg != target_reg:
+                continue
+
+            src = insn.operands[1]
+            # MOV reg, imm64/imm32
+            if insn.id == cs_x86.X86_INS_MOV and src.type == cs_x86.X86_OP_IMM:
+                return src.imm
+            # LEA reg, [rip+disp]
+            if insn.id == cs_x86.X86_INS_LEA and src.type == cs_x86.X86_OP_MEM:
+                if self.is_64 and src.mem.base == cs_x86.X86_REG_RIP:
+                    return insn.address + insn.size + src.mem.disp
+            # MOV reg, [rip+disp] (load from memory)
+            if insn.id == cs_x86.X86_INS_MOV and src.type == cs_x86.X86_OP_MEM:
+                if self.is_64 and src.mem.base == cs_x86.X86_REG_RIP:
+                    return insn.address + insn.size + src.mem.disp
+
+            # If the register is written by something we can't resolve, stop
+            break
+        return None
+
+    # ── v7: 14. Code Signing Detection ────────────────────────────────
+    def detect_signature(self) -> Optional[Dict]:
+        """Detect Authenticode / code signing in PE."""
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 4:
+            return None
+        cert_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
+        if cert_dir.VirtualAddress == 0 or cert_dir.Size == 0:
+            return None
+        return {
+            'type': 'authenticode',
+            'offset': cert_dir.VirtualAddress,  # This is a file offset, not RVA
+            'size': cert_dir.Size,
+            'warning': 'Binary has Authenticode signature — modifications will invalidate it',
+        }
 
 class ELFReferenceFinder:
     """
@@ -969,6 +1501,7 @@ class ELFReferenceFinder:
             ("Symbol tables", self._find_from_symbols),
             ("GOT / PLT", self._find_got_plt),
             ("Init/Fini arrays", self._find_init_fini),
+            ("Dynamic tags", self._find_dynamic_tags),          # v7
             ("Data pointers (heuristic)", self._find_data_pointers),
         ]
         for i, (name, func) in enumerate(steps):
@@ -1269,6 +1802,8 @@ class ELFReferenceFinder:
 
     def _disasm_generic_insn(self, refs, insn, insn_vaddr, insn_foff, sec_name):
         """Handle non-x86 instruction reference extraction using generic Capstone groups."""
+        if insn.id == 0:
+            return
         if not insn.groups:
             return
 
@@ -1374,6 +1909,86 @@ class ELFReferenceFinder:
         return refs
 
     # ── 6. Data Pointer Heuristic ─────────────────────────────────────
+    # ── v7: 7. Dynamic Tags ──────────────────────────────────────────
+    def _find_dynamic_tags(self) -> List[Reference]:
+        """
+        Parse .dynamic section entries that contain virtual addresses.
+        These must be updated when binary is shifted.
+        """
+        refs = []
+        dyn_sec = self._section_cache.get('.dynamic')
+        if dyn_sec is None:
+            return refs
+
+        # Tags that contain virtual addresses needing fixup
+        addr_tags = {
+            0x03: 'DT_PLTGOT',
+            0x04: 'DT_HASH',
+            0x05: 'DT_STRTAB',
+            0x06: 'DT_SYMTAB',
+            0x07: 'DT_RELA',
+            0x0C: 'DT_INIT',
+            0x0D: 'DT_FINI',
+            0x11: 'DT_REL',
+            0x15: 'DT_DEBUG',
+            0x17: 'DT_JMPREL',
+            0x19: 'DT_INIT_ARRAY',
+            0x1A: 'DT_FINI_ARRAY',
+            0x1C: 'DT_PREINIT_ARRAY',
+            0x6FFFFEF5: 'DT_GNU_HASH',
+            0x6FFFFFF0: 'DT_VERSYM',
+            0x6FFFFFFE: 'DT_VERNEED',
+            0x6FFFFFFC: 'DT_VERDEF',
+        }
+
+        # Tags with non-address values (sizes, counts, flags)
+        skip_tags = {0x01, 0x02, 0x08, 0x09, 0x0A, 0x0B, 0x0E, 0x0F,
+                     0x10, 0x12, 0x13, 0x14, 0x16, 0x18, 0x1B, 0x1D,
+                     0x1E, 0x1F, 0x20}
+
+        e = self.endian
+        base_va = dyn_sec.header['sh_addr']
+        base_foff = dyn_sec.header['sh_offset']
+        entry_size = 16 if self.is_64 else 8
+        data = dyn_sec.data()
+
+        for i in range(0, len(data) - entry_size + 1, entry_size):
+            if self.is_64:
+                tag = struct.unpack_from(f'{e}q', data, i)[0]
+                val = struct.unpack_from(f'{e}Q', data, i + 8)[0]
+            else:
+                tag = struct.unpack_from(f'{e}i', data, i)[0]
+                val = struct.unpack_from(f'{e}I', data, i + 4)[0]
+
+            if tag == 0:  # DT_NULL — end of dynamic section
+                break
+            if tag in skip_tags or tag < 0:
+                continue
+
+            tag_name = addr_tags.get(tag, f'DT_0x{tag:X}')
+            if tag not in addr_tags:
+                continue  # Only track known address tags
+
+            if val == 0:
+                continue
+
+            val_off = i + (8 if self.is_64 else 4)
+            foff = base_foff + val_off
+            if foff + self.ptr_size > len(self.data):
+                continue
+
+            refs.append(Reference(
+                file_offset=foff,
+                ref_type=RefType.ELF_DYNAMIC_TAG,
+                target_rva=val, ref_rva=base_va + val_off,
+                size_bytes=self.ptr_size, is_relative=False,
+                insn_size=self.ptr_size, section_name='.dynamic',
+                confidence=1.0, source=RefSource.ELF_TABLE,
+                symbol_name=tag_name,
+            ))
+        return refs
+
+    # ── 8. Data Pointer Heuristic ─────────────────────────────────────
     def _find_data_pointers(self) -> List[Reference]:
         refs = []
         code_lo, code_hi = self._get_code_range()
@@ -1916,13 +2531,16 @@ class MachOReferenceFinder:
 
 class BaseShiftEngine:
     """
-    Shared base for PE and ELF shift engines.
+    Shared base for PE, ELF, and Mach-O shift engines.
 
-    Provides:
+    v7 features:
     - _write_int: safe byte writing to buffer
     - _relax_short_branch: EB→E9 / 7x→0F 8x auto-upgrade
     - _cascade_shift: mini-recalc after relaxation
-    - _SHORT_TO_NEAR_JCC: opcode mapping table
+    - _run_relaxation_pass: multi-pass fixpoint relaxation (v7)
+    - Batch/transaction system: begin_batch/commit_batch/rollback_batch (v7)
+    - Cross-section validation (v7)
+    - Code signing detection (v7)
     """
 
     # Mapping from short conditional branch opcodes (7x) to near conditional (0F 8x)
@@ -1937,6 +2555,13 @@ class BaseShiftEngine:
         self.buffer: bytearray = bytearray()
         self.ref_db: Optional[ReferenceDatabase] = None
         self.is_64: bool = False
+        # v7: batch/transaction state
+        self._batch_active: bool = False
+        self._batch_ops: List[Tuple[ShiftOp, int, int, bytes]] = []
+        self._batch_snapshot: Optional[bytes] = None
+        # v7: code signing detection
+        self._has_signature: bool = False
+        self._signature_warning_shown: bool = False
 
     def _write_int(self, offset: int, value: int, size: int, signed: bool = False):
         if offset < 0 or offset + size > len(self.buffer):
@@ -2045,27 +2670,139 @@ class BaseShiftEngine:
     def _run_relaxation_pass(self, relaxations: list, updated: int,
                               warnings: List[str]) -> Tuple[int, List[str]]:
         """
-        Process short branch overflows by relaxing them to near branches.
-        Shared by PE and ELF shift engines.
+        v7: Multi-pass fixpoint relaxation.
+        Processes short branch overflows by relaxing them to near branches.
+        Repeats until no more relaxations are needed (fixpoint).
+        Max 8 passes to prevent infinite loops.
         """
         if not relaxations:
             return updated, warnings
 
-        relaxations.sort(key=lambda x: x[2], reverse=True)  # highest addr first
-        for ref, foff, ref_addr, target_addr in relaxations:
-            result = self._relax_short_branch(ref)
-            if result:
-                updated += 1
-                warnings.append(
-                    f"RELAXED short→near @0x{ref_addr:X}: "
-                    f"{ref.ref_type.value} (auto-upgraded)"
-                )
-            else:
-                warnings.append(
-                    f"SHORT BRANCH OVERFLOW @0x{ref_addr:X}: "
-                    f"could not auto-relax (type={ref.ref_type.value})"
-                )
+        max_passes = 8
+        for pass_num in range(max_passes):
+            if not relaxations:
+                break
+
+            relaxations.sort(key=lambda x: x[2], reverse=True)  # highest addr first
+            new_relaxations = []
+
+            for ref, foff, ref_addr, target_addr in relaxations:
+                result = self._relax_short_branch(ref)
+                if result:
+                    updated += 1
+                    warnings.append(
+                        f"RELAXED short→near @0x{ref_addr:X}: "
+                        f"{ref.ref_type.value} (auto-upgraded, pass {pass_num + 1})"
+                    )
+                else:
+                    warnings.append(
+                        f"SHORT BRANCH OVERFLOW @0x{ref_addr:X}: "
+                        f"could not auto-relax (type={ref.ref_type.value})"
+                    )
+
+            # Check if cascade caused new overflows
+            for ref in self.ref_db.get_all():
+                if ref.is_relative and ref.size_bytes == 1:
+                    disp = ref.target_rva - (ref.ref_rva + ref.insn_size)
+                    if disp < -128 or disp > 127:
+                        new_foff = ref.file_offset
+                        new_relaxations.append((ref, new_foff, ref.ref_rva, ref.target_rva))
+
+            relaxations = new_relaxations
+            if not relaxations:
+                break
+
+        if relaxations:
+            warnings.append(
+                f"WARNING: {len(relaxations)} short branches still overflowing "
+                f"after {max_passes} relaxation passes"
+            )
+
         return updated, warnings
+
+    # ── v7: Batch/Transaction System ──────────────────────────────────
+
+    def begin_batch(self):
+        """Start a batch transaction. Saves a snapshot for rollback."""
+        if self._batch_active:
+            raise RuntimeError("Batch already active — commit or rollback first")
+        self._batch_active = True
+        self._batch_snapshot = bytes(self.buffer)
+        self._batch_ops = []
+
+    def commit_batch(self) -> Dict:
+        """Commit the batch. Returns summary of all operations."""
+        if not self._batch_active:
+            raise RuntimeError("No active batch to commit")
+        self._batch_active = False
+        summary = {
+            'operations': len(self._batch_ops),
+            'ops': [(op.value, addr, n) for op, addr, n, _ in self._batch_ops],
+        }
+        self._batch_ops = []
+        self._batch_snapshot = None
+        return summary
+
+    def rollback_batch(self) -> str:
+        """Rollback the batch to the saved snapshot."""
+        if not self._batch_active:
+            raise RuntimeError("No active batch to rollback")
+        if self._batch_snapshot is not None:
+            self.buffer = bytearray(self._batch_snapshot)
+        self._batch_active = False
+        ops_count = len(self._batch_ops)
+        self._batch_ops = []
+        self._batch_snapshot = None
+        return f"Rolled back {ops_count} operations"
+
+    @property
+    def batch_active(self) -> bool:
+        return self._batch_active
+
+    def _record_batch_op(self, op: ShiftOp, addr: int, n: int, data: bytes):
+        """Record an operation in the current batch."""
+        if self._batch_active:
+            self._batch_ops.append((op, addr, n, data))
+
+    # ── v7: Cross-Section Target Validation ───────────────────────────
+
+    def validate_all_targets(self, valid_ranges: List[Tuple[int, int]]) -> List[Dict]:
+        """
+        Validate that all reference targets land within valid address ranges.
+        Call after shift operations to detect broken references.
+        """
+        if not self.ref_db:
+            return []
+        broken = []
+        for ref in self.ref_db.get_all():
+            target = ref.target_rva
+            in_range = any(lo <= target < hi for lo, hi in valid_ranges)
+            if not in_range and ref.confidence >= 0.7:
+                broken.append({
+                    'ref_rva': f'0x{ref.ref_rva:X}',
+                    'target_rva': f'0x{target:X}',
+                    'type': ref.ref_type.value,
+                    'section': ref.section_name,
+                    'confidence': ref.confidence,
+                })
+        return broken
+
+    # ── v7: Code Signing Detection ────────────────────────────────────
+
+    def detect_code_signature(self) -> Optional[Dict]:
+        """
+        Detect code signatures / Authenticode in the binary.
+        Override per format. Returns info dict or None.
+        """
+        return None
+
+    def _check_signature_warning(self) -> Optional[str]:
+        """If binary is signed, return a warning string."""
+        if self._has_signature and not self._signature_warning_shown:
+            self._signature_warning_shown = True
+            return ("WARNING: This binary has a code signature / Authenticode. "
+                    "Modifications will invalidate the signature.")
+        return None
 
 
 # ─── ELF Shift Engine ────────────────────────────────────────────────────
@@ -2090,6 +2827,7 @@ class ELFShiftEngine(BaseShiftEngine):
         self.ref_db = ref_db
         self.is_64 = self.elf.elfclass == 64
         self.ptr_size = 8 if self.is_64 else 4
+        self.endian = '>' if self.elf.little_endian is False else '<'
         self._undo_stack: List[Tuple[ShiftOp, int, int, bytes]] = []
 
     def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
@@ -2120,6 +2858,7 @@ class ELFShiftEngine(BaseShiftEngine):
 
         sections_adjusted = self._update_elf_headers(vaddr, N, insert_foff)
         self._update_elf_relocations(vaddr, N)
+        self._update_elf_dynamic_tags(vaddr, N)  # v7
         refs_updated, warnings = self._recalculate_refs(vaddr, N)
 
         return ShiftResult(
@@ -2145,6 +2884,7 @@ class ELFShiftEngine(BaseShiftEngine):
 
         sections_adjusted = self._update_elf_headers(vaddr, -count, foff)
         self._update_elf_relocations(vaddr, -count)
+        self._update_elf_dynamic_tags(vaddr, -count)  # v7
         refs_updated, warnings = self._recalculate_refs(vaddr, -count)
 
         return ShiftResult(
@@ -2461,8 +3201,76 @@ class ELFShiftEngine(BaseShiftEngine):
 
         return updated
 
+    def _update_elf_dynamic_tags(self, shift_va: int, delta: int) -> int:
+        """
+        v7: Update .dynamic section entries that contain virtual addresses.
+        Patches DT_* entries whose d_val (address) >= shift_va.
+        """
+        updated = 0
+        e = self.endian
 
-# ─── Mach-O Shift Engine ─────────────────────────────────────────────────
+        # Find .dynamic section by scanning section headers
+        if self.is_64:
+            e_shoff = struct.unpack_from(f'{e}Q', self.buffer, 40)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 58)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 60)[0]
+        else:
+            e_shoff = struct.unpack_from(f'{e}I', self.buffer, 32)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 46)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 48)[0]
+
+        # SHT_DYNAMIC = 6
+        for i in range(e_shnum):
+            sh_off = e_shoff + i * e_shentsize
+            if sh_off + e_shentsize > len(self.buffer):
+                break
+            if self.is_64:
+                sh_type = struct.unpack_from(f'{e}I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 32)[0]
+            else:
+                sh_type = struct.unpack_from(f'{e}I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}I', self.buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from(f'{e}I', self.buffer, sh_off + 20)[0]
+
+            if sh_type != 6:  # SHT_DYNAMIC
+                continue
+
+            # Tags that contain virtual addresses
+            addr_tags = {0x03, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0D,
+                         0x11, 0x15, 0x17, 0x19, 0x1A, 0x1C,
+                         0x6FFFFEF5, 0x6FFFFFF0, 0x6FFFFFFE, 0x6FFFFFFC}
+
+            entry_size = 16 if self.is_64 else 8
+            num_entries = sh_size // entry_size
+
+            for j in range(num_entries):
+                ent_off = sh_offset + j * entry_size
+                if ent_off + entry_size > len(self.buffer):
+                    break
+
+                if self.is_64:
+                    tag = struct.unpack_from(f'{e}q', self.buffer, ent_off)[0]
+                    val = struct.unpack_from(f'{e}Q', self.buffer, ent_off + 8)[0]
+                else:
+                    tag = struct.unpack_from(f'{e}i', self.buffer, ent_off)[0]
+                    val = struct.unpack_from(f'{e}I', self.buffer, ent_off + 4)[0]
+
+                if tag == 0:  # DT_NULL
+                    break
+                if tag not in addr_tags:
+                    continue
+                if val >= shift_va:
+                    new_val = val + delta
+                    if self.is_64:
+                        struct.pack_into(f'{e}Q', self.buffer, ent_off + 8, new_val)
+                    else:
+                        struct.pack_into(f'{e}I', self.buffer, ent_off + 4,
+                                         new_val & 0xFFFFFFFF)
+                    updated += 1
+            break  # Only one .dynamic section
+
+        return updated
 
 class MachOShiftEngine(BaseShiftEngine):
     """
@@ -2482,6 +3290,38 @@ class MachOShiftEngine(BaseShiftEngine):
         self.sections = self.finder.sections
         self.arch_offset = self.finder.arch_offset
         self._undo_stack: List[Tuple[ShiftOp, int, int, bytes]] = []
+        # v7: Detect code signing
+        self._detect_macho_signature()
+
+    def _detect_macho_signature(self):
+        """Check for LC_CODE_SIGNATURE in Mach-O."""
+        LC_CODE_SIGNATURE = 0x1D
+        base = self.arch_offset
+        if self.is_64:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            cmd_offset = base + 32
+        else:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            cmd_offset = base + 28
+        for _ in range(ncmds):
+            if cmd_offset + 8 > len(self.buffer):
+                break
+            cmd = struct.unpack_from('<I', self.buffer, cmd_offset)[0]
+            cmdsize = struct.unpack_from('<I', self.buffer, cmd_offset + 4)[0]
+            if cmdsize < 8:
+                break
+            if cmd == LC_CODE_SIGNATURE:
+                self._has_signature = True
+                return
+            cmd_offset += cmdsize
+
+    def detect_code_signature(self) -> Optional[Dict]:
+        if not self._has_signature:
+            return None
+        return {
+            'type': 'macho_codesign',
+            'warning': 'Binary has Mach-O code signature (LC_CODE_SIGNATURE) — modifications will invalidate it',
+        }
 
     def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
         for seg in self.segments:
@@ -2522,17 +3362,8 @@ class MachOShiftEngine(BaseShiftEngine):
         self.segments = finder.segments
         self.sections = finder.sections
 
-    def undo(self) -> Optional[str]:
-        if not self._undo_stack:
-            return None
-        op, foff, n, saved = self._undo_stack.pop()
-        if op == ShiftOp.INSERT:
-            del self.buffer[foff:foff + n]
-            self._reparse_macho()
-            return f"Undid INSERT of {n} bytes at offset 0x{foff:X}"
-        elif op == ShiftOp.DELETE:
-            self.buffer[foff:foff] = saved
-            self._reparse_macho()
+    def insert_bytes(self, vaddr: int, data: bytes) -> ShiftResult:
+        N = len(data)
         insert_foff = self._vaddr_to_offset(vaddr)
         if insert_foff is None:
             return ShiftResult(ShiftOp.INSERT, vaddr, N, 0, [],
@@ -2971,6 +3802,26 @@ class ShiftEngine(BaseShiftEngine):
         self.file_alignment = self.pe.OPTIONAL_HEADER.FileAlignment
         self.section_alignment = self.pe.OPTIONAL_HEADER.SectionAlignment
         self._undo_stack: List[Tuple[ShiftOp, int, int, bytes]] = []
+        # v7: Detect code signing
+        self._detect_pe_signature()
+
+    def _detect_pe_signature(self):
+        """Check for Authenticode in PE."""
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 4:
+            cert_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
+            if cert_dir.VirtualAddress != 0 and cert_dir.Size != 0:
+                self._has_signature = True
+
+    def detect_code_signature(self) -> Optional[Dict]:
+        if not self._has_signature:
+            return None
+        cert_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
+        return {
+            'type': 'authenticode',
+            'offset': cert_dir.VirtualAddress,
+            'size': cert_dir.Size,
+            'warning': 'Binary has Authenticode signature — modifications will invalidate it',
+        }
 
     def _encode_absolute(self, ref: Reference):
         """Encode PE absolute reference (target_rva + image_base)."""
@@ -3052,6 +3903,12 @@ class ShiftEngine(BaseShiftEngine):
             return ShiftResult(ShiftOp.INSERT, rva, 0, 0, [], 0,
                                len(self.buffer), True, "Nothing to insert")
 
+        # v7: signature warning
+        warnings_pre = []
+        sig_warn = self._check_signature_warning()
+        if sig_warn:
+            warnings_pre.append(sig_warn)
+
         # Find the file offset for this RVA
         insert_foff = self._rva_to_offset(rva)
         if insert_foff is None:
@@ -3070,6 +3927,7 @@ class ShiftEngine(BaseShiftEngine):
 
         # Phase 3: Recalculate all references
         refs_updated, warnings = self._recalculate_refs(rva, N)
+        warnings = warnings_pre + warnings
 
         # Phase 4: Update PE headers
         self._update_pe_headers(rva, N)
@@ -3270,6 +4128,173 @@ class ShiftEngine(BaseShiftEngine):
         for i, dd in enumerate(oh.DATA_DIRECTORY):
             if dd.VirtualAddress and dd.VirtualAddress >= rva:
                 dd.VirtualAddress += delta
+
+    # ── v7: Section Management ────────────────────────────────────────
+
+    def add_section(self, name: str, size: int, characteristics: int = 0xE0000020,
+                    data: bytes = None) -> Dict:
+        """
+        Add a new PE section at the end of the section table.
+
+        Args:
+            name: Section name (max 8 chars, e.g. '.ubrt')
+            size: Virtual size of the new section
+            characteristics: Section characteristics flags (default: RWX + code)
+            data: Optional initial data (padded/truncated to aligned size)
+
+        Returns:
+            Dict with section details {'name', 'rva', 'vsize', 'raw_offset', 'raw_size'}
+        """
+        fa = self.file_alignment
+        sa = self.section_alignment
+
+        # Validate name
+        sec_name = name.encode('ascii')[:8].ljust(8, b'\x00')
+
+        # Compute where the new section goes
+        last_sec = max(self.pe.sections, key=lambda s: s.VirtualAddress)
+        new_rva = last_sec.VirtualAddress + last_sec.Misc_VirtualSize
+        new_rva = (new_rva + sa - 1) & ~(sa - 1)  # align to section alignment
+
+        last_raw = max(self.pe.sections, key=lambda s: s.PointerToRawData + s.SizeOfRawData)
+        new_raw_offset = last_raw.PointerToRawData + last_raw.SizeOfRawData
+        new_raw_offset = (new_raw_offset + fa - 1) & ~(fa - 1)  # align to file alignment
+
+        raw_size = (size + fa - 1) & ~(fa - 1)  # file-aligned size
+
+        # Check there's room in the header for a new section entry
+        header_end = self.pe.OPTIONAL_HEADER.SizeOfHeaders
+        num_sections = self.pe.FILE_HEADER.NumberOfSections
+        section_table_offset = (self.pe.OPTIONAL_HEADER.get_file_offset() +
+                                self.pe.FILE_HEADER.SizeOfOptionalHeader)
+        entry_size = 40  # sizeof(IMAGE_SECTION_HEADER)
+        needed = section_table_offset + (num_sections + 1) * entry_size
+        if needed > header_end:
+            return {'error': f'No room for section header (need {needed}, headers end at {header_end})'}
+
+        # Prepare section data
+        if data is not None:
+            sec_data = bytearray(data[:raw_size]).ljust(raw_size, b'\x00')
+        else:
+            sec_data = bytearray(raw_size)
+
+        # Extend buffer
+        if new_raw_offset > len(self.buffer):
+            self.buffer.extend(b'\x00' * (new_raw_offset - len(self.buffer)))
+        if new_raw_offset < len(self.buffer):
+            # Insert at the right position
+            self.buffer[new_raw_offset:new_raw_offset] = sec_data
+        else:
+            self.buffer.extend(sec_data)
+
+        # Write the section header entry
+        entry_offset = section_table_offset + num_sections * entry_size
+        struct.pack_into('8s', self.buffer, entry_offset, sec_name)
+        struct.pack_into('<I', self.buffer, entry_offset + 8, size)           # VirtualSize
+        struct.pack_into('<I', self.buffer, entry_offset + 12, new_rva)       # VirtualAddress
+        struct.pack_into('<I', self.buffer, entry_offset + 16, raw_size)      # SizeOfRawData
+        struct.pack_into('<I', self.buffer, entry_offset + 20, new_raw_offset) # PointerToRawData
+        struct.pack_into('<I', self.buffer, entry_offset + 24, 0)             # PointerToRelocations
+        struct.pack_into('<I', self.buffer, entry_offset + 28, 0)             # PointerToLinenumbers
+        struct.pack_into('<H', self.buffer, entry_offset + 32, 0)             # NumberOfRelocations
+        struct.pack_into('<H', self.buffer, entry_offset + 34, 0)             # NumberOfLinenumbers
+        struct.pack_into('<I', self.buffer, entry_offset + 36, characteristics)
+
+        # Update PE headers
+        self.pe.FILE_HEADER.NumberOfSections = num_sections + 1
+        oh = self.pe.OPTIONAL_HEADER
+        new_image_end = new_rva + size
+        oh.SizeOfImage = (new_image_end + sa - 1) & ~(sa - 1)
+        if characteristics & 0x20000000:  # IMAGE_SCN_MEM_EXECUTE
+            oh.SizeOfCode += raw_size
+        if characteristics & 0x00000040:  # IMAGE_SCN_CNT_INITIALIZED_DATA
+            oh.SizeOfInitializedData += raw_size
+
+        # Re-parse PE to pick up new section
+        self.pe = pefile.PE(data=bytes(self.buffer))
+
+        # Record for undo
+        self._undo_stack.append((ShiftOp.INSERT, new_raw_offset, raw_size, b''))
+
+        result = {
+            'name': name,
+            'rva': new_rva,
+            'vsize': size,
+            'raw_offset': new_raw_offset,
+            'raw_size': raw_size,
+        }
+        self._record_batch_op(('add_section', result))
+        return result
+
+    def remove_section(self, name: str) -> Dict:
+        """
+        Remove a PE section by name. Only the last section can be safely removed.
+
+        Args:
+            name: Name of the section to remove (e.g. '.ubrt')
+
+        Returns:
+            Dict with removal details or error
+        """
+        target = None
+        for s in self.pe.sections:
+            sec_name = s.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+            if sec_name == name:
+                target = s
+                break
+        if target is None:
+            return {'error': f'Section {name!r} not found'}
+
+        # Only allow removing the last section (by VirtualAddress)
+        last_sec = max(self.pe.sections, key=lambda s: s.VirtualAddress)
+        if target.VirtualAddress != last_sec.VirtualAddress:
+            return {'error': f'Can only remove the last section (last is '
+                    f'{last_sec.Name.rstrip(b"\x00").decode("ascii", errors="replace")!r})'}
+
+        raw_off = target.PointerToRawData
+        raw_size = target.SizeOfRawData
+        sec_rva = target.VirtualAddress
+        sec_vsize = target.Misc_VirtualSize
+        old_data = bytes(self.buffer[raw_off:raw_off + raw_size])
+
+        # Remove section data from buffer
+        self.buffer[raw_off:raw_off + raw_size] = b''
+
+        # Clear the section header entry
+        num_sections = self.pe.FILE_HEADER.NumberOfSections
+        section_table_offset = (self.pe.OPTIONAL_HEADER.get_file_offset() +
+                                self.pe.FILE_HEADER.SizeOfOptionalHeader)
+        entry_size = 40
+        last_entry_offset = section_table_offset + (num_sections - 1) * entry_size
+        self.buffer[last_entry_offset:last_entry_offset + entry_size] = b'\x00' * entry_size
+
+        # Update PE headers
+        self.pe.FILE_HEADER.NumberOfSections = num_sections - 1
+        oh = self.pe.OPTIONAL_HEADER
+        if num_sections >= 2:
+            prev_sec = sorted(self.pe.sections, key=lambda s: s.VirtualAddress)[-2]
+            new_end = prev_sec.VirtualAddress + prev_sec.Misc_VirtualSize
+            sa = self.section_alignment
+            oh.SizeOfImage = (new_end + sa - 1) & ~(sa - 1)
+        if target.Characteristics & 0x20000000:
+            oh.SizeOfCode = max(0, oh.SizeOfCode - raw_size)
+        if target.Characteristics & 0x00000040:
+            oh.SizeOfInitializedData = max(0, oh.SizeOfInitializedData - raw_size)
+
+        # Re-parse PE
+        self.pe = pefile.PE(data=bytes(self.buffer))
+
+        # Record for undo
+        self._undo_stack.append((ShiftOp.DELETE, raw_off, raw_size, old_data))
+
+        result = {
+            'removed': name,
+            'rva': sec_rva,
+            'vsize': sec_vsize,
+            'raw_removed': raw_size,
+        }
+        self._record_batch_op(('remove_section', result))
+        return result
 
 
 # ─── QEMU Tracer ─────────────────────────────────────────────────────────
@@ -3748,3 +4773,86 @@ class UBRTEngine:
                 buf, self.shift_engine.pe, shift_addr, delta)
             count += SymbolUpdater.update_pe_debug_dir(
                 buf, self.shift_engine.pe, shift_addr, delta)
+
+    # ── v7: Batch/Transaction Interface ───────────────────────────────
+
+    def begin_batch(self):
+        """Start a batch transaction for multiple operations."""
+        if not self.shift_engine:
+            raise RuntimeError("No binary loaded")
+        self.shift_engine.begin_batch()
+
+    def commit_batch(self) -> Dict:
+        """Commit the current batch."""
+        if not self.shift_engine:
+            raise RuntimeError("No binary loaded")
+        return self.shift_engine.commit_batch()
+
+    def rollback_batch(self) -> str:
+        """Rollback the current batch."""
+        if not self.shift_engine:
+            raise RuntimeError("No binary loaded")
+        return self.shift_engine.rollback_batch()
+
+    # ── v7: Cross-Section Validation ──────────────────────────────────
+
+    def validate_references(self) -> Dict:
+        """Validate all reference targets are within valid address ranges."""
+        if not self.shift_engine or not self.ref_db:
+            return {'success': False, 'error': 'No binary loaded'}
+
+        valid_ranges = []
+        for sec in self.pe_info.get('sections', []):
+            rva = sec.get('rva', 0)
+            vsize = sec.get('vsize', 0)
+            if rva > 0 and vsize > 0:
+                valid_ranges.append((rva, rva + vsize))
+
+        broken = self.shift_engine.validate_all_targets(valid_ranges)
+        return {
+            'success': True,
+            'total_refs': self.ref_db.count,
+            'broken_refs': len(broken),
+            'broken': broken[:50],  # cap output
+        }
+
+    # ── v7: Code Signing Detection ────────────────────────────────────
+
+    def check_signature(self) -> Optional[Dict]:
+        """Check if the loaded binary has a code signature."""
+        if not self.shift_engine:
+            return None
+        return self.shift_engine.detect_code_signature()
+
+    # ── v7: Range Query Interface ─────────────────────────────────────
+
+    def get_refs_in_range(self, lo: int, hi: int) -> List[Dict]:
+        """Get all references with ref_rva in [lo, hi)."""
+        if not self.ref_db:
+            return []
+        return [r.to_dict() for r in self.ref_db.get_refs_in_range(lo, hi)]
+
+    def get_refs_targeting_range(self, lo: int, hi: int) -> List[Dict]:
+        """Get all references whose target_rva falls in [lo, hi)."""
+        if not self.ref_db:
+            return []
+        return [r.to_dict() for r in self.ref_db.get_refs_targeting_range(lo, hi)]
+
+    # ── v7: Section Management ────────────────────────────────────────
+
+    def add_section(self, name: str, size: int, characteristics: int = 0xE0000020,
+                    data: bytes = None) -> Dict:
+        """Add a new section to the loaded PE binary."""
+        if not self.shift_engine:
+            return {'error': 'No binary loaded or shift engine not initialized'}
+        if not hasattr(self.shift_engine, 'add_section'):
+            return {'error': 'Section management not supported for this format'}
+        return self.shift_engine.add_section(name, size, characteristics, data)
+
+    def remove_section(self, name: str) -> Dict:
+        """Remove a section from the loaded PE binary (last section only)."""
+        if not self.shift_engine:
+            return {'error': 'No binary loaded or shift engine not initialized'}
+        if not hasattr(self.shift_engine, 'remove_section'):
+            return {'error': 'Section management not supported for this format'}
+        return self.shift_engine.remove_section(name)
