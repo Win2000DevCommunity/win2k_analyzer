@@ -46,9 +46,11 @@ class RefType(enum.Enum):
     REL_COND_NEAR   = "rel_cond_near"
     ABS_IMMEDIATE   = "abs_immediate"
     ABS_DISPLACEMENT = "abs_displacement"
+    RIP_RELATIVE    = "rip_relative"
     RELOC_HIGHLOW   = "reloc_highlow"
     RELOC_DIR64     = "reloc_dir64"
     JUMP_TABLE      = "jump_table"
+    VTABLE_ENTRY    = "vtable_entry"
     EXPORT_RVA      = "export_rva"
     IMPORT_THUNK    = "import_thunk"
     EXCEPTION_ENTRY = "exception_entry"
@@ -244,6 +246,8 @@ class PEReferenceFinder:
             ("Export table", self._find_from_exports),
             ("Import table", self._find_from_imports),
             ("Exception table", self._find_from_exceptions),
+            ("Jump tables (switch/case)", self._find_jump_tables),
+            ("Vtables (C++ virtual)", self._find_vtables),
             ("Data pointers (heuristic)", self._find_data_pointers),
         ]
         for i, (name, func) in enumerate(steps):
@@ -425,6 +429,79 @@ class PEReferenceFinder:
                             confidence=0.95, source=RefSource.STATIC_DISASM,
                         ))
 
+                # ── RIP-relative addressing (x64): LEA, MOV, CMP, etc. ──
+                elif self.is_64 and len(insn.operands) >= 2:
+                    for op_idx, op in enumerate(insn.operands):
+                        if (op.type == cs_x86.X86_OP_MEM and
+                                op.mem.base == cs_x86.X86_REG_RIP and
+                                op.mem.index == 0):
+                            disp = op.mem.disp
+                            target_rva = insn_rva + insn.size + disp
+                            # The disp32 is always the last 4 bytes before any immediate
+                            disp_foff = insn_foff + insn.size - 4
+                            # If instruction has an immediate operand after, adjust
+                            for op2 in insn.operands:
+                                if op2.type == cs_x86.X86_OP_IMM:
+                                    disp_foff -= op2.size
+                                    break
+                            refs.append(Reference(
+                                file_offset=disp_foff,
+                                ref_type=RefType.RIP_RELATIVE,
+                                target_rva=target_rva, ref_rva=insn_rva,
+                                size_bytes=4, is_relative=True,
+                                insn_size=insn.size, section_name=sec_name,
+                                confidence=1.0, source=RefSource.STATIC_DISASM,
+                            ))
+                            break  # one RIP-rel per instruction
+
+                # ── MOV with absolute immediate address (x86-32) ──
+                elif (not self.is_64 and mnemonic == 'mov' and
+                      len(insn.operands) == 2):
+                    for op_idx, op in enumerate(insn.operands):
+                        if op.type == cs_x86.X86_OP_IMM and op.size == 4:
+                            candidate_rva = op.imm - self.image_base
+                            if self._is_executable_rva(candidate_rva):
+                                # imm32 is the last 4 bytes of the instruction
+                                refs.append(Reference(
+                                    file_offset=insn_foff + insn.size - 4,
+                                    ref_type=RefType.ABS_IMMEDIATE,
+                                    target_rva=candidate_rva, ref_rva=insn_rva,
+                                    size_bytes=4, is_relative=False,
+                                    insn_size=insn.size, section_name=sec_name,
+                                    confidence=0.85, source=RefSource.STATIC_DISASM,
+                                ))
+                                break
+                        elif op.type == cs_x86.X86_OP_MEM and op.mem.disp != 0:
+                            candidate_rva = op.mem.disp - self.image_base
+                            if (0 < candidate_rva < self.pe.OPTIONAL_HEADER.SizeOfImage
+                                    and op.mem.base == 0 and op.mem.index == 0):
+                                # Direct memory reference like MOV EAX, [0x401234]
+                                refs.append(Reference(
+                                    file_offset=insn_foff + insn.size - 4,
+                                    ref_type=RefType.ABS_DISPLACEMENT,
+                                    target_rva=candidate_rva, ref_rva=insn_rva,
+                                    size_bytes=4, is_relative=False,
+                                    insn_size=insn.size, section_name=sec_name,
+                                    confidence=0.80, source=RefSource.STATIC_DISASM,
+                                ))
+                                break
+
+                # ── PUSH with absolute immediate address (x86-32) ──
+                elif (not self.is_64 and mnemonic == 'push' and
+                      len(insn.operands) == 1):
+                    op = insn.operands[0]
+                    if op.type == cs_x86.X86_OP_IMM and op.size == 4:
+                        candidate_rva = op.imm - self.image_base
+                        if self._is_executable_rva(candidate_rva):
+                            refs.append(Reference(
+                                file_offset=insn_foff + insn.size - 4,
+                                ref_type=RefType.ABS_IMMEDIATE,
+                                target_rva=candidate_rva, ref_rva=insn_rva,
+                                size_bytes=4, is_relative=False,
+                                insn_size=insn.size, section_name=sec_name,
+                                confidence=0.80, source=RefSource.STATIC_DISASM,
+                            ))
+
         return refs
 
     # ── 3. Export Table ───────────────────────────────────────────────
@@ -516,7 +593,151 @@ class PEReferenceFinder:
             ))
         return refs
 
-    # ── 6. Data Pointer Heuristic ─────────────────────────────────────
+    # ── 6. Jump Table Detection ────────────────────────────────────
+    def _find_jump_tables(self) -> List[Reference]:
+        """Detect switch/case jump tables: JMP DWORD PTR [reg*4 + table_addr]."""
+        refs = []
+        arch = capstone.CS_ARCH_X86
+        mode = capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32
+        md = capstone.Cs(arch, mode)
+        md.detail = True
+        md.skipdata = True
+
+        size_of_image = self.pe.OPTIONAL_HEADER.SizeOfImage
+
+        for section in self.pe.sections:
+            if not self._is_code_section(section):
+                continue
+            sec_name = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+            code = section.get_data()
+            base_va = self.image_base + section.VirtualAddress
+
+            for insn in md.disasm(code, base_va):
+                # Pattern: JMP [reg*4 + disp32] or JMP [reg*4 + reg + disp32]
+                if insn.id != cs_x86.X86_INS_JMP or len(insn.operands) != 1:
+                    continue
+                op = insn.operands[0]
+                if op.type != cs_x86.X86_OP_MEM:
+                    continue
+                # Must have scale == 4 (or 8 for x64) — the index*scale pattern
+                if op.mem.scale not in (4, 8):
+                    continue
+                # The displacement is the table base address
+                table_va = op.mem.disp
+                if table_va == 0:
+                    continue
+
+                if self.is_64 and op.mem.base == cs_x86.X86_REG_RIP:
+                    # x64: RIP-relative jump table
+                    insn_rva = insn.address - self.image_base
+                    table_rva = insn_rva + insn.size + table_va
+                else:
+                    table_rva = table_va - self.image_base
+
+                if not (0 < table_rva < size_of_image):
+                    continue
+
+                # Read entries from the table until they stop pointing to code
+                table_foff = self._rva_to_offset(table_rva)
+                if table_foff is None:
+                    continue
+
+                entry_size = 4  # RVA entries are 32-bit even in x64 PE
+                table_sec = self._section_for_rva(table_rva)
+                max_entries = 1024  # safety cap
+
+                for idx in range(max_entries):
+                    off = table_foff + idx * entry_size
+                    if off + entry_size > len(self.data):
+                        break
+                    if self.is_64 and op.mem.base == cs_x86.X86_REG_RIP:
+                        # x64 relative jump tables: entries are RVA offsets from table base
+                        entry_val = struct.unpack_from('<i', self.data, off)[0]
+                        target_rva = table_rva + entry_val
+                    else:
+                        entry_val = struct.unpack_from('<I', self.data, off)[0]
+                        target_rva = entry_val - self.image_base
+
+                    if not self._is_executable_rva(target_rva):
+                        break  # end of table
+
+                    refs.append(Reference(
+                        file_offset=off,
+                        ref_type=RefType.JUMP_TABLE,
+                        target_rva=target_rva,
+                        ref_rva=table_rva + idx * entry_size,
+                        size_bytes=entry_size,
+                        is_relative=(self.is_64 and op.mem.base == cs_x86.X86_REG_RIP),
+                        insn_size=entry_size,
+                        section_name=table_sec,
+                        confidence=0.90, source=RefSource.STATIC_DISASM,
+                    ))
+        return refs
+
+    # ── 7. Vtable Scanner ─────────────────────────────────────────
+    def _find_vtables(self) -> List[Reference]:
+        """Detect C++ vtables: arrays of consecutive code pointers in .rdata."""
+        refs = []
+        code_rva_min = None
+        code_rva_max = None
+        for s in self.pe.sections:
+            if self._is_code_section(s):
+                lo = s.VirtualAddress
+                hi = s.VirtualAddress + s.Misc_VirtualSize
+                if code_rva_min is None or lo < code_rva_min:
+                    code_rva_min = lo
+                if code_rva_max is None or hi > code_rva_max:
+                    code_rva_max = hi
+        if code_rva_min is None:
+            return refs
+
+        step = self.ptr_size
+        fmt = '<Q' if self.is_64 else '<I'
+        min_vtable_entries = 3  # at least 3 consecutive code ptrs = vtable
+
+        for section in self.pe.sections:
+            sec_name = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+            # Vtables live in read-only data sections (.rdata, .rodata)
+            if sec_name not in ('.rdata', '.rodata', 'rdata'):
+                continue
+            data = section.get_data()
+            foff_base = section.PointerToRawData
+            rva_base = section.VirtualAddress
+
+            i = 0
+            while i <= len(data) - step:
+                # Try to find a run of consecutive code pointers
+                run_start = i
+                run_count = 0
+                while i <= len(data) - step:
+                    val = struct.unpack_from(fmt, data, i)[0]
+                    candidate_rva = val - self.image_base
+                    if code_rva_min <= candidate_rva < code_rva_max:
+                        run_count += 1
+                        i += step
+                    else:
+                        break
+
+                if run_count >= min_vtable_entries:
+                    # This is likely a vtable
+                    for j in range(run_count):
+                        off = run_start + j * step
+                        val = struct.unpack_from(fmt, data, off)[0]
+                        target_rva = val - self.image_base
+                        refs.append(Reference(
+                            file_offset=foff_base + off,
+                            ref_type=RefType.VTABLE_ENTRY,
+                            target_rva=target_rva,
+                            ref_rva=rva_base + off,
+                            size_bytes=step, is_relative=False,
+                            insn_size=step, section_name=sec_name,
+                            confidence=0.85, source=RefSource.HEURISTIC,
+                        ))
+                else:
+                    i += step
+        return refs
+
+    # ── 8. Data Pointer Heuristic ─────────────────────────────────────
     def _find_data_pointers(self) -> List[Reference]:
         refs = []
         code_rva_min = None
@@ -767,10 +988,19 @@ class ShiftEngine:
 
     # ── Internal: Reference Recalculation ─────────────────────────────
 
+    # Mapping from short conditional branch opcodes (7x) to near conditional (0F 8x)
+    _SHORT_TO_NEAR_JCC = {
+        0x70: (0x0F, 0x80), 0x71: (0x0F, 0x81), 0x72: (0x0F, 0x82), 0x73: (0x0F, 0x83),
+        0x74: (0x0F, 0x84), 0x75: (0x0F, 0x85), 0x76: (0x0F, 0x86), 0x77: (0x0F, 0x87),
+        0x78: (0x0F, 0x88), 0x79: (0x0F, 0x89), 0x7A: (0x0F, 0x8A), 0x7B: (0x0F, 0x8B),
+        0x7C: (0x0F, 0x8C), 0x7D: (0x0F, 0x8D), 0x7E: (0x0F, 0x8E), 0x7F: (0x0F, 0x8F),
+    }
+
     def _recalculate_refs(self, insert_rva: int, delta: int) -> Tuple[int, List[str]]:
         """Recalculate all references after a shift at insert_rva by delta bytes."""
         updated = 0
         warnings = []
+        relaxations = []  # (ref, new_foff, new_ref_rva, new_target_rva) for deferred relaxation
 
         for ref in self.ref_db.get_all():
             ref_moved = ref.ref_rva >= insert_rva
@@ -788,12 +1018,13 @@ class ShiftEngine:
                     # Check for short branch overflow
                     if ref.size_bytes == 1:
                         if new_val < -128 or new_val > 127:
-                            warnings.append(
-                                f"SHORT BRANCH OVERFLOW @0x{ref.ref_rva:X}: "
-                                f"disp {new_val:+d} exceeds ±127 "
-                                f"(type={ref.ref_type.value})"
-                            )
-                            continue  # Skip — can't encode, needs relaxation
+                            # Queue for relaxation instead of skipping
+                            relaxations.append((ref, new_foff, new_ref_rva, new_target_rva))
+                            # Still update the record positions
+                            ref.ref_rva = new_ref_rva
+                            ref.target_rva = new_target_rva
+                            ref.file_offset = new_foff
+                            continue
                         self._write_int(new_foff, new_val, 1, signed=True)
                     elif ref.size_bytes == 2:
                         self._write_int(new_foff, new_val, 2, signed=True)
@@ -815,7 +1046,119 @@ class ShiftEngine:
             ref.file_offset = new_foff
 
         self.ref_db.rebuild_indices()
+
+        # ── Short Branch Relaxation Pass ──
+        # Upgrade overflowed rel8 branches to rel32 (EB→E9, 7x→0F 8x)
+        # Each relaxation inserts 3-4 bytes, which may cascade. We process
+        # from highest RVA to lowest to minimize cascading re-adjustments.
+        if relaxations:
+            relaxations.sort(key=lambda x: x[2], reverse=True)  # highest RVA first
+            for ref, foff, ref_rva, target_rva in relaxations:
+                result = self._relax_short_branch(ref)
+                if result:
+                    updated += 1
+                    warnings.append(
+                        f"RELAXED short→near @0x{ref_rva:X}: "
+                        f"{ref.ref_type.value} (auto-upgraded)"
+                    )
+                else:
+                    warnings.append(
+                        f"SHORT BRANCH OVERFLOW @0x{ref_rva:X}: "
+                        f"could not auto-relax (type={ref.ref_type.value})"
+                    )
+
         return updated, warnings
+
+    def _relax_short_branch(self, ref: Reference) -> bool:
+        """
+        Upgrade a short branch (2 bytes) to a near branch (5-6 bytes).
+
+        EB rel8 (JMP short)  → E9 rel32 (JMP near)     : +3 bytes
+        7x rel8 (Jcc short)  → 0F 8x rel32 (Jcc near)  : +4 bytes
+
+        Returns True if relaxation succeeded.
+        """
+        insn_foff = ref.file_offset - 1  # file_offset points to disp byte, opcode is 1 before
+        if insn_foff < 0 or insn_foff + 2 > len(self.buffer):
+            return False
+
+        opcode = self.buffer[insn_foff]
+
+        if ref.ref_type == RefType.REL_JUMP_SHORT and opcode == 0xEB:
+            # EB rel8 → E9 rel32 (expand by 3 bytes)
+            expand = 3
+            new_insn_size = 5
+            # New displacement: target_rva - (ref_rva + 5)
+            new_disp = ref.target_rva - (ref.ref_rva + new_insn_size)
+            new_bytes = struct.pack('<bI', 0xE9 - 256, new_disp) if False else b''
+            new_bytes = bytes([0xE9]) + struct.pack('<i', new_disp)
+
+            # Replace the 2-byte instruction with 5-byte version
+            self.buffer[insn_foff:insn_foff + 2] = new_bytes
+
+            # Update ref record
+            ref.ref_type = RefType.REL_JUMP_NEAR
+            ref.size_bytes = 4
+            ref.insn_size = 5
+            ref.file_offset = insn_foff + 1  # disp starts at byte 1
+
+            # Now shift everything after by +3 bytes
+            self._cascade_shift(ref.ref_rva + 2, expand)  # old end was ref_rva+2
+            return True
+
+        elif ref.ref_type == RefType.REL_COND_SHORT and opcode in self._SHORT_TO_NEAR_JCC:
+            # 7x rel8 → 0F 8x rel32 (expand by 4 bytes)
+            expand = 4
+            new_insn_size = 6
+            near_op = self._SHORT_TO_NEAR_JCC[opcode]
+            new_disp = ref.target_rva - (ref.ref_rva + new_insn_size)
+            new_bytes = bytes([near_op[0], near_op[1]]) + struct.pack('<i', new_disp)
+
+            # Replace the 2-byte instruction with 6-byte version
+            self.buffer[insn_foff:insn_foff + 2] = new_bytes
+
+            # Update ref record
+            ref.ref_type = RefType.REL_COND_NEAR
+            ref.size_bytes = 4
+            ref.insn_size = 6
+            ref.file_offset = insn_foff + 2  # disp starts at byte 2
+
+            # Shift everything after by +4 bytes
+            self._cascade_shift(ref.ref_rva + 2, expand)
+            return True
+
+        return False
+
+    def _cascade_shift(self, from_rva: int, expand: int):
+        """
+        After a branch relaxation expands an instruction, shift all refs
+        that are after from_rva by expand bytes and update their encoded values.
+        This is a mini version of _recalculate_refs for the cascade.
+        """
+        for ref in self.ref_db.get_all():
+            if ref.ref_rva >= from_rva:
+                ref.ref_rva += expand
+                ref.file_offset += expand
+            if ref.target_rva >= from_rva:
+                ref.target_rva += expand
+
+            # Re-encode the reference with updated positions
+            if ref.is_relative:
+                new_val = ref.target_rva - (ref.ref_rva + ref.insn_size)
+                if ref.size_bytes == 1:
+                    if -128 <= new_val <= 127:
+                        self._write_int(ref.file_offset, new_val, 1, signed=True)
+                elif ref.size_bytes == 4:
+                    self._write_int(ref.file_offset, new_val, 4, signed=True)
+            elif ref.ref_rva >= from_rva or ref.target_rva >= from_rva:
+                if not ref.is_relative and ref.target_rva >= from_rva:
+                    new_abs = ref.target_rva + self.image_base
+                    if ref.size_bytes == 4:
+                        self._write_int(ref.file_offset, new_abs & 0xFFFFFFFF, 4)
+                    elif ref.size_bytes == 8:
+                        self._write_int(ref.file_offset, new_abs, 8)
+
+        self.ref_db.rebuild_indices()
 
     def _write_int(self, offset: int, value: int, size: int, signed: bool = False):
         if offset < 0 or offset + size > len(self.buffer):
@@ -841,13 +1184,24 @@ class ShiftEngine:
                 break
 
         if target_section:
-            target_section.SizeOfRawData += delta
             target_section.Misc_VirtualSize += delta
+            # SizeOfRawData must be aligned to FileAlignment
+            new_raw = target_section.SizeOfRawData + delta
+            aligned_raw = (new_raw + self.file_alignment - 1) & ~(self.file_alignment - 1)
+            # Pad to alignment boundary if needed
+            padding_needed = aligned_raw - (target_section.SizeOfRawData + delta)
+            if padding_needed > 0 and delta > 0:
+                pad_foff = foff + delta  # right after inserted data
+                # Find end of this section's raw data
+                sec_end_foff = target_section.PointerToRawData + target_section.SizeOfRawData + delta
+                self.buffer[sec_end_foff:sec_end_foff] = b'\x00' * padding_needed
+                delta += padding_needed
+            target_section.SizeOfRawData = aligned_raw
             adjusted += 1
 
         # Shift PointerToRawData for sections after the target
         for s in self.pe.sections:
-            if s.PointerToRawData > foff:
+            if s != target_section and s.PointerToRawData > foff:
                 s.PointerToRawData += delta
                 adjusted += 1
 
