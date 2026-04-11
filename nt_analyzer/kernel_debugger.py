@@ -2025,6 +2025,7 @@ class DebugSession:
                 "events": list(self.events),
                 "breakpoint_hits": sum(bp.hit_count for bp in
                                        self._breakpoints.values()),
+                "visited_addresses": set(self._block_hits.keys()),
             }
 
         # Cleanup hooks
@@ -2049,6 +2050,7 @@ class DebugSession:
             "api_calls": list(self._api_calls),
             "events": list(self.events),
             "breakpoint_hits": sum(bp.hit_count for bp in self._breakpoints.values()),
+            "visited_addresses": set(self._block_hits.keys()),
             "pre_return_snapshot": self._pre_return_snapshot,
         }
 
@@ -2419,6 +2421,7 @@ class DebugSession:
                     "trace": list(self._trace) if rs.get("show_trace") else [],
                     "api_calls": list(self._api_calls),
                     "events": list(self.events),
+                    "visited_addresses": set(self._block_hits.keys()),
                 }
 
         self.state = DebugState.RUNNING
@@ -2443,6 +2446,7 @@ class DebugSession:
                 "instructions": self._insn_count,
                 "elapsed_sec": elapsed,
                 "events": list(self.events),
+                "visited_addresses": set(self._block_hits.keys()),
             }
 
         self._cleanup_hooks()
@@ -2460,6 +2464,7 @@ class DebugSession:
             "trace": list(self._trace) if rs.get("show_trace") else [],
             "api_calls": list(self._api_calls),
             "events": list(self.events),
+            "visited_addresses": set(self._block_hits.keys()),
         }
 
     def _cleanup_hooks(self):

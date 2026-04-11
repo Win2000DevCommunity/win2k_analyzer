@@ -5201,6 +5201,7 @@ class DisassemblyView(tk.Frame):
         self._addr_to_line = {} # address -> line number (1-based)
         self._line_to_addr = {} # line number -> address
         self._bp_lines = set()  # lines with breakpoints
+        self._exec_lines = set() # lines that were actually executed
         self._eip_line = None   # line with current EIP
 
         self.columnconfigure(1, weight=1)
@@ -5252,12 +5253,15 @@ class DisassemblyView(tk.Frame):
         self._text.tag_configure("separator", foreground="#444444")
         self._text.tag_configure("eip_line", background="#3A3A00")
         self._text.tag_configure("bp_line", background="#3A1010")
+        self._text.tag_configure("exec_line", background="#1A2A1A")
+        self._text.tag_configure("not_exec_line", foreground="#555555")
 
         self._gutter.tag_configure("bp_dot", foreground=self._BP_COLOR,
                                     font=("Consolas", 10, "bold"))
         self._gutter.tag_configure("eip_arrow", foreground=self._EIP_COLOR,
                                     font=("Consolas", 10, "bold"))
         self._gutter.tag_configure("linenum", foreground="#555555")
+        self._gutter.tag_configure("exec_mark", foreground="#4EC9B0")
 
         # Bind click on gutter
         self._gutter.bind("<Button-1>", self._on_gutter_click)
@@ -5492,6 +5496,52 @@ class DisassemblyView(tk.Frame):
             self._eip_line = None
             self._refresh_line_highlights()
 
+    def mark_executed(self, addresses):
+        """Mark lines that were executed (from trace) vs not executed.
+
+        addresses: iterable of int addresses that were visited.
+        """
+        exec_addrs = set(addresses)
+        self._exec_lines.clear()
+
+        for addr, line in self._addr_to_line.items():
+            if addr in exec_addrs:
+                self._exec_lines.add(line)
+
+        self._text.configure(state="normal")
+        self._text.tag_remove("exec_line", "1.0", "end")
+        self._text.tag_remove("not_exec_line", "1.0", "end")
+
+        for line, addr in self._line_to_addr.items():
+            if line in self._exec_lines:
+                self._text.tag_add("exec_line", f"{line}.0", f"{line}.end")
+            else:
+                self._text.tag_add("not_exec_line", f"{line}.0", f"{line}.end")
+        self._text.configure(state="disabled")
+
+        # Mark executed lines in gutter with a tick
+        self._gutter.configure(state="normal")
+        self._gutter.tag_remove("exec_mark", "1.0", "end")
+        for line in self._exec_lines:
+            line_start = f"{line}.0"
+            line_char = f"{line}.1"
+            cur = self._gutter.get(line_start, line_char)
+            if cur not in (self._BP_CHAR, self._EIP_CHAR):
+                self._gutter.delete(line_start, line_char)
+                self._gutter.insert(line_start, "\u2502", "exec_mark")
+        self._gutter.configure(state="disabled")
+
+    def clear_execution_marks(self):
+        """Remove execution path highlighting."""
+        self._exec_lines.clear()
+        self._text.configure(state="normal")
+        self._text.tag_remove("exec_line", "1.0", "end")
+        self._text.tag_remove("not_exec_line", "1.0", "end")
+        self._text.configure(state="disabled")
+        self._gutter.configure(state="normal")
+        self._gutter.tag_remove("exec_mark", "1.0", "end")
+        self._gutter.configure(state="disabled")
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 16: Kernel Debugger
@@ -5548,6 +5598,9 @@ class KernelDebuggerTab(ttk.Frame):
         self._args_ent.grid(row=0, column=3, sticky="ew")
         func_frm.columnconfigure(3, weight=1)
         app._placeholder_entries.append(self._args_ent)
+        ttk.Button(func_frm, text="\u25BC Presets",
+                   command=self._show_arg_presets, width=10).grid(
+                       row=0, column=4, padx=(6, 0))
 
         # Row 3 — run / step / continue / breakpoints
         bf2 = make_button_bar(self, row=3)
@@ -5612,6 +5665,9 @@ class KernelDebuggerTab(ttk.Frame):
         ttk.Button(bf3, text="\U0001F50D Find Callers",
                    command=self._find_callers).pack(side="left", padx=2)
         ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
+        ttk.Button(bf3, text="\u2B0C Split View",
+                   command=self._toggle_split_view).pack(side="left", padx=2)
+        ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
         ttk.Button(bf3, text="\U0001F9F9 Clear",
                    command=self._clear_output).pack(side="left", padx=2)
 
@@ -5619,11 +5675,410 @@ class KernelDebuggerTab(ttk.Frame):
         self.status_var, self._prog_start, self._prog_stop = \
             make_status_with_progress(self, "Kernel debugger ready", row=7)
 
-        # Row 8 — output
+        # Row 8 — output (supports tabbed and split view modes)
+        self._split_mode = False
+        self._split_pane = None
         self.output = TabbedOutput(self)
         self.output.grid(row=8, column=0, sticky="nsew", padx=10, pady=(4, 10))
 
     # ── helpers ───────────────────────────────────────────────────────────
+
+    def _bp_not_hit_diagnostic(self, result, tab):
+        """Show detailed diagnostic when breakpoints weren't hit."""
+        if not self._dbg:
+            return
+        bps = self._dbg.list_breakpoints()
+        if not bps:
+            self.output.write_to_tab(tab,
+                "\n  \u26A0 No breakpoints were set.\n", "warn")
+            self.output.write_to_tab(tab,
+                "  Tip: Set breakpoints before running, or use "
+                "\"Run+Break at Entry\" to pause at function start.\n")
+            return
+
+        visited = result.get("visited_addresses", set()) if isinstance(result, dict) else set()
+        insn_count = result.get("instructions", 0) if isinstance(result, dict) else 0
+
+        # Gather BP hit counts and event info
+        bp_events = {}
+        if isinstance(result, dict):
+            for ev in result.get("events", []):
+                if ev.event_type == "breakpoint" and ev.details:
+                    bp_events[ev.details.get("bp_id")] = ev.details.get("hit_count", 0)
+
+        enabled_bps = [bp for bp in bps if bp.enabled]
+        missed_bps = [bp for bp in enabled_bps if bp.address not in visited]
+
+        self.output.write_to_tab(tab,
+            f"\n  {'─' * 60}\n", "separator")
+        self.output.write_to_tab(tab,
+            "  BREAKPOINT DIAGNOSTIC\n\n", "title")
+        self.output.write_to_tab(tab,
+            f"  Instructions executed: {insn_count}\n")
+        self.output.write_to_tab(tab,
+            f"  Unique addresses visited: {len(visited)}\n")
+        self.output.write_to_tab(tab,
+            f"  Breakpoints: {len(enabled_bps)} enabled, "
+            f"{len(missed_bps)} not reached\n\n")
+
+        for bp in bps:
+            addr = bp.address
+            name = bp.name
+            was_visited = addr in visited
+            was_hit = bp.hit_count > 0 or bp.id in bp_events
+
+            if not bp.enabled:
+                self.output.write_to_tab(tab,
+                    f"  \u26D4 BP #{bp.id}  0x{addr:08X}  {name}  "
+                    f"[DISABLED]\n", "warn")
+            elif was_hit:
+                # BP was hit (previously or during this run) — already triggered
+                self.output.write_to_tab(tab,
+                    f"  \u2705 BP #{bp.id}  0x{addr:08X}  {name}  "
+                    f"— hit {bp.hit_count}x (already triggered earlier)\n", "ok")
+            elif was_visited:
+                # Address was executed but BP didn't fire — conditional BP
+                # or BP was added after the address was already passed
+                self.output.write_to_tab(tab,
+                    f"  \u26A0 BP #{bp.id}  0x{addr:08X}  {name}  "
+                    f"— address visited but BP not triggered "
+                    f"(set after passing? conditional?)\n", "warn")
+            else:
+                self.output.write_to_tab(tab,
+                    f"  \u274C BP #{bp.id}  0x{addr:08X}  {name}  "
+                    f"— NOT on executed code path\n", "error")
+
+        # Suggest possible causes
+        any_disabled = any(not bp.enabled for bp in bps)
+        some_missed = len(missed_bps) > 0
+        all_missed = len(missed_bps) == len(enabled_bps) and len(enabled_bps) > 0
+
+        reasons = []
+        if any_disabled:
+            reasons.append(
+                "Some breakpoints are disabled \u2014 enable them in List BPs")
+        if all_missed:
+            reasons.append(
+                "The function arguments caused a code path that "
+                "bypassed ALL breakpoint addresses")
+            reasons.append(
+                "Try different arguments, or set breakpoints closer "
+                "to the function entry point")
+            if insn_count < 50:
+                reasons.append(
+                    "Very few instructions executed \u2014 the function "
+                    "may have returned early (check args / PreviousMode)")
+        elif some_missed:
+            reasons.append(
+                "The function arguments caused a code path that "
+                "bypassed some breakpoint addresses")
+            reasons.append(
+                "Try setting breakpoints on different branches, "
+                "or use Disassemble to see the control flow")
+
+        if reasons:
+            self.output.write_to_tab(tab, "\n  Possible reasons:\n")
+            for r in reasons:
+                self.output.write_to_tab(tab, f"  \u2022 {r}\n")
+        self.output.write_to_tab(tab, "\n")
+
+    def _update_disasm_execution(self, result):
+        """Update disassembly view with execution path highlighting."""
+        if not self._disasm_view:
+            return
+        visited = None
+        if isinstance(result, dict):
+            visited = result.get("visited_addresses")
+        if not visited and self._dbg:
+            # Fallback: read directly from debug session
+            visited = set(self._dbg._block_hits.keys()) if hasattr(self._dbg, '_block_hits') else None
+        if visited:
+            try:
+                self._disasm_view.mark_executed(visited)
+            except Exception:
+                pass
+
+    # ── arg presets ───────────────────────────────────────────────────────
+
+    # Test argument presets for common NT kernel functions.
+    # Format: { "FuncName": [ ("Description", "arg_string"), ... ] }
+    _ARG_PRESETS = {
+        "NtPowerInformation": [
+            ("Level 0 \u2014 SystemPowerPolicyAc (default)", "0, 0, 0, 0x1000, 0x1000"),
+            ("Level 1 \u2014 SystemPowerPolicyDc",           "1, 0, 0, 0x1000, 0x1000"),
+            ("Level 2 \u2014 VerifySystemPolicies",          "2, 0, 0, 0x1000, 0x1000"),
+            ("Level 3 \u2014 VerifyProcessorPowerPolicy",    "3, 0, 0, 0x1000, 0x1000"),
+            ("Level 10 \u2014 SystemBatteryState",           "0xa, 0, 0, 0x1000, 0x1000"),
+            ("Level 11 \u2014 SystemPowerStateHandler",      "0xb, 0, 0, 0x1000, 0x1000"),
+            ("Level 12 \u2014 ProcessorStateHandler",        "0xc, 0, 0, 0x1000, 0x1000"),
+            ("Level 41 \u2014 SystemPowerInformation",       "0x29, 0, 0, 0x1000, 0x1000"),
+        ],
+        "NtClose": [
+            ("Valid handle",          "0x100"),
+            ("Null handle",           "0"),
+            ("Invalid handle (test)", "0xDEADBEEF"),
+        ],
+        "NtQuerySystemInformation": [
+            ("Class 0 \u2014 SystemBasicInformation",        "0, 0x80000, 0x1000, 0x80004"),
+            ("Class 2 \u2014 SystemPerformanceInformation",  "2, 0x80000, 0x1000, 0x80004"),
+            ("Class 5 \u2014 SystemProcessInformation",      "5, 0x80000, 0x4000, 0x80004"),
+            ("Class 8 \u2014 SystemProcessorInfo",           "8, 0x80000, 0x1000, 0x80004"),
+            ("Class 11 \u2014 SystemModuleInformation",      "0xb, 0x80000, 0x4000, 0x80004"),
+        ],
+        "NtQueryInformationProcess": [
+            ("Class 0 \u2014 ProcessBasicInformation",  "-1, 0, 0x80000, 0x18, 0x80018"),
+            ("Class 7 \u2014 ProcessDebugPort",         "-1, 7, 0x80000, 4, 0x80004"),
+            ("Class 30 \u2014 ProcessWow64Information", "-1, 30, 0x80000, 4, 0x80004"),
+        ],
+        "NtCreateFile": [
+            ("Open null (exercise validation)", "0x80000, 0x80100000, 0, 0x80200, 0, 0, 1, 0, 0, 0, 0, 0"),
+        ],
+        "NtOpenFile": [
+            ("Open null (exercise validation)", "0x80000, 0x80100000, 0, 0x80200, 0, 0"),
+        ],
+        "NtReadFile": [
+            ("Handle + null buffer", "0x100, 0, 0, 0, 0x80200, 0x80300, 0x1000, 0, 0"),
+        ],
+        "NtWriteFile": [
+            ("Handle + null buffer", "0x100, 0, 0, 0, 0x80200, 0x80300, 0x1000, 0, 0"),
+        ],
+        "NtAllocateVirtualMemory": [
+            ("Commit 4KB private",  "-1, 0x80000, 0, 0x80004, 0x1000, 4"),
+            ("Reserve 64KB",        "-1, 0x80000, 0, 0x80004, 0x2000, 4"),
+        ],
+        "NtFreeVirtualMemory": [
+            ("Release at address", "-1, 0x80000, 0x80004, 0x8000"),
+        ],
+        "NtDeviceIoControlFile": [
+            ("Null IOCTL", "0x100, 0, 0, 0, 0x80200, 0x80000, 0, 0, 0, 0"),
+        ],
+        "NtQueryInformationFile": [
+            ("FileBasicInformation",    "0x100, 0x80200, 0x80300, 0x28, 4"),
+            ("FileStandardInformation", "0x100, 0x80200, 0x80300, 0x18, 5"),
+        ],
+        "NtSetInformationFile": [
+            ("FileBasicInformation",       "0x100, 0x80200, 0x80300, 0x28, 4"),
+            ("FileDispositionInformation", "0x100, 0x80200, 0x80300, 1, 13"),
+        ],
+        "NtQueryInformationThread": [
+            ("ThreadBasicInformation", "-2, 0, 0x80000, 0x1C, 0x80020"),
+        ],
+        "NtOpenKey": [
+            ("Null attributes", "0x80000, 0x80100000, 0"),
+        ],
+        "NtQueryKey": [
+            ("KeyBasicInformation", "0x100, 0, 0x80000, 0x100, 0x80100"),
+            ("KeyFullInformation",  "0x100, 2, 0x80000, 0x200, 0x80200"),
+        ],
+        "NtQueryValueKey": [
+            ("KeyValueBasicInformation", "0x100, 0x80200, 0, 0x80300, 0x100, 0x80400"),
+        ],
+    }
+
+    def _show_arg_presets(self):
+        """Show a dropdown menu of preset arguments for the current function."""
+        func = self._get_func()
+
+        menu = tk.Menu(self.app, tearoff=0, bg=T["bg_light"], fg=T["fg"],
+                       activebackground=T["accent"], activeforeground="#000000",
+                       font=("Consolas", 9))
+
+        if func and func in self._ARG_PRESETS:
+            menu.add_command(label=f"\u2500\u2500 {func} \u2500\u2500",
+                             state="disabled")
+            for desc, args in self._ARG_PRESETS[func]:
+                menu.add_command(label=f"  {desc}",
+                    command=lambda a=args: self._apply_preset_args(a))
+            menu.add_separator()
+
+        # Also try to get signature from KERNEL_API_SIGNATURES
+        if func:
+            try:
+                from nt_analyzer.decompiler import KERNEL_API_SIGNATURES
+                sig = KERNEL_API_SIGNATURES.get(func)
+                if sig:
+                    ret_type, params = sig
+                    param_str = ", ".join(f"{t} {n}" for t, n in params)
+                    menu.add_command(
+                        label=f"Sig: {ret_type} {func}({param_str})",
+                        state="disabled")
+                    # Generate zero-filled args from signature
+                    zero_args = ", ".join("0" for _ in params)
+                    menu.add_command(
+                        label=f"  All zeros ({len(params)} args)",
+                        command=lambda a=zero_args: self._apply_preset_args(a))
+            except Exception:
+                pass
+
+        # Show other functions that have presets
+        others = [f for f in sorted(self._ARG_PRESETS) if f != func]
+        if others:
+            menu.add_separator()
+            menu.add_command(label="\u2500\u2500 Other functions \u2500\u2500",
+                             state="disabled")
+            for fn in others:
+                sub = tk.Menu(menu, tearoff=0, bg=T["bg_light"], fg=T["fg"],
+                              activebackground=T["accent"],
+                              activeforeground="#000000",
+                              font=("Consolas", 9))
+                for desc, args in self._ARG_PRESETS[fn]:
+                    sub.add_command(label=f"  {desc}",
+                        command=lambda f=fn, a=args:
+                            self._apply_preset(f, a))
+                menu.add_cascade(label=f"  {fn}", menu=sub)
+
+        # Position below the Presets button
+        try:
+            x = self._args_ent.winfo_rootx() + self._args_ent.winfo_width()
+            y = self._args_ent.winfo_rooty() + self._args_ent.winfo_height()
+            menu.tk_popup(x, y)
+        except Exception:
+            menu.tk_popup(
+                self.app.winfo_pointerx(), self.app.winfo_pointery())
+
+    def _apply_preset_args(self, args_str):
+        """Apply a preset args string to the args entry."""
+        if isinstance(self._args_ent, PlaceholderEntry):
+            self._args_ent.set_value(args_str)
+        else:
+            self._args_var.set(args_str)
+
+    def _apply_preset(self, func_name, args_str):
+        """Apply a preset: set function name and args."""
+        if isinstance(self._func_ent, PlaceholderEntry):
+            self._func_ent.set_value(func_name)
+        else:
+            self._func_var.set(func_name)
+        self._apply_preset_args(args_str)
+
+    # ── split view ────────────────────────────────────────────────────────
+
+    def _toggle_split_view(self):
+        """Toggle between tabbed mode and side-by-side (trace + disasm)."""
+        if self._split_mode:
+            self._restore_tabbed_view()
+        else:
+            self._enter_split_view()
+
+    def _enter_split_view(self):
+        """Switch to side-by-side: trace left, disasm right."""
+        # Find the trace tab
+        trace_tab_title = self._trace_tab_title
+        if not trace_tab_title:
+            for tab_id in reversed(self.output._nb.tabs()):
+                title = self.output._nb.tab(tab_id, "text").strip()
+                if any(title.startswith(p) for p in
+                       ("Run:", "Debug:", "Run\u2192BP:")):
+                    trace_tab_title = title
+                    break
+
+        if not trace_tab_title and not self._disasm_view:
+            self.status_var.set(
+                "\u26A0 Need a trace or disassembly tab for split view")
+            return
+
+        # Hide the normal output notebook
+        self.output.grid_forget()
+
+        # Create a PanedWindow for side-by-side
+        pw = tk.PanedWindow(self, orient="horizontal", bg=T["separator"],
+                            sashwidth=4, sashrelief="flat",
+                            opaqueresize=True, bd=0)
+        pw.grid(row=8, column=0, sticky="nsew", padx=10, pady=(4, 10))
+
+        # ── Left pane: trace output ──
+        left_frm = tk.Frame(pw, bg=T["bg_dark"])
+        left_frm.columnconfigure(0, weight=1)
+        left_frm.rowconfigure(1, weight=1)
+
+        left_hdr = tk.Frame(left_frm, bg=T["bg"])
+        left_hdr.grid(row=0, column=0, sticky="ew")
+        tk.Label(left_hdr, text=f"  {trace_tab_title or 'Trace'}  ",
+                 bg=T["bg"], fg=T["accent"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=4, pady=2)
+
+        left_txt = scrolledtext.ScrolledText(
+            left_frm, bg=T["bg_dark"], fg=T["fg"], insertbackground=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=8,
+            wrap="none", state="disabled")
+        left_txt.grid(row=1, column=0, sticky="nsew")
+        _configure_output_tags(left_txt)
+
+        # Copy trace content from the existing tab
+        if trace_tab_title:
+            _, src_widget = self.output.find_tab(trace_tab_title)
+            if src_widget and hasattr(src_widget, 'get'):
+                content = src_widget.get("1.0", "end-1c")
+                left_txt.configure(state="normal")
+                left_txt.insert("1.0", content)
+                left_txt.see("end")
+                left_txt.configure(state="disabled")
+
+        pw.add(left_frm, stretch="always")
+
+        # ── Right pane: disassembly ──
+        right_frm = tk.Frame(pw, bg=T["bg_dark"])
+        right_frm.columnconfigure(0, weight=1)
+        right_frm.rowconfigure(1, weight=1)
+
+        right_hdr = tk.Frame(right_frm, bg=T["bg"])
+        right_hdr.grid(row=0, column=0, sticky="ew")
+
+        func = self._get_func()
+        disasm_title = f"Disasm: {func}" if func else "Disassembly"
+        tk.Label(right_hdr, text=f"  {disasm_title}  ",
+                 bg=T["bg"], fg=T["accent"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=4, pady=2)
+        ttk.Button(right_hdr, text="\u2716 Restore Tabs",
+                   command=self._restore_tabbed_view).pack(
+                       side="right", padx=4, pady=2)
+
+        if self._disasm_view:
+            # Reparent disasm view into right pane
+            self._disasm_view_original_parent = self._disasm_view.master
+            self._disasm_view.grid_forget()
+            self._disasm_view.grid(in_=right_frm, row=1, column=0,
+                                   sticky="nsew")
+        else:
+            tk.Label(right_frm,
+                     text="No disassembly loaded.\nClick Disassemble first.",
+                     bg=T["bg_dark"], fg=T["fg_dim"],
+                     font=("Consolas", 10)).grid(
+                         row=1, column=0, sticky="nsew")
+
+        pw.add(right_frm, stretch="always")
+
+        self._split_pane = pw
+        self._split_left_txt = left_txt
+        self._split_left_title = trace_tab_title
+        self._split_mode = True
+        self.status_var.set(
+            "\u2B0C Split view \u2014 click \u2716 Restore Tabs to go back")
+
+    def _restore_tabbed_view(self):
+        """Restore the normal tabbed output view."""
+        if not self._split_mode:
+            return
+
+        # Reparent disasm view back to its original tab
+        if (self._disasm_view and
+                hasattr(self, '_disasm_view_original_parent')):
+            orig = self._disasm_view_original_parent
+            self._disasm_view.grid_forget()
+            self._disasm_view.grid(in_=orig, row=0, column=0, sticky="nsew")
+
+        # Destroy the split pane
+        if self._split_pane:
+            self._split_pane.grid_forget()
+            self._split_pane.destroy()
+            self._split_pane = None
+
+        # Re-grid the normal output
+        self.output.grid(row=8, column=0, sticky="nsew",
+                         padx=10, pady=(4, 10))
+
+        self._split_mode = False
+        self.status_var.set("Kernel debugger ready")
 
     def _parse_args(self):
         """Parse the args entry into a list of ints."""
@@ -5837,6 +6292,7 @@ class KernelDebuggerTab(ttk.Frame):
             trace_tab = self._trace_tab_title or "Run"
             for line in result.split('\n'):
                 self.output.write_to_tab(trace_tab, line + '\n')
+            self._update_disasm_execution(None)
             self.status_var.set("\u2705 Run complete")
 
         run_with_progress_dialog(self.app, f"Running {func}\u2026", work, done)
@@ -5889,10 +6345,12 @@ class KernelDebuggerTab(ttk.Frame):
                 self.status_var.set(
                     f"\u23F8 Paused at {eip_name} \u2014 use Step / Continue")
                 self._update_disasm_eip()
+                self._update_disasm_execution(result)
             else:
                 report = self._dbg.format_result(result, show_trace=show_trace)
                 for line in report.split('\n'):
                     self.output.write_to_tab(trace_tab, line + '\n')
+                self._update_disasm_execution(result)
                 self.status_var.set("\u2705 Run complete (no break)")
 
         run_with_progress_dialog(self.app, f"Debugging {func}\u2026", work, done)
@@ -5966,6 +6424,7 @@ class KernelDebuggerTab(ttk.Frame):
                 self.output.write_to_tab(trace_tab, reg_line + "\n", "ok")
                 self.status_var.set(f"\u23F8 Paused at {eip_name}")
                 self._update_disasm_eip()
+                self._update_disasm_execution(result)
             else:
                 retval = result.get("return_value", 0)
                 show_trace = self._show_trace_var.get()
@@ -5974,6 +6433,7 @@ class KernelDebuggerTab(ttk.Frame):
                 # Write completion report to trace tab
                 for line in report.split('\n'):
                     self.output.write_to_tab(trace_tab, line + '\n')
+                self._update_disasm_execution(result)
                 self.status_var.set(
                     f"\u2705 Completed: 0x{retval:08X} "
                     f"({kdbg2.ntstatus_name(retval)})")
@@ -6028,6 +6488,7 @@ class KernelDebuggerTab(ttk.Frame):
                     self.status_var.set(
                         f"\u23F8 Paused at {eip_name} \u2014 use Step / Run Until BP")
                     self._update_disasm_eip()
+                    self._update_disasm_execution(result)
                 else:
                     # Function completed — clear EIP arrow in disassembly
                     if self._disasm_view:
@@ -6038,12 +6499,12 @@ class KernelDebuggerTab(ttk.Frame):
                     retval = result.get("return_value", 0) if isinstance(result, dict) else 0
                     show_trace = self._show_trace_var.get()
                     if isinstance(result, dict):
-                        self.output.write_to_tab(tab,
-                            f"\n  \u26A0 No more breakpoints hit on this code path "
-                            f"(args may skip some branches)\n", "error")
+                        self._bp_not_hit_diagnostic(result, tab)
+                        self.output.write_to_tab(tab, "\n")
                         report = self._dbg.format_result(result, show_trace=show_trace)
                         for line in report.split('\n'):
                             self.output.write_to_tab(tab, line + '\n')
+                    self._update_disasm_execution(result)
                     self.status_var.set(
                         f"\u2705 Completed: 0x{retval:08X} "
                         f"({kdbg2.ntstatus_name(retval)})")
@@ -6104,11 +6565,15 @@ class KernelDebuggerTab(ttk.Frame):
                 self.status_var.set(
                     f"\u23F8 Paused at {eip_name} \u2014 use Step / Continue")
                 self._update_disasm_eip()
+                self._update_disasm_execution(result)
             else:
+                self._bp_not_hit_diagnostic(result, trace_tab)
+                self.output.write_to_tab(trace_tab, "\n")
                 report = self._dbg.format_result(result,
                                                   show_trace=show_trace)
                 for line in report.split('\n'):
                     self.output.write_to_tab(trace_tab, line + '\n')
+                self._update_disasm_execution(result)
                 self.status_var.set("\u2705 Run complete (no BP hit)")
 
         run_with_progress_dialog(self.app,
