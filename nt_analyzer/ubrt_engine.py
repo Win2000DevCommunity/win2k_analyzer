@@ -866,6 +866,30 @@ class ELFReferenceFinder:
         self._section_cache = {}
         for sec in self.elf.iter_sections():
             self._section_cache[sec.name] = sec
+        self.e_machine = self.elf.header['e_machine']
+        self.endian = '>' if self.elf.little_endian is False else '<'
+
+    def _get_capstone_arch(self):
+        """Return (arch, mode) tuple for Capstone based on ELF e_machine."""
+        machine = self.e_machine
+        mapping = {
+            'EM_X86_64':    (capstone.CS_ARCH_X86,   capstone.CS_MODE_64),
+            'EM_386':       (capstone.CS_ARCH_X86,   capstone.CS_MODE_32),
+            'EM_ARM':       (capstone.CS_ARCH_ARM,   capstone.CS_MODE_ARM),
+            'EM_AARCH64':   (capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM),
+            'EM_MIPS':      (capstone.CS_ARCH_MIPS,  capstone.CS_MODE_MIPS32),
+            'EM_PPC':       (capstone.CS_ARCH_PPC,   capstone.CS_MODE_32 | capstone.CS_MODE_BIG_ENDIAN),
+            'EM_PPC64':     (capstone.CS_ARCH_PPC,   capstone.CS_MODE_64 | capstone.CS_MODE_BIG_ENDIAN),
+        }
+        result = mapping.get(machine)
+        if result is not None:
+            return result
+        # Fallback: try x86 based on bitness
+        return (capstone.CS_ARCH_X86, capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32)
+
+    @property
+    def is_x86(self) -> bool:
+        return self.e_machine in ('EM_X86_64', 'EM_386')
 
     def _compute_image_base(self) -> int:
         min_vaddr = None
@@ -983,7 +1007,7 @@ class ELFReferenceFinder:
                 target_vaddr += addend
 
                 # Determine ref type from ELF relocation type
-                if self.is_64:
+                if self.is_x86 and self.is_64:
                     # x86-64 relocation types
                     if r_type == 1:   # R_X86_64_64
                         ref_type = RefType.ELF_RELATIVE
@@ -1005,7 +1029,7 @@ class ELFReferenceFinder:
                     else:
                         ref_type = RefType.ELF_RELATIVE
                         size = 8
-                else:
+                elif self.is_x86:
                     # x86-32 relocation types
                     if r_type == 1:     # R_386_32
                         ref_type = RefType.ELF_RELATIVE
@@ -1023,11 +1047,92 @@ class ELFReferenceFinder:
                         ref_type = RefType.ELF_RELATIVE
                         size = 4
                         if foff + 4 <= len(self.data):
-                            stored = struct.unpack_from('<I', self.data, foff)[0]
+                            stored = struct.unpack_from(f'{self.endian}I', self.data, foff)[0]
                             target_vaddr = stored
                     else:
                         ref_type = RefType.ELF_RELATIVE
                         size = 4
+                elif self.e_machine == 'EM_AARCH64':
+                    # AArch64 relocation types
+                    if r_type == 257:     # R_AARCH64_ABS64
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 8
+                    elif r_type == 258:   # R_AARCH64_ABS32
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                    elif r_type == 1025:  # R_AARCH64_GLOB_DAT
+                        ref_type = RefType.GOT_ENTRY
+                        size = 8
+                    elif r_type == 1026:  # R_AARCH64_JUMP_SLOT
+                        ref_type = RefType.PLT_STUB
+                        size = 8
+                    elif r_type == 1027:  # R_AARCH64_RELATIVE
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 8
+                        if addend:
+                            target_vaddr = self.image_base + addend
+                    elif r_type == 275:   # R_AARCH64_CALL26
+                        ref_type = RefType.REL_CALL
+                        size = 4
+                    elif r_type == 282:   # R_AARCH64_JUMP26
+                        ref_type = RefType.REL_JUMP_NEAR
+                        size = 4
+                    else:
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 8
+                elif self.e_machine == 'EM_ARM':
+                    # ARM32 relocation types
+                    if r_type == 2:       # R_ARM_ABS32
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                    elif r_type == 3:     # R_ARM_REL32
+                        ref_type = RefType.REL_CALL
+                        size = 4
+                    elif r_type == 21:    # R_ARM_GLOB_DAT
+                        ref_type = RefType.GOT_ENTRY
+                        size = 4
+                    elif r_type == 22:    # R_ARM_JUMP_SLOT
+                        ref_type = RefType.PLT_STUB
+                        size = 4
+                    elif r_type == 23:    # R_ARM_RELATIVE
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                        if foff + 4 <= len(self.data):
+                            stored = struct.unpack_from(f'{self.endian}I', self.data, foff)[0]
+                            target_vaddr = stored
+                    elif r_type == 28:    # R_ARM_CALL
+                        ref_type = RefType.REL_CALL
+                        size = 4
+                    elif r_type == 29:    # R_ARM_JUMP24
+                        ref_type = RefType.REL_JUMP_NEAR
+                        size = 4
+                    else:
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                elif self.e_machine == 'EM_MIPS':
+                    # MIPS relocation types
+                    if r_type == 2:       # R_MIPS_32
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                    elif r_type == 4:     # R_MIPS_26
+                        ref_type = RefType.REL_CALL
+                        size = 4
+                    elif r_type == 5:     # R_MIPS_HI16
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                    elif r_type == 6:     # R_MIPS_LO16
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                    elif r_type == 10:    # R_MIPS_JUMP_ADDR
+                        ref_type = RefType.PLT_STUB
+                        size = 4
+                    else:
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                else:
+                    # Generic fallback
+                    ref_type = RefType.ELF_RELATIVE
+                    size = self.ptr_size
 
                 is_rel = r_type == 2  # PC-relative
                 refs.append(Reference(
@@ -1044,8 +1149,7 @@ class ELFReferenceFinder:
     # ── 2. Disassembly ────────────────────────────────────────────────
     def _find_from_disassembly(self) -> List[Reference]:
         refs = []
-        arch = capstone.CS_ARCH_X86
-        mode = capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32
+        arch, mode = self._get_capstone_arch()
         md = capstone.Cs(arch, mode)
         md.detail = True
         md.skipdata = True
@@ -1063,95 +1167,127 @@ class ELFReferenceFinder:
                 insn_vaddr = insn.address
                 insn_foff = sec_foff + (insn_vaddr - base_va)
 
-                # ── Relative CALL (E8 rel32) ──
-                if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1:
-                    op = insn.operands[0]
-                    if op.type == cs_x86.X86_OP_IMM:
-                        target_va = op.imm
-                        disp_off = insn.size - 4
-                        refs.append(Reference(
-                            file_offset=insn_foff + disp_off,
-                            ref_type=RefType.REL_CALL,
-                            target_rva=target_va, ref_rva=insn_vaddr,
-                            size_bytes=4, is_relative=True,
-                            insn_size=insn.size, section_name=sec_name,
-                            confidence=1.0, source=RefSource.STATIC_DISASM,
-                        ))
+                if self.is_x86:
+                    self._disasm_x86_insn(refs, insn, insn_vaddr, insn_foff, sec_name)
+                else:
+                    self._disasm_generic_insn(refs, insn, insn_vaddr, insn_foff, sec_name)
+        return refs
 
-                # ── Relative JMP ──
-                elif insn.id == cs_x86.X86_INS_JMP and len(insn.operands) == 1:
-                    op = insn.operands[0]
-                    if op.type == cs_x86.X86_OP_IMM:
-                        target_va = op.imm
-                        if insn.size == 2:
-                            refs.append(Reference(
-                                file_offset=insn_foff + 1,
-                                ref_type=RefType.REL_JUMP_SHORT,
-                                target_rva=target_va, ref_rva=insn_vaddr,
-                                size_bytes=1, is_relative=True,
-                                insn_size=insn.size, section_name=sec_name,
-                                confidence=1.0, source=RefSource.STATIC_DISASM,
-                            ))
-                        else:
-                            disp_off = insn.size - 4
-                            refs.append(Reference(
-                                file_offset=insn_foff + disp_off,
-                                ref_type=RefType.REL_JUMP_NEAR,
-                                target_rva=target_va, ref_rva=insn_vaddr,
-                                size_bytes=4, is_relative=True,
-                                insn_size=insn.size, section_name=sec_name,
-                                confidence=1.0, source=RefSource.STATIC_DISASM,
-                            ))
+    def _disasm_x86_insn(self, refs, insn, insn_vaddr, insn_foff, sec_name):
+        """Handle x86/x86-64 instruction reference extraction."""
+        mnemonic = insn.mnemonic.lower()
 
-                # ── Conditional branches ──
-                elif mnemonic.startswith('j') and mnemonic != 'jmp':
-                    if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
-                        target_va = insn.operands[0].imm
-                        if insn.size == 2:
-                            refs.append(Reference(
-                                file_offset=insn_foff + 1,
-                                ref_type=RefType.REL_COND_SHORT,
-                                target_rva=target_va, ref_rva=insn_vaddr,
-                                size_bytes=1, is_relative=True,
-                                insn_size=insn.size, section_name=sec_name,
-                                confidence=1.0, source=RefSource.STATIC_DISASM,
-                            ))
-                        else:
-                            disp_off = insn.size - 4
-                            refs.append(Reference(
-                                file_offset=insn_foff + disp_off,
-                                ref_type=RefType.REL_COND_NEAR,
-                                target_rva=target_va, ref_rva=insn_vaddr,
-                                size_bytes=4, is_relative=True,
-                                insn_size=insn.size, section_name=sec_name,
-                                confidence=1.0, source=RefSource.STATIC_DISASM,
-                            ))
+        # ── Relative CALL (E8 rel32) ──
+        if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1:
+            op = insn.operands[0]
+            if op.type == cs_x86.X86_OP_IMM:
+                target_va = op.imm
+                disp_off = insn.size - 4
+                refs.append(Reference(
+                    file_offset=insn_foff + disp_off,
+                    ref_type=RefType.REL_CALL,
+                    target_rva=target_va, ref_rva=insn_vaddr,
+                    size_bytes=4, is_relative=True,
+                    insn_size=insn.size, section_name=sec_name,
+                    confidence=1.0, source=RefSource.STATIC_DISASM,
+                ))
 
-                # ── RIP-relative addressing (x64) ──
-                elif self.is_64 and len(insn.operands) >= 2:
-                    for op in insn.operands:
-                        if (op.type == cs_x86.X86_OP_MEM and
-                                op.mem.base == cs_x86.X86_REG_RIP and
-                                op.mem.index == 0):
-                            disp = op.mem.disp
-                            target_va = insn_vaddr + insn.size + disp
-                            if hasattr(insn, 'disp_offset') and insn.disp_offset > 0:
-                                disp_foff = insn_foff + insn.disp_offset
-                            else:
-                                disp_foff = insn_foff + insn.size - 4
-                                for op2 in insn.operands:
-                                    if op2.type == cs_x86.X86_OP_IMM:
-                                        disp_foff -= op2.size
-                                        break
-                            refs.append(Reference(
-                                file_offset=disp_foff,
-                                ref_type=RefType.RIP_RELATIVE,
-                                target_rva=target_va, ref_rva=insn_vaddr,
-                                size_bytes=4, is_relative=True,
-                                insn_size=insn.size, section_name=sec_name,
-                                confidence=1.0, source=RefSource.STATIC_DISASM,
-                            ))
-                            break
+        # ── Relative JMP ──
+        elif insn.id == cs_x86.X86_INS_JMP and len(insn.operands) == 1:
+            op = insn.operands[0]
+            if op.type == cs_x86.X86_OP_IMM:
+                target_va = op.imm
+                if insn.size == 2:
+                    refs.append(Reference(
+                        file_offset=insn_foff + 1,
+                        ref_type=RefType.REL_JUMP_SHORT,
+                        target_rva=target_va, ref_rva=insn_vaddr,
+                        size_bytes=1, is_relative=True,
+                        insn_size=insn.size, section_name=sec_name,
+                        confidence=1.0, source=RefSource.STATIC_DISASM,
+                    ))
+                else:
+                    disp_off = insn.size - 4
+                    refs.append(Reference(
+                        file_offset=insn_foff + disp_off,
+                        ref_type=RefType.REL_JUMP_NEAR,
+                        target_rva=target_va, ref_rva=insn_vaddr,
+                        size_bytes=4, is_relative=True,
+                        insn_size=insn.size, section_name=sec_name,
+                        confidence=1.0, source=RefSource.STATIC_DISASM,
+                    ))
+
+        # ── Conditional branches ──
+        elif mnemonic.startswith('j') and mnemonic != 'jmp':
+            if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                target_va = insn.operands[0].imm
+                if insn.size == 2:
+                    refs.append(Reference(
+                        file_offset=insn_foff + 1,
+                        ref_type=RefType.REL_COND_SHORT,
+                        target_rva=target_va, ref_rva=insn_vaddr,
+                        size_bytes=1, is_relative=True,
+                        insn_size=insn.size, section_name=sec_name,
+                        confidence=1.0, source=RefSource.STATIC_DISASM,
+                    ))
+                else:
+                    disp_off = insn.size - 4
+                    refs.append(Reference(
+                        file_offset=insn_foff + disp_off,
+                        ref_type=RefType.REL_COND_NEAR,
+                        target_rva=target_va, ref_rva=insn_vaddr,
+                        size_bytes=4, is_relative=True,
+                        insn_size=insn.size, section_name=sec_name,
+                        confidence=1.0, source=RefSource.STATIC_DISASM,
+                    ))
+
+        # ── RIP-relative addressing (x64) ──
+        elif self.is_64 and len(insn.operands) >= 2:
+            for op in insn.operands:
+                if (op.type == cs_x86.X86_OP_MEM and
+                        op.mem.base == cs_x86.X86_REG_RIP and
+                        op.mem.index == 0):
+                    disp = op.mem.disp
+                    target_va = insn_vaddr + insn.size + disp
+                    if hasattr(insn, 'disp_offset') and insn.disp_offset > 0:
+                        disp_foff = insn_foff + insn.disp_offset
+                    else:
+                        disp_foff = insn_foff + insn.size - 4
+                        for op2 in insn.operands:
+                            if op2.type == cs_x86.X86_OP_IMM:
+                                disp_foff -= op2.size
+                                break
+                    refs.append(Reference(
+                        file_offset=disp_foff,
+                        ref_type=RefType.RIP_RELATIVE,
+                        target_rva=target_va, ref_rva=insn_vaddr,
+                        size_bytes=4, is_relative=True,
+                        insn_size=insn.size, section_name=sec_name,
+                        confidence=1.0, source=RefSource.STATIC_DISASM,
+                    ))
+                    break
+
+    def _disasm_generic_insn(self, refs, insn, insn_vaddr, insn_foff, sec_name):
+        """Handle non-x86 instruction reference extraction using generic Capstone groups."""
+        if not insn.groups:
+            return
+
+        is_jump = capstone.CS_GRP_JUMP in insn.groups
+        is_call = capstone.CS_GRP_CALL in insn.groups
+
+        if (is_jump or is_call) and insn.operands:
+            op0 = insn.operands[0]
+            if op0.type == capstone.CS_OP_IMM:
+                target_va = op0.imm
+                rt = RefType.REL_CALL if is_call else RefType.REL_JUMP_NEAR
+                refs.append(Reference(
+                    file_offset=insn_foff,
+                    ref_type=rt,
+                    target_rva=target_va, ref_rva=insn_vaddr,
+                    size_bytes=4, is_relative=True,
+                    insn_size=insn.size, section_name=sec_name,
+                    confidence=1.0, source=RefSource.STATIC_DISASM,
+                ))
         return refs
 
     # ── 3. Symbol Tables ──────────────────────────────────────────────
@@ -1182,7 +1318,7 @@ class ELFReferenceFinder:
     # ── 4. GOT / PLT ─────────────────────────────────────────────────
     def _find_got_plt(self) -> List[Reference]:
         refs = []
-        fmt = '<Q' if self.is_64 else '<I'
+        fmt = f'{self.endian}Q' if self.is_64 else f'{self.endian}I'
         step = self.ptr_size
 
         for sec_name in ('.got', '.got.plt'):
@@ -1212,7 +1348,7 @@ class ELFReferenceFinder:
     # ── 5. .init_array / .fini_array ──────────────────────────────────
     def _find_init_fini(self) -> List[Reference]:
         refs = []
-        fmt = '<Q' if self.is_64 else '<I'
+        fmt = f'{self.endian}Q' if self.is_64 else f'{self.endian}I'
         step = self.ptr_size
 
         for sec_name in ('.init_array', '.fini_array', '.preinit_array'):
@@ -1244,7 +1380,7 @@ class ELFReferenceFinder:
         if code_lo is None:
             return refs
 
-        fmt = '<Q' if self.is_64 else '<I'
+        fmt = f'{self.endian}Q' if self.is_64 else f'{self.endian}I'
         step = self.ptr_size
         align_mask = 7 if self.is_64 else 3
 
@@ -1305,6 +1441,14 @@ class MachOReferenceFinder:
     LC_SEGMENT_64 = 0x19
     LC_DYSYMTAB   = 0x0B
 
+    # Mach-O CPU types
+    CPU_TYPE_X86     = 7
+    CPU_TYPE_X86_64  = 0x01000007
+    CPU_TYPE_ARM     = 12
+    CPU_TYPE_ARM64   = 0x0100000C
+    CPU_TYPE_PPC     = 18
+    CPU_TYPE_PPC64   = 0x01000012
+
     def __init__(self, path: str, arch_index: int = 0):
         self.path = path
         with open(path, 'rb') as f:
@@ -1314,8 +1458,10 @@ class MachOReferenceFinder:
         self.is_fat = False
         self.image_base = 0
         self.arch_offset = 0
+        self.cputype = 0
         self.sections: List[Dict] = []
         self.segments: List[Dict] = []
+        self._dysymtab = None  # (locreloff, nlocrel, extreloff, nextrel)
         self._parse_header(arch_index)
 
     def _parse_header(self, arch_index: int):
@@ -1329,6 +1475,7 @@ class MachOReferenceFinder:
                 arch_index = 0
             # Each fat_arch is 20 bytes: cputype(4), cpusubtype(4), offset(4), size(4), align(4)
             fa_off = 8 + arch_index * 20
+            self.cputype = struct.unpack_from('>I', self.buffer, fa_off)[0]
             self.arch_offset = struct.unpack_from('>I', self.buffer, fa_off + 8)[0]
             magic = struct.unpack_from('<I', self.buffer, self.arch_offset)[0]
         else:
@@ -1337,12 +1484,14 @@ class MachOReferenceFinder:
         base = self.arch_offset
         if magic == self.MH_MAGIC_64:
             self.is_64 = True
+            self.cputype = struct.unpack_from('<I', self.buffer, base + 4)[0]
             # Mach-O 64 header: 32 bytes
             ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
             sizeofcmds = struct.unpack_from('<I', self.buffer, base + 20)[0]
             cmd_offset = base + 32
         elif magic == self.MH_MAGIC_32:
             self.is_64 = False
+            self.cputype = struct.unpack_from('<I', self.buffer, base + 4)[0]
             # Mach-O 32 header: 28 bytes
             ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
             sizeofcmds = struct.unpack_from('<I', self.buffer, base + 20)[0]
@@ -1351,6 +1500,25 @@ class MachOReferenceFinder:
             return  # Not a valid Mach-O
 
         self._parse_load_commands(cmd_offset, ncmds)
+
+    def _get_capstone_arch(self):
+        """Return (arch, mode) tuple for Capstone based on Mach-O cputype."""
+        mapping = {
+            self.CPU_TYPE_X86:    (capstone.CS_ARCH_X86,   capstone.CS_MODE_32),
+            self.CPU_TYPE_X86_64: (capstone.CS_ARCH_X86,   capstone.CS_MODE_64),
+            self.CPU_TYPE_ARM:    (capstone.CS_ARCH_ARM,   capstone.CS_MODE_ARM),
+            self.CPU_TYPE_ARM64:  (capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM),
+            self.CPU_TYPE_PPC:    (capstone.CS_ARCH_PPC,   capstone.CS_MODE_32 | capstone.CS_MODE_BIG_ENDIAN),
+            self.CPU_TYPE_PPC64:  (capstone.CS_ARCH_PPC,   capstone.CS_MODE_64 | capstone.CS_MODE_BIG_ENDIAN),
+        }
+        result = mapping.get(self.cputype)
+        if result is not None:
+            return result
+        return (capstone.CS_ARCH_X86, capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32)
+
+    @property
+    def is_x86(self) -> bool:
+        return self.cputype in (self.CPU_TYPE_X86, self.CPU_TYPE_X86_64)
 
     def _parse_load_commands(self, offset: int, ncmds: int):
         for _ in range(ncmds):
@@ -1365,6 +1533,8 @@ class MachOReferenceFinder:
                 self._parse_segment64(offset)
             elif cmd == self.LC_SEGMENT:
                 self._parse_segment32(offset)
+            elif cmd == self.LC_DYSYMTAB:
+                self._parse_dysymtab(offset)
 
             offset += cmdsize
 
@@ -1440,6 +1610,24 @@ class MachOReferenceFinder:
             })
             sec_off += 68
 
+    def _parse_dysymtab(self, offset: int):
+        """Parse LC_DYSYMTAB load command to extract relocation table info."""
+        # LC_DYSYMTAB layout (after cmd+cmdsize):
+        # offset+8: ilocalsym, offset+12: nlocalsym, ...
+        # offset+32: tocoff, offset+36: ntoc
+        # offset+40: modtaboff, offset+44: nmodtab
+        # offset+48: extrefsymoff, offset+52: nextrefsyms
+        # offset+56: indirectsymoff, offset+60: nindirectsyms
+        # offset+64: extreloff, offset+68: nextrel
+        # offset+72: locreloff, offset+76: nlocrel
+        if offset + 80 > len(self.buffer):
+            return
+        locreloff = struct.unpack_from('<I', self.buffer, offset + 72)[0]
+        nlocrel   = struct.unpack_from('<I', self.buffer, offset + 76)[0]
+        extreloff = struct.unpack_from('<I', self.buffer, offset + 64)[0]
+        nextrel   = struct.unpack_from('<I', self.buffer, offset + 68)[0]
+        self._dysymtab = (locreloff, nlocrel, extreloff, nextrel)
+
     def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
         for seg in self.segments:
             va = seg['vmaddr']
@@ -1451,7 +1639,7 @@ class MachOReferenceFinder:
 
     def find_all(self, callback=None) -> ReferenceDatabase:
         db = ReferenceDatabase()
-        total_passes = 3
+        total_passes = 4
         current = 0
 
         # Pass 1: Disassemble code sections
@@ -1470,7 +1658,15 @@ class MachOReferenceFinder:
         for r in refs:
             db.add(r)
 
-        # Pass 3: Data pointer heuristic scan
+        # Pass 3: DYSYMTAB relocations
+        if callback:
+            current += 1
+            callback(current, total_passes, "Parsing Mach-O DYSYMTAB relocations...")
+        refs = self._pass_dysymtab_relocs()
+        for r in refs:
+            db.add(r)
+
+        # Pass 4: Data pointer heuristic scan
         if callback:
             current += 1
             callback(current, total_passes, "Scanning Mach-O data pointers...")
@@ -1485,10 +1681,8 @@ class MachOReferenceFinder:
         if capstone is None:
             return refs
 
-        if self.is_64:
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-        else:
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        arch, mode = self._get_capstone_arch()
+        md = capstone.Cs(arch, mode)
         md.detail = True
 
         for sec in self.sections:
@@ -1511,21 +1705,28 @@ class MachOReferenceFinder:
                         op0 = insn.operands[0]
                         if op0.type == capstone.CS_OP_IMM:
                             target = op0.imm
-                            disp_size = insn.size - 1
-                            if insn.size == 2:
-                                rt = RefType.REL_JUMP_SHORT if is_jump else RefType.REL_CALL
-                                disp_size = 1
-                            elif insn.size == 5:
+                            if self.is_x86:
+                                # x86 size-based ref type dispatch
+                                disp_size = insn.size - 1
+                                if insn.size == 2:
+                                    rt = RefType.REL_JUMP_SHORT if is_jump else RefType.REL_CALL
+                                    disp_size = 1
+                                elif insn.size == 5:
+                                    rt = RefType.REL_CALL if is_call else RefType.REL_JUMP_NEAR
+                                    disp_size = 4
+                                elif insn.size == 6:
+                                    rt = RefType.REL_COND_NEAR
+                                    disp_size = 4
+                                else:
+                                    rt = RefType.REL_JUMP_NEAR
+                                    disp_size = 4
+                                disp_off = self._vaddr_to_offset(insn.address + (insn.size - disp_size))
+                            else:
+                                # Non-x86: fixed-size instructions
                                 rt = RefType.REL_CALL if is_call else RefType.REL_JUMP_NEAR
                                 disp_size = 4
-                            elif insn.size == 6:
-                                rt = RefType.REL_COND_NEAR
-                                disp_size = 4
-                            else:
-                                rt = RefType.REL_JUMP_NEAR
-                                disp_size = 4
+                                disp_off = self._vaddr_to_offset(insn.address)
 
-                            disp_off = self._vaddr_to_offset(insn.address + (insn.size - disp_size))
                             if disp_off is not None:
                                 refs.append(Reference(
                                     file_offset=disp_off,
@@ -1540,8 +1741,8 @@ class MachOReferenceFinder:
                                     source=RefSource.STATIC_DISASM,
                                 ))
 
-                # RIP-relative addressing (x64 only)
-                if self.is_64:
+                # RIP-relative addressing (x86-64 only)
+                if self.is_x86 and self.is_64:
                     for op in insn.operands:
                         if op.type == capstone.CS_OP_MEM and op.mem.base == capstone.x86.X86_REG_RIP:
                             target = insn.address + insn.size + op.mem.disp
@@ -1603,6 +1804,67 @@ class MachOReferenceFinder:
                     source=RefSource.ELF_TABLE,
                 ))
         return refs
+
+    def _pass_dysymtab_relocs(self) -> List[Reference]:
+        """Parse DYSYMTAB relocation entries (local + external)."""
+        refs = []
+        if self._dysymtab is None:
+            return refs
+        locreloff, nlocrel, extreloff, nextrel = self._dysymtab
+        ptr_size = 8 if self.is_64 else 4
+
+        # Each relocation_info is 8 bytes: r_address(4), r_symbolnum:24 | r_pcrel:1 | r_length:2 | r_extern:1 | r_type:4
+        for reloff, nrel, source_label in [(locreloff, nlocrel, "local"), (extreloff, nextrel, "external")]:
+            for i in range(nrel):
+                off = reloff + i * 8
+                if off + 8 > len(self.buffer):
+                    break
+                r_address = struct.unpack_from('<I', self.buffer, off)[0]
+                info = struct.unpack_from('<I', self.buffer, off + 4)[0]
+                r_pcrel = (info >> 24) & 1
+                r_length = (info >> 25) & 3
+                r_extern = (info >> 27) & 1
+
+                size = 1 << r_length  # 0->1, 1->2, 2->4, 3->8
+                foff = self._vaddr_to_offset(r_address + self.image_base)
+                if foff is None:
+                    continue
+
+                if r_pcrel:
+                    ref_type = RefType.REL_CALL
+                    is_rel = True
+                else:
+                    ref_type = RefType.ELF_RELATIVE
+                    is_rel = False
+
+                # Read target from the relocation
+                target_va = 0
+                if not r_pcrel and foff + size <= len(self.buffer):
+                    if size == 4:
+                        target_va = struct.unpack_from('<I', self.buffer, foff)[0]
+                    elif size == 8:
+                        target_va = struct.unpack_from('<Q', self.buffer, foff)[0]
+
+                refs.append(Reference(
+                    file_offset=foff,
+                    ref_rva=r_address + self.image_base,
+                    target_rva=target_va,
+                    ref_type=ref_type,
+                    size_bytes=size,
+                    is_relative=is_rel,
+                    insn_size=size,
+                    section_name=self._section_for_offset(foff),
+                    confidence=1.0,
+                    source=RefSource.ELF_TABLE,
+                ))
+        return refs
+
+    def _section_for_offset(self, foff: int) -> str:
+        """Return section name for a given file offset."""
+        for sec in self.sections:
+            if sec['offset'] <= foff < sec['offset'] + sec['size']:
+                return sec['name']
+        return ""
 
     def _pass_data_pointers(self) -> List[Reference]:
         refs = []
@@ -2035,77 +2297,78 @@ class ELFShiftEngine(BaseShiftEngine):
         """
         adjusted = 0
         ehdr_size = 64 if self.is_64 else 52
+        e = self.endian
 
         # ── Update ELF header entry point ──
         if self.is_64:
             entry_off = 24  # e_entry offset in Elf64_Ehdr
-            entry = struct.unpack_from('<Q', self.buffer, entry_off)[0]
+            entry = struct.unpack_from(f'{e}Q', self.buffer, entry_off)[0]
             if entry >= vaddr:
-                struct.pack_into('<Q', self.buffer, entry_off, entry + delta)
+                struct.pack_into(f'{e}Q', self.buffer, entry_off, entry + delta)
         else:
             entry_off = 24
-            entry = struct.unpack_from('<I', self.buffer, entry_off)[0]
+            entry = struct.unpack_from(f'{e}I', self.buffer, entry_off)[0]
             if entry >= vaddr:
-                struct.pack_into('<I', self.buffer, entry_off, entry + delta)
+                struct.pack_into(f'{e}I', self.buffer, entry_off, entry + delta)
 
         # ── Update program headers (PHDR) ──
         if self.is_64:
-            e_phoff = struct.unpack_from('<Q', self.buffer, 32)[0]
-            e_phentsize = struct.unpack_from('<H', self.buffer, 54)[0]
-            e_phnum = struct.unpack_from('<H', self.buffer, 56)[0]
+            e_phoff = struct.unpack_from(f'{e}Q', self.buffer, 32)[0]
+            e_phentsize = struct.unpack_from(f'{e}H', self.buffer, 54)[0]
+            e_phnum = struct.unpack_from(f'{e}H', self.buffer, 56)[0]
         else:
-            e_phoff = struct.unpack_from('<I', self.buffer, 28)[0]
-            e_phentsize = struct.unpack_from('<H', self.buffer, 42)[0]
-            e_phnum = struct.unpack_from('<H', self.buffer, 44)[0]
+            e_phoff = struct.unpack_from(f'{e}I', self.buffer, 28)[0]
+            e_phentsize = struct.unpack_from(f'{e}H', self.buffer, 42)[0]
+            e_phnum = struct.unpack_from(f'{e}H', self.buffer, 44)[0]
 
         for i in range(e_phnum):
             ph_off = e_phoff + i * e_phentsize
             if self.is_64:
-                p_type = struct.unpack_from('<I', self.buffer, ph_off)[0]
-                p_offset = struct.unpack_from('<Q', self.buffer, ph_off + 8)[0]
-                p_vaddr = struct.unpack_from('<Q', self.buffer, ph_off + 16)[0]
-                p_filesz = struct.unpack_from('<Q', self.buffer, ph_off + 32)[0]
-                p_memsz = struct.unpack_from('<Q', self.buffer, ph_off + 40)[0]
+                p_type = struct.unpack_from(f'{e}I', self.buffer, ph_off)[0]
+                p_offset = struct.unpack_from(f'{e}Q', self.buffer, ph_off + 8)[0]
+                p_vaddr = struct.unpack_from(f'{e}Q', self.buffer, ph_off + 16)[0]
+                p_filesz = struct.unpack_from(f'{e}Q', self.buffer, ph_off + 32)[0]
+                p_memsz = struct.unpack_from(f'{e}Q', self.buffer, ph_off + 40)[0]
 
                 if p_vaddr <= vaddr < p_vaddr + p_filesz:
                     # This segment contains the insertion point — grow it
-                    struct.pack_into('<Q', self.buffer, ph_off + 32, p_filesz + delta)
-                    struct.pack_into('<Q', self.buffer, ph_off + 40, p_memsz + delta)
+                    struct.pack_into(f'{e}Q', self.buffer, ph_off + 32, p_filesz + delta)
+                    struct.pack_into(f'{e}Q', self.buffer, ph_off + 40, p_memsz + delta)
                     adjusted += 1
                 elif p_offset > foff:
                     # Shift segment offset for segments after the insertion
-                    struct.pack_into('<Q', self.buffer, ph_off + 8, p_offset + delta)
+                    struct.pack_into(f'{e}Q', self.buffer, ph_off + 8, p_offset + delta)
                     adjusted += 1
             else:
-                p_type = struct.unpack_from('<I', self.buffer, ph_off)[0]
-                p_offset = struct.unpack_from('<I', self.buffer, ph_off + 4)[0]
-                p_vaddr = struct.unpack_from('<I', self.buffer, ph_off + 8)[0]
-                p_filesz = struct.unpack_from('<I', self.buffer, ph_off + 16)[0]
-                p_memsz = struct.unpack_from('<I', self.buffer, ph_off + 20)[0]
+                p_type = struct.unpack_from(f'{e}I', self.buffer, ph_off)[0]
+                p_offset = struct.unpack_from(f'{e}I', self.buffer, ph_off + 4)[0]
+                p_vaddr = struct.unpack_from(f'{e}I', self.buffer, ph_off + 8)[0]
+                p_filesz = struct.unpack_from(f'{e}I', self.buffer, ph_off + 16)[0]
+                p_memsz = struct.unpack_from(f'{e}I', self.buffer, ph_off + 20)[0]
 
                 if p_vaddr <= vaddr < p_vaddr + p_filesz:
-                    struct.pack_into('<I', self.buffer, ph_off + 16, p_filesz + delta)
-                    struct.pack_into('<I', self.buffer, ph_off + 20, p_memsz + delta)
+                    struct.pack_into(f'{e}I', self.buffer, ph_off + 16, p_filesz + delta)
+                    struct.pack_into(f'{e}I', self.buffer, ph_off + 20, p_memsz + delta)
                     adjusted += 1
                 elif p_offset > foff:
-                    struct.pack_into('<I', self.buffer, ph_off + 4, p_offset + delta)
+                    struct.pack_into(f'{e}I', self.buffer, ph_off + 4, p_offset + delta)
                     adjusted += 1
 
         # ── Update section headers (SHDR) ──
         if self.is_64:
-            e_shoff = struct.unpack_from('<Q', self.buffer, 40)[0]
-            e_shentsize = struct.unpack_from('<H', self.buffer, 58)[0]
-            e_shnum = struct.unpack_from('<H', self.buffer, 60)[0]
+            e_shoff = struct.unpack_from(f'{e}Q', self.buffer, 40)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 58)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 60)[0]
             # If section header table is after insertion, shift it
             if e_shoff > foff:
-                struct.pack_into('<Q', self.buffer, 40, e_shoff + delta)
+                struct.pack_into(f'{e}Q', self.buffer, 40, e_shoff + delta)
                 e_shoff += delta
         else:
-            e_shoff = struct.unpack_from('<I', self.buffer, 32)[0]
-            e_shentsize = struct.unpack_from('<H', self.buffer, 46)[0]
-            e_shnum = struct.unpack_from('<H', self.buffer, 48)[0]
+            e_shoff = struct.unpack_from(f'{e}I', self.buffer, 32)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 46)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 48)[0]
             if e_shoff > foff:
-                struct.pack_into('<I', self.buffer, 32, e_shoff + delta)
+                struct.pack_into(f'{e}I', self.buffer, 32, e_shoff + delta)
                 e_shoff += delta
 
         for i in range(e_shnum):
@@ -2113,30 +2376,30 @@ class ELFShiftEngine(BaseShiftEngine):
             if sh_off + e_shentsize > len(self.buffer):
                 break
             if self.is_64:
-                sh_addr = struct.unpack_from('<Q', self.buffer, sh_off + 16)[0]
-                sh_offset = struct.unpack_from('<Q', self.buffer, sh_off + 24)[0]
-                sh_size = struct.unpack_from('<Q', self.buffer, sh_off + 32)[0]
+                sh_addr = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 16)[0]
+                sh_offset = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 32)[0]
 
                 if sh_addr and sh_addr <= vaddr < sh_addr + sh_size:
-                    struct.pack_into('<Q', self.buffer, sh_off + 32, sh_size + delta)
+                    struct.pack_into(f'{e}Q', self.buffer, sh_off + 32, sh_size + delta)
                     adjusted += 1
                 elif sh_offset > foff:
-                    struct.pack_into('<Q', self.buffer, sh_off + 24, sh_offset + delta)
+                    struct.pack_into(f'{e}Q', self.buffer, sh_off + 24, sh_offset + delta)
                     if sh_addr and sh_addr >= vaddr:
-                        struct.pack_into('<Q', self.buffer, sh_off + 16, sh_addr + delta)
+                        struct.pack_into(f'{e}Q', self.buffer, sh_off + 16, sh_addr + delta)
                     adjusted += 1
             else:
-                sh_addr = struct.unpack_from('<I', self.buffer, sh_off + 12)[0]
-                sh_offset = struct.unpack_from('<I', self.buffer, sh_off + 16)[0]
-                sh_size = struct.unpack_from('<I', self.buffer, sh_off + 20)[0]
+                sh_addr = struct.unpack_from(f'{e}I', self.buffer, sh_off + 12)[0]
+                sh_offset = struct.unpack_from(f'{e}I', self.buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from(f'{e}I', self.buffer, sh_off + 20)[0]
 
                 if sh_addr and sh_addr <= vaddr < sh_addr + sh_size:
-                    struct.pack_into('<I', self.buffer, sh_off + 20, sh_size + delta)
+                    struct.pack_into(f'{e}I', self.buffer, sh_off + 20, sh_size + delta)
                     adjusted += 1
                 elif sh_offset > foff:
-                    struct.pack_into('<I', self.buffer, sh_off + 16, sh_offset + delta)
+                    struct.pack_into(f'{e}I', self.buffer, sh_off + 16, sh_offset + delta)
                     if sh_addr and sh_addr >= vaddr:
-                        struct.pack_into('<I', self.buffer, sh_off + 12, sh_addr + delta)
+                        struct.pack_into(f'{e}I', self.buffer, sh_off + 12, sh_addr + delta)
                     adjusted += 1
 
         return adjusted
@@ -2148,14 +2411,15 @@ class ELFShiftEngine(BaseShiftEngine):
         Returns the number of relocation entries updated.
         """
         updated = 0
+        e = self.endian
         if self.is_64:
-            e_shoff = struct.unpack_from('<Q', self.buffer, 40)[0]
-            e_shentsize = struct.unpack_from('<H', self.buffer, 58)[0]
-            e_shnum = struct.unpack_from('<H', self.buffer, 60)[0]
+            e_shoff = struct.unpack_from(f'{e}Q', self.buffer, 40)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 58)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 60)[0]
         else:
-            e_shoff = struct.unpack_from('<I', self.buffer, 32)[0]
-            e_shentsize = struct.unpack_from('<H', self.buffer, 46)[0]
-            e_shnum = struct.unpack_from('<H', self.buffer, 48)[0]
+            e_shoff = struct.unpack_from(f'{e}I', self.buffer, 32)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 46)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 48)[0]
 
         # SHT_REL=9, SHT_RELA=4
         for i in range(e_shnum):
@@ -2163,15 +2427,15 @@ class ELFShiftEngine(BaseShiftEngine):
             if sh_off + e_shentsize > len(self.buffer):
                 break
             if self.is_64:
-                sh_type = struct.unpack_from('<I', self.buffer, sh_off + 4)[0]
-                sh_offset = struct.unpack_from('<Q', self.buffer, sh_off + 24)[0]
-                sh_size = struct.unpack_from('<Q', self.buffer, sh_off + 32)[0]
-                sh_entsize = struct.unpack_from('<Q', self.buffer, sh_off + 56)[0]
+                sh_type = struct.unpack_from(f'{e}I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 32)[0]
+                sh_entsize = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 56)[0]
             else:
-                sh_type = struct.unpack_from('<I', self.buffer, sh_off + 4)[0]
-                sh_offset = struct.unpack_from('<I', self.buffer, sh_off + 16)[0]
-                sh_size = struct.unpack_from('<I', self.buffer, sh_off + 20)[0]
-                sh_entsize = struct.unpack_from('<I', self.buffer, sh_off + 36)[0]
+                sh_type = struct.unpack_from(f'{e}I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}I', self.buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from(f'{e}I', self.buffer, sh_off + 20)[0]
+                sh_entsize = struct.unpack_from(f'{e}I', self.buffer, sh_off + 36)[0]
 
             if sh_type not in (4, 9):  # SHT_RELA=4, SHT_REL=9
                 continue
@@ -2185,14 +2449,14 @@ class ELFShiftEngine(BaseShiftEngine):
                     break
 
                 if self.is_64:
-                    r_offset = struct.unpack_from('<Q', self.buffer, ent_off)[0]
+                    r_offset = struct.unpack_from(f'{e}Q', self.buffer, ent_off)[0]
                     if r_offset >= shift_va:
-                        struct.pack_into('<Q', self.buffer, ent_off, r_offset + delta)
+                        struct.pack_into(f'{e}Q', self.buffer, ent_off, r_offset + delta)
                         updated += 1
                 else:
-                    r_offset = struct.unpack_from('<I', self.buffer, ent_off)[0]
+                    r_offset = struct.unpack_from(f'{e}I', self.buffer, ent_off)[0]
                     if r_offset >= shift_va:
-                        struct.pack_into('<I', self.buffer, ent_off, (r_offset + delta) & 0xFFFFFFFF)
+                        struct.pack_into(f'{e}I', self.buffer, ent_off, (r_offset + delta) & 0xFFFFFFFF)
                         updated += 1
 
         return updated
@@ -2242,12 +2506,33 @@ class MachOShiftEngine(BaseShiftEngine):
             foff = 0
         self._update_macho_headers(from_addr, expand, foff)
 
-    def insert_bytes(self, vaddr: int, data: bytes) -> ShiftResult:
-        N = len(data)
-        if N == 0:
-            return ShiftResult(ShiftOp.INSERT, vaddr, 0, 0, [], 0,
-                               len(self.buffer), True, "Nothing to insert")
+    def _reparse_macho(self):
+        """Re-parse Mach-O segments/sections from the current buffer after undo."""
+        finder = MachOReferenceFinder.__new__(MachOReferenceFinder)
+        finder.buffer = self.buffer
+        finder.sections = []
+        finder.segments = []
+        finder.is_64 = self.is_64
+        finder.is_fat = False
+        finder.image_base = 0
+        finder.arch_offset = self.arch_offset
+        finder.cputype = 0
+        finder._dysymtab = None
+        finder._parse_header(0)
+        self.segments = finder.segments
+        self.sections = finder.sections
 
+    def undo(self) -> Optional[str]:
+        if not self._undo_stack:
+            return None
+        op, foff, n, saved = self._undo_stack.pop()
+        if op == ShiftOp.INSERT:
+            del self.buffer[foff:foff + n]
+            self._reparse_macho()
+            return f"Undid INSERT of {n} bytes at offset 0x{foff:X}"
+        elif op == ShiftOp.DELETE:
+            self.buffer[foff:foff] = saved
+            self._reparse_macho()
         insert_foff = self._vaddr_to_offset(vaddr)
         if insert_foff is None:
             return ShiftResult(ShiftOp.INSERT, vaddr, N, 0, [],
@@ -2511,7 +2796,7 @@ class SymbolUpdater:
     """
 
     @staticmethod
-    def update_elf_symbols(buffer: bytearray, is_64: bool, shift_va: int, delta: int) -> int:
+    def update_elf_symbols(buffer: bytearray, is_64: bool, shift_va: int, delta: int, endian: str = '<') -> int:
         """
         Patch all symbol st_value entries in .symtab and .dynsym that are >= shift_va.
         Returns the number of symbols updated.
@@ -2520,15 +2805,16 @@ class SymbolUpdater:
             return 0
 
         updated = 0
+        e = endian
         # Read ELF header to find section header table
         if is_64:
-            e_shoff = struct.unpack_from('<Q', buffer, 40)[0]
-            e_shentsize = struct.unpack_from('<H', buffer, 58)[0]
-            e_shnum = struct.unpack_from('<H', buffer, 60)[0]
+            e_shoff = struct.unpack_from(f'{e}Q', buffer, 40)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', buffer, 58)[0]
+            e_shnum = struct.unpack_from(f'{e}H', buffer, 60)[0]
         else:
-            e_shoff = struct.unpack_from('<I', buffer, 32)[0]
-            e_shentsize = struct.unpack_from('<H', buffer, 46)[0]
-            e_shnum = struct.unpack_from('<H', buffer, 48)[0]
+            e_shoff = struct.unpack_from(f'{e}I', buffer, 32)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', buffer, 46)[0]
+            e_shnum = struct.unpack_from(f'{e}H', buffer, 48)[0]
 
         sym_entry_size = 24 if is_64 else 16
 
@@ -2538,15 +2824,15 @@ class SymbolUpdater:
                 break
 
             if is_64:
-                sh_type = struct.unpack_from('<I', buffer, sh_off + 4)[0]
-                sh_offset = struct.unpack_from('<Q', buffer, sh_off + 24)[0]
-                sh_size = struct.unpack_from('<Q', buffer, sh_off + 32)[0]
-                sh_entsize = struct.unpack_from('<Q', buffer, sh_off + 56)[0]
+                sh_type = struct.unpack_from(f'{e}I', buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}Q', buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from(f'{e}Q', buffer, sh_off + 32)[0]
+                sh_entsize = struct.unpack_from(f'{e}Q', buffer, sh_off + 56)[0]
             else:
-                sh_type = struct.unpack_from('<I', buffer, sh_off + 4)[0]
-                sh_offset = struct.unpack_from('<I', buffer, sh_off + 16)[0]
-                sh_size = struct.unpack_from('<I', buffer, sh_off + 20)[0]
-                sh_entsize = struct.unpack_from('<I', buffer, sh_off + 36)[0]
+                sh_type = struct.unpack_from(f'{e}I', buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}I', buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from(f'{e}I', buffer, sh_off + 20)[0]
+                sh_entsize = struct.unpack_from(f'{e}I', buffer, sh_off + 36)[0]
 
             # SHT_SYMTAB = 2, SHT_DYNSYM = 11
             if sh_type not in (2, 11):
@@ -2563,14 +2849,14 @@ class SymbolUpdater:
 
                 if is_64:
                     # Elf64_Sym: st_name(4), st_info(1), st_other(1), st_shndx(2), st_value(8), st_size(8)
-                    st_shndx = struct.unpack_from('<H', buffer, sym_off + 6)[0]
-                    st_value = struct.unpack_from('<Q', buffer, sym_off + 8)[0]
-                    st_size = struct.unpack_from('<Q', buffer, sym_off + 16)[0]
+                    st_shndx = struct.unpack_from(f'{e}H', buffer, sym_off + 6)[0]
+                    st_value = struct.unpack_from(f'{e}Q', buffer, sym_off + 8)[0]
+                    st_size = struct.unpack_from(f'{e}Q', buffer, sym_off + 16)[0]
                 else:
                     # Elf32_Sym: st_name(4), st_value(4), st_size(4), st_info(1), st_other(1), st_shndx(2)
-                    st_value = struct.unpack_from('<I', buffer, sym_off + 4)[0]
-                    st_size = struct.unpack_from('<I', buffer, sym_off + 8)[0]
-                    st_shndx = struct.unpack_from('<H', buffer, sym_off + 14)[0]
+                    st_value = struct.unpack_from(f'{e}I', buffer, sym_off + 4)[0]
+                    st_size = struct.unpack_from(f'{e}I', buffer, sym_off + 8)[0]
+                    st_shndx = struct.unpack_from(f'{e}H', buffer, sym_off + 14)[0]
 
                 # SHN_UNDEF=0, SHN_ABS=0xFFF1 — don't shift these
                 if st_shndx == 0 or st_shndx == 0xFFF1:
@@ -2581,9 +2867,9 @@ class SymbolUpdater:
                 if st_value >= shift_va:
                     new_value = st_value + delta
                     if is_64:
-                        struct.pack_into('<Q', buffer, sym_off + 8, new_value)
+                        struct.pack_into(f'{e}Q', buffer, sym_off + 8, new_value)
                     else:
-                        struct.pack_into('<I', buffer, sym_off + 4, new_value & 0xFFFFFFFF)
+                        struct.pack_into(f'{e}I', buffer, sym_off + 4, new_value & 0xFFFFFFFF)
                     updated += 1
 
         return updated
@@ -3455,7 +3741,8 @@ class UBRTEngine:
         is_64 = self.pe_info.get('is_64', False)
 
         if self.binary_format == 'elf':
-            count = SymbolUpdater.update_elf_symbols(buf, is_64, shift_addr, delta)
+            endian = getattr(self.shift_engine, 'endian', '<')
+            count = SymbolUpdater.update_elf_symbols(buf, is_64, shift_addr, delta, endian)
         elif self.binary_format == 'pe' and isinstance(self.shift_engine, ShiftEngine):
             count = SymbolUpdater.update_pe_exports(
                 buf, self.shift_engine.pe, shift_addr, delta)
