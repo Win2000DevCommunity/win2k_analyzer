@@ -2,9 +2,19 @@
 
 **The ultimate reverse-engineering and binary compatibility toolkit for porting ReactOS components to Windows 2000 SP4.**
 
-Analyze, compare, decompile, emulate, debug, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (16 tabs)** and a **full CLI (27 commands)**.
+Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (17 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.4 — Dynamic PDB Structure Extraction:**
+**NEW in v3.5 — Universal Binary Rewriting Tool (UBRT) v7.2:**
+- **Universal Binary Rewriter:** Insert, delete, or patch bytes anywhere in a PE, ELF, or Mach-O binary and have **every reference in the file automatically recalculated** — relocations, jump tables, export/import tables, exception tables, TLS, debug directories, resource directories, load configs, delay imports, bound imports, and more.
+- **15 reference analysis passes** — discovers 109,000+ relocatable references in ntoskrnl.exe alone: direct relocations, export RVAs, import thunks, exception handler RVAs, TLS callbacks, debug directory entries, resource RVAs, load config pointers, delay import descriptors, bound import descriptors, indirect calls through memory, indirect jumps through memory, section-relative data, cross-section references, and QEMU dynamic trace targets.
+- **Multi-format support:** PE (32/64-bit), ELF (with full section/program header updates, SHT_RELA addend correction), Mach-O (including fat/universal binaries with automatic arch offset shifting).
+- **QEMU dynamic tracing:** Run any binary under QEMU with `-d exec` tracing, parse the execution log, and **automatically discover indirect call/jump targets** that static analysis misses — merged as first-class references for the shift engine.
+- **compact():** Reclaim trailing zero padding from any section in PE, ELF, or Mach-O binaries — automatically updates all headers and re-parses the binary.
+- **strip_signature():** Remove PE Authenticode signatures (zeroes Security directory, truncates certificate table, zeroes checksum) and Mach-O LC_CODE_SIGNATURE load commands — so modified binaries don't fail signature verification.
+- **Resource directory protection:** Detects when a shift operation falls inside a `.rsrc` section and skips internal resource pointer rewriting to prevent corruption of the resource tree's relative offsets.
+- **GUI Tab 17 (UBRT):** Full graphical interface with progress dialogs, tabbed results, format detection, reference analysis display, and interactive patch/insert/delete operations.
+
+**Previously in v3.4 — Dynamic PDB Structure Extraction:**
 - **Zero static data:** All Win2000 kernel structure layouts (PEB, TEB, EPROCESS, ETHREAD, KUSER_SHARED_DATA, etc.) are now extracted **live from real PDB debug symbols** — no hardcoded field tables, no stale offsets.
 - **Native PDB 2.0 / 7.0 parser** — reads Microsoft PDB files (both JG/MSF 2.0 and DS/MSF 7.0 formats) directly in pure Python — no `pdbparse` or external dependency required.
 - **Full TPI stream support** — resolves LF_STRUCTURE, LF_UNION, LF_ARRAY, LF_POINTER, LF_MODIFIER, LF_BITFIELD, LF_FIELDLIST and all CodeView leaf types. Handles forward-reference chains, nested types, and pointer qualifiers (PVOID, PULONG, PPEB_LDR_DATA, etc.).
@@ -41,6 +51,7 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 ## Table of Contents
 
 - [What Does This Tool Do?](#what-does-this-tool-do)
+- [What's New in v3.5 — UBRT Engine](#whats-new-in-v35--ubrt-engine)
 - [What's New in v3.4 — Dynamic PDB Structure Extraction](#whats-new-in-v34--dynamic-pdb-structure-extraction)
 - [What's New in v3.2](#whats-new-in-v32)
 - [Kernel Function Emulator](#kernel-function-emulator--pre-test-patches-before-deploying)
@@ -54,7 +65,8 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 - [CLI Command Reference (All 27 Commands)](#cli-command-reference-all-27-commands)
 - [Patching NT System Internals (.sys / Kernel-Mode Binaries)](#patching-nt-system-internals-sys--kernel-mode-binaries)
 - [Kernel Debugger — Live Kernel State](#kernel-debugger--live-kernel-state)
-- [GUI Tab Reference (All 16 Tabs)](#gui-tab-reference-all-16-tabs)
+- [UBRT Engine — Universal Binary Rewriting](#ubrt-engine--universal-binary-rewriting)
+- [GUI Tab Reference (All 17 Tabs)](#gui-tab-reference-all-17-tabs)
 - [Deep Analyzer — IDA Pro-Level Analysis Without Symbols](#deep-analyzer--ida-pro-level-analysis-without-symbols)
 - [Symbol Loader — Enrich Disassembly With Debug Info](#symbol-loader--enrich-disassembly-with-debug-info)
 - [Decompiler Modes — Pseudo-C, Assembly, Hex Dump](#decompiler-modes--pseudo-c-assembly-hex-dump)
@@ -559,6 +571,13 @@ All long-running operations now show a **real-time progress dialog** with:
 | | **Cross-module IAT resolution and call tracing** | Python API | Tab 16 |
 | | **Object inspector (EPROCESS, DRIVER_OBJECT, handle table)** | Python API | Tab 16 |
 | | **Missing module detection and dependency resolver** | Python API | Tab 16 |
+| **UBRT Engine** | **Universal binary rewriter — insert/delete/patch with auto-reference fixups** | Python API | Tab 17 |
+| | **15-pass reference analysis (relocations, exports, imports, exceptions, TLS, resources, ...)** | Python API | Tab 17 |
+| | **Multi-format: PE (32/64), ELF (RELA), Mach-O (fat/universal)** | Python API | Tab 17 |
+| | **QEMU dynamic tracing — discover indirect call/jump targets** | Python API | Tab 17 |
+| | **compact() — reclaim section padding (PE, ELF, Mach-O)** | Python API | Tab 17 |
+| | **strip_signature() — remove PE Authenticode / Mach-O LC_CODE_SIGNATURE** | Python API | Tab 17 |
+| | **Resource directory protection (.rsrc conflict detection)** | Python API | Tab 17 |
 | **UI Features** | **Tabbed output — each action opens new closeable tab** | — | All tabs |
 | | **Right-click / middle-click to close tabs** | — | All tabs |
 | | **Progress dialogs with operation names + percentage** | — | Tab 10, 13 |
@@ -588,6 +607,7 @@ pip install -r requirements.txt
 pefile>=2023.2.7    # PE file parsing
 capstone>=5.0.0     # x86 disassembly engine
 unicorn>=2.0.0      # x86 CPU emulator (kernel function emulator)
+pyelftools>=0.29    # ELF binary parsing (UBRT ELF support)
 tabulate>=0.9.0     # Table formatting for CLI output
 colorama>=0.4.6     # Colored terminal output
 ```
@@ -627,7 +647,7 @@ python win2k_gui.py
 
 ## Opening the GUI
 
-The GUI is a standalone Python/Tkinter application with a dark theme and 15 tabs.
+The GUI is a standalone Python/Tkinter application with a dark theme and 17 tabs.
 
 ### From the command line:
 
@@ -666,6 +686,8 @@ Double-click `win2k_gui.py` (if Python is associated with `.py` files).
 | 13 | Deep Analyzer | IDA Pro-level function discovery, profiling, XRefs, deep compare |
 | 14 | XRef Scanner | Scan directories for all callers of a function |
 | 15 | PE Patcher | Patch binaries: version, syscalls, calling conventions, rebase |
+| 16 | Kernel Debugger | Live kernel-state debugger with breakpoints, stepping, register inspection |
+| 17 | UBRT Engine | Universal binary rewriter — insert/delete/patch with automatic reference recalculation |
 
 ---
 
@@ -1318,7 +1340,7 @@ A full 13-scenario debug test is included in [`ntpower_debug_results.txt`](ntpow
 
 ---
 
-## GUI Tab Reference (All 16 Tabs)
+## GUI Tab Reference (All 17 Tabs)
 
 ### Tab 1: Exports / Imports
 - Browse to any PE file (.dll, .sys, .exe, .cpl)
@@ -1471,6 +1493,135 @@ Live kernel-state debugger — a portable WinDbg built entirely in Python:
 - **Env Info** — full environment status (modules, exports, unresolved imports)
 - **Instruction trace** — optional per-instruction log with address + disassembly
 - **User/Kernel mode toggle** — set PreviousMode for testing different call paths
+
+### Tab 17: UBRT Engine (NEW)
+Universal Binary Rewriting Tool — treat any binary like a text file. Insert, delete, or patch bytes anywhere and have every reference in the file automatically recalculated:
+
+- **Browse to any PE, ELF, or Mach-O binary** — format is auto-detected
+- **Analyze References** — runs 15 analysis passes to discover all relocatable references (relocations, exports, imports, exception handlers, TLS callbacks, debug directories, resource RVAs, load config pointers, delay imports, bound imports, indirect calls/jumps, section-relative data, cross-section refs)
+- **Results display** — shows reference count by type, broken down by analysis pass
+- **Insert Bytes** — insert N bytes at any RVA/offset; all references after the insertion point are shifted forward automatically
+- **Delete Bytes** — remove N bytes at any RVA/offset; all references shift backward
+- **Patch Bytes** — overwrite bytes at any offset without shifting
+- **compact()** — reclaim trailing zero padding from sections to shrink the binary
+- **strip_signature()** — remove code signatures (PE Authenticode / Mach-O LC_CODE_SIGNATURE) so modified binaries don't trigger verification failures
+- **QEMU Trace** — load a QEMU `-d exec` trace log to discover indirect call/jump targets; merged as first-class references
+- **Mach-O fat binary support** — extract thin binaries from fat/universal Mach-O files; fat header offsets are automatically updated when an arch is modified
+- **Resource protection** — warns when a shift operation falls inside `.rsrc` to prevent corruption of the resource tree's internal relative offsets
+- **Progress dialogs** — all long-running operations show real-time progress with percentage and cancel button
+- **Tabbed output** — each analysis opens in a new closeable tab
+
+---
+
+## UBRT Engine — Universal Binary Rewriting
+
+The UBRT Engine (Tab 17, `nt_analyzer/ubrt_engine.py`) is a **universal binary shift engine** that lets you insert, delete, or patch bytes at arbitrary locations in PE, ELF, and Mach-O binaries while automatically recalculating every internal reference. Think of it as `sed` for compiled binaries.
+
+### Why UBRT?
+
+Traditional binary patching tools let you overwrite bytes in place, but they can't **insert** or **delete** — because adding even a single byte shifts every address after it, breaking hundreds of thousands of cross-references. UBRT solves this by:
+
+1. **Analyzing** the entire binary to discover all relocatable references (15 analysis passes)
+2. **Tracking** every reference's file offset and target
+3. **Shifting** all affected references when bytes are inserted or deleted
+4. **Updating** all format-specific headers (section tables, program headers, load commands, etc.)
+
+### Supported Formats
+
+| Format | Reference Passes | Shift Engine | compact() | strip_signature() |
+|--------|-----------------|--------------|-----------|-------------------|
+| **PE** (32/64-bit) | 15 passes — relocations, EAT, IAT, exceptions, TLS, debug, resources, load config, delay imports, bound imports, indirect calls/jumps, section-relative, cross-section, QEMU trace | Full header update (sections, data directories, Optional header sizes) | Section padding reclamation | Zeroes Security DD, truncates cert table, zeroes checksum |
+| **ELF** | Section headers, program headers, RELA addend correction | Section/program header offset + size updates, SHT offset update | Section padding reclamation with alignment | — |
+| **Mach-O** | Load commands, segments, sections | Segment/section size updates via load commands | Segment filesize/vmsize reclamation | Removes LC_CODE_SIGNATURE load command + blob |
+| **Mach-O Fat** | Per-arch (delegates to thin Mach-O engine) | Fat header arch offset shifting for all subsequent architectures | Per-arch | Per-arch |
+
+### 15 Reference Analysis Passes (PE)
+
+| # | Pass | What it finds | Example |
+|---|------|--------------|---------|
+| 1 | Base relocations | `.reloc` entries — absolute address fixups | Every `IMAGE_BASE_RELOCATION` entry |
+| 2 | Export address table | RVAs in the EAT pointing to function bodies | `NtCreateFile → RVA 0x4AE10` |
+| 3 | Import thunks | IAT/ILT entries pointing to `IMAGE_IMPORT_BY_NAME` | `kernel32.dll!CreateFileW` |
+| 4 | Exception handlers | `.pdata` function table entries (RVAs to handlers) | SEH unwind entries |
+| 5 | TLS callbacks | TLS directory + callback array RVAs | Thread-local storage init |
+| 6 | Debug directory | Debug data RVAs (CodeView, MISC) | PDB path pointer |
+| 7 | Resource directory | Resource tree node RVAs (directories + data entries) | Icons, version info, manifests |
+| 8 | Load config | Lock prefix table, SE handler table, guard CF table | Security cookie pointer |
+| 9 | Delay imports | Delay-load IAT/ILT/DLL name RVAs | `delayimp:advapi32.dll` |
+| 10 | Bound imports | Bound import descriptor offsets | Pre-resolved import bindings |
+| 11 | Indirect calls | `call [mem]` through absolute memory addresses | `call [0x77F81234]` |
+| 12 | Indirect jumps | `jmp [mem]` through absolute memory addresses | `jmp [0x77F81238]` |
+| 13 | Section-relative | Data references relative to section bases | Static data pointers |
+| 14 | Cross-section | References between different PE sections | `.text → .data` pointers |
+| 15 | QEMU trace | Dynamic targets from `-d exec` execution traces | Runtime indirect targets |
+
+### Python API
+
+```python
+from nt_analyzer.ubrt_engine import UBRTEngine
+
+# Load any binary
+engine = UBRTEngine("ntoskrnl.exe")
+
+# Analyze all references
+refs = engine.analyze()
+print(f"Found {len(refs)} references")
+# → Found 109512 references
+
+# Insert 16 bytes at RVA 0x1000
+engine.insert_bytes(rva=0x1000, count=16)
+
+# Delete 8 bytes at RVA 0x2000
+engine.delete_bytes(rva=0x2000, count=8)
+
+# Patch bytes at an offset (no shift)
+engine.patch_bytes(offset=0x400, data=b'\x90\x90\x90\x90')
+
+# Reclaim section padding
+engine.compact()
+
+# Strip code signatures before distribution
+engine.strip_signature()
+
+# Save the modified binary
+engine.save("ntoskrnl_modified.exe")
+```
+
+### QEMU Dynamic Tracing
+
+Static analysis can't resolve indirect calls (`call eax`, `call [vtable+0x10]`) because the target depends on runtime state. UBRT solves this by parsing QEMU execution traces:
+
+```bash
+# 1. Run the binary under QEMU with execution tracing
+qemu-system-i386 -d exec -D trace.log -kernel ntoskrnl.exe
+
+# 2. Load the trace into UBRT
+engine = UBRTEngine("ntoskrnl.exe")
+engine.merge_trace_coverage("trace.log")
+
+# 3. Now analyze — QEMU targets are included as first-class refs
+refs = engine.analyze()
+# Indirect call targets from the trace are now tracked by the shift engine
+```
+
+### Mach-O Fat Binary Support
+
+```python
+from nt_analyzer.ubrt_engine import UBRTEngine
+
+# Extract a thin binary from a fat/universal Mach-O
+engine = UBRTEngine("libsystem.dylib")
+thin_data = engine.extract_thin_macho(cpu_type=0x0C)  # ARM
+
+# When you modify one arch in a fat binary, UBRT automatically
+# shifts the offsets of all subsequent architectures in the fat header
+```
+
+### Performance
+
+On a real Windows 2000 SP4 debug ntoskrnl.exe (1.6 MB):
+- **Reference analysis:** 109,512 references discovered across 15 passes
+- **Breakdown:** 54 indirect calls through memory, 14 resource RVAs, 2 indirect jumps, plus relocations, exports, imports, exceptions, etc.
 
 ---
 
@@ -1717,7 +1868,7 @@ This project works great as a **VS Code workspace**:
 1. **Open the folder**: `File > Open Folder > win2k_analyzer`
 2. **Run the GUI**: Open terminal (`Ctrl+`` `), type `python win2k_gui.py`
 3. **Run CLI commands**: Use the integrated terminal for any CLI command
-4. **Edit modules**: All 15 Python modules are in the `nt_analyzer/` package — fully documented and modular
+4. **Edit modules**: All 18 Python modules are in the `nt_analyzer/` package — fully documented and modular
 5. **Debug**: Set breakpoints in any module, press F5 to debug
 6. **IntelliSense**: VS Code provides autocomplete for all module functions
 
@@ -1757,6 +1908,15 @@ from nt_analyzer.pe_patcher import (
     patch_pe_for_win2000, inspect_pe_tables, rebase_pe
 )
 from nt_analyzer.decompiler import decompile, decompile_no_symbols
+from nt_analyzer.ubrt_engine import UBRTEngine
+
+# Universal binary rewriting — insert bytes with automatic reference fixups
+engine = UBRTEngine("ntoskrnl.exe")
+refs = engine.analyze()           # 109,512 references across 15 passes
+engine.insert_bytes(0x1000, 64)   # insert 64 bytes — all refs auto-shift
+engine.compact()                  # reclaim section padding
+engine.strip_signature()          # remove Authenticode signature
+engine.save("ntoskrnl_modified.exe")
 
 # Deep compatibility analysis
 report = compare_compat("win2k_ntoskrnl.exe", "reactos_ntoskrnl.exe")
@@ -1815,11 +1975,11 @@ for name, code in functions.items():
 ```
 win2k_analyzer/
 ├── win2k_analyzer.py          # CLI frontend (27 commands)
-├── win2k_gui.py               # GUI frontend (16 tabs, dark theme, tabbed output)
+├── win2k_gui.py               # GUI frontend (17 tabs, dark theme, tabbed output)
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
 │
-├── nt_analyzer/               # Core analysis package (17 modules)
+├── nt_analyzer/               # Core analysis package (18 modules)
 │   ├── __init__.py            # Package init
 │   ├── pe_analyzer.py         # PE export/import/header analysis
 │   ├── syscall_extractor.py   # Syscall number extraction from ntdll stubs
@@ -1836,7 +1996,8 @@ win2k_analyzer/
 │   ├── deep_analyzer.py       # IDA Pro-level function discovery, profiling, XRefs, deep compare
 │   ├── symbol_loader.py       # Multi-format symbol loader (.map/.pdb/.dbg/.sym)
 │   ├── emulator.py            # Unicorn-based kernel function emulator with API mocking
-│   └── kernel_debugger.py     # (NEW) Live kernel-state debugger: multi-PE loader, breakpoints, stepping
+│   ├── kernel_debugger.py     # (NEW) Live kernel-state debugger: multi-PE loader, breakpoints, stepping
+│   └── ubrt_engine.py         # (NEW) Universal Binary Rewriting Tool: PE/ELF/Mach-O shift engine, 15-pass ref analysis
 │
 ├── generated_headers/         # Output: generated C header files
 │   ├── peb_win2k.h
@@ -1998,6 +2159,29 @@ A: Based on KernelEx's `apply_patches`: (1) Prepare — validate conditions, (2)
 **Q: How do I generate build scripts for ReactOS?**
 A: CLI: `python win2k_analyzer.py build-script <reactos_dir> --type rosbe --dlls ntdll.dll kernel32.dll` or GUI: Tab 9.
 
+### UBRT Engine
+
+**Q: What is the UBRT Engine?**
+A: The Universal Binary Rewriting Tool (Tab 17, `nt_analyzer/ubrt_engine.py`) lets you insert, delete, or patch bytes anywhere in a PE, ELF, or Mach-O binary while automatically recalculating every internal reference — relocations, exports, imports, exception handlers, TLS, resources, debug directories, and more.
+
+**Q: How many references does UBRT find?**
+A: On Win2K SP4 debug ntoskrnl.exe (1.6 MB), UBRT discovers **109,512 references** across 15 analysis passes. This includes 54 indirect calls through memory, 14 resource RVAs, 2 indirect jumps, plus all standard relocation/export/import references.
+
+**Q: What binary formats does UBRT support?**
+A: PE (32/64-bit), ELF (with SHT_RELA addend correction), and Mach-O (including fat/universal binaries). Each format has a dedicated shift engine that knows how to update format-specific headers.
+
+**Q: What is compact()?**
+A: `compact()` scans sections for trailing zero padding and removes it, shrinking the binary. Available for PE, ELF, and Mach-O. All section headers, program headers, and load commands are automatically updated.
+
+**Q: What is strip_signature()?**
+A: `strip_signature()` removes code signatures so modified binaries don't fail verification. For PE: zeroes the Security data directory, truncates the certificate table, zeroes the PE checksum. For Mach-O: removes the LC_CODE_SIGNATURE load command and signature blob.
+
+**Q: How does QEMU tracing work?**
+A: Run your binary under QEMU with `-d exec` to generate an execution trace. Then call `engine.merge_trace_coverage("trace.log")` to parse it. UBRT resolves the traced addresses to file offsets and adds them as first-class references that the shift engine tracks during insert/delete operations.
+
+**Q: What happens if I insert bytes inside the .rsrc section?**
+A: UBRT detects the conflict and warns you. It skips internal resource pointer rewriting to prevent corrupting the resource tree's relative offsets. The operation still succeeds, but the warning tells you the resource directory may need manual attention.
+
 ### VS Code & Copilot
 
 **Q: Can I use this from VS Code?**
@@ -2029,6 +2213,10 @@ Areas that need help:
 - PDB support for hal.pdb, ntdll.pdb, win32k.pdb structure extraction
 - Additional prologue patterns for deep function discovery
 - Graph visualization for cross-reference maps
+- UBRT: ELF DT_JMPREL / DT_RELA / DT_INIT_ARRAY reference passes
+- UBRT: Mach-O chained fixups and bind opcodes reference analysis
+- UBRT: lazy delta accumulation for large-scale multi-shift performance
+- UBRT: ARM/AArch64 ELF relocation types
 
 ---
 
