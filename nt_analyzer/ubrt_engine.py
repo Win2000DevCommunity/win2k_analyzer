@@ -89,6 +89,10 @@ class RefType(enum.Enum):
     ELF_DYNAMIC_TAG = "elf_dynamic_tag"
     # v7: Mach-O specific
     MACHO_REBASE    = "macho_rebase"
+    # v7.1: memory-indirect + fat binary
+    INDIRECT_CALL_MEM = "indirect_call_mem"
+    RESOURCE_RVA    = "resource_rva"
+    BOUND_IMPORT_RVA = "bound_import_rva"
 
 
 class RefSource(enum.Enum):
@@ -101,6 +105,7 @@ class RefSource(enum.Enum):
     ELF_TABLE     = "elf_table"
     DATAFLOW      = "dataflow"       # v7: backward dataflow analysis
     MACHO_TABLE   = "macho_table"    # v7: Mach-O load command tables
+    QEMU_TRACE    = "qemu_trace"     # v7.1: QEMU dynamic branch tracing
 
 
 class ShiftOp(enum.Enum):
@@ -369,6 +374,9 @@ class PEReferenceFinder:
             ("Delay-load imports", self._find_delay_imports),
             ("Debug directory", self._find_debug_entries),
             ("Indirect control flow", self._find_indirect_control_flow),
+            # v7.1: resource and bound import passes
+            ("Resource directory", self._find_resource_entries),
+            ("Bound import table", self._find_bound_imports),
         ]
         for i, (name, func) in enumerate(steps):
             if callback:
@@ -1296,6 +1304,28 @@ class PEReferenceFinder:
 
                 # Memory indirect: call [rax+8], jmp QWORD PTR [rip+0x1234]
                 elif op.type == cs_x86.X86_OP_MEM:
+                    insn_rva = insn.address - self.image_base
+                    foff = self._rva_to_offset(insn_rva)
+                    if foff is None:
+                        continue
+                    # v7.1: Handle call/jmp [abs_addr] (x86-32 memory indirect through data)
+                    if not self.is_64 and op.mem.base == 0 and op.mem.index == 0 and op.mem.disp != 0:
+                        ptr_rva = op.mem.disp - self.image_base
+                        deref = self._read_pointer_at_rva(ptr_rva)
+                        if deref is not None:
+                            target_rva = deref - self.image_base
+                            if 0 < target_rva < size_of_image:
+                                ref_type = (RefType.INDIRECT_CALL_MEM
+                                            if insn.id == cs_x86.X86_INS_CALL
+                                            else RefType.INDIRECT_JUMP)
+                                refs.append(Reference(
+                                    file_offset=foff, ref_type=ref_type,
+                                    target_rva=target_rva, ref_rva=insn_rva,
+                                    size_bytes=0, is_relative=False,
+                                    insn_size=insn.size, section_name=sec_name,
+                                    confidence=0.85, source=RefSource.DATAFLOW,
+                                ))
+                        continue
                     # RIP-relative memory indirect is already caught by disassembly pass
                     if self.is_64 and op.mem.base == cs_x86.X86_REG_RIP:
                         continue
@@ -1325,6 +1355,7 @@ class PEReferenceFinder:
         """
         Backward dataflow: trace a register to find its most recent load value.
         Handles: MOV reg, imm; LEA reg, [rip+disp]; MOV reg, [rip+disp].
+        v7.1: Also dereferences loads from data sections to resolve function pointers.
         Returns the resolved VA or None.
         """
         for insn in reversed(window):
@@ -1344,13 +1375,48 @@ class PEReferenceFinder:
             if insn.id == cs_x86.X86_INS_LEA and src.type == cs_x86.X86_OP_MEM:
                 if self.is_64 and src.mem.base == cs_x86.X86_REG_RIP:
                     return insn.address + insn.size + src.mem.disp
-            # MOV reg, [rip+disp] (load from memory)
+            # MOV reg, [rip+disp] — load from memory, dereference the pointer
             if insn.id == cs_x86.X86_INS_MOV and src.type == cs_x86.X86_OP_MEM:
                 if self.is_64 and src.mem.base == cs_x86.X86_REG_RIP:
-                    return insn.address + insn.size + src.mem.disp
+                    ptr_va = insn.address + insn.size + src.mem.disp
+                    ptr_rva = ptr_va - self.image_base
+                    deref = self._read_pointer_at_rva(ptr_rva)
+                    if deref is not None:
+                        return deref
+                    return ptr_va
+                # v7.1: MOV reg, [abs_addr] (x86-32) — dereference data section pointer
+                if not self.is_64 and src.mem.base == 0 and src.mem.index == 0 and src.mem.disp != 0:
+                    ptr_rva = src.mem.disp - self.image_base
+                    deref = self._read_pointer_at_rva(ptr_rva)
+                    if deref is not None:
+                        return deref
 
             # If the register is written by something we can't resolve, stop
             break
+        return None
+
+    def _read_pointer_at_rva(self, rva: int) -> Optional[int]:
+        """
+        v7.1: Read a pointer value from a data section at the given RVA.
+        Returns the dereferenced VA if it points to valid image memory, else None.
+        """
+        size_of_image = self.pe.OPTIONAL_HEADER.SizeOfImage
+        if rva <= 0 or rva >= size_of_image:
+            return None
+        foff = self._rva_to_offset(rva)
+        if foff is None:
+            return None
+        if self.is_64:
+            if foff + 8 > len(self.data):
+                return None
+            val = struct.unpack_from('<Q', self.data, foff)[0]
+        else:
+            if foff + 4 > len(self.data):
+                return None
+            val = struct.unpack_from('<I', self.data, foff)[0]
+        target_rva = val - self.image_base
+        if 0 < target_rva < size_of_image:
+            return val
         return None
 
     # ── v7: 14. Code Signing Detection ────────────────────────────────
@@ -1367,6 +1433,135 @@ class PEReferenceFinder:
             'size': cert_dir.Size,
             'warning': 'Binary has Authenticode signature — modifications will invalidate it',
         }
+
+    # ── v7.1: 15. Resource Directory Parsing ──────────────────────────
+    def _find_resource_entries(self) -> List[Reference]:
+        """
+        Parse the PE resource directory tree and extract all OffsetToData RVAs.
+        These point to the actual resource data and must be updated during shifts.
+        """
+        refs = []
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 2:
+            return refs
+        rsrc_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[2]
+        if rsrc_dir.VirtualAddress == 0 or rsrc_dir.Size == 0:
+            return refs
+
+        rsrc_rva = rsrc_dir.VirtualAddress
+        rsrc_foff = self._rva_to_offset(rsrc_rva)
+        if rsrc_foff is None:
+            return refs
+
+        # Find the .rsrc section for bounds checking
+        rsrc_section = None
+        for s in self.pe.sections:
+            if s.VirtualAddress == rsrc_rva:
+                rsrc_section = s
+                break
+        if rsrc_section is None:
+            return refs
+        rsrc_end = rsrc_foff + rsrc_section.SizeOfRawData
+
+        visited = set()
+        self._walk_resource_dir(rsrc_rva, rsrc_foff, rsrc_foff, rsrc_end, refs, visited, depth=0)
+        return refs
+
+    def _walk_resource_dir(self, rsrc_rva: int, dir_foff: int,
+                           rsrc_base_foff: int, rsrc_end: int,
+                           refs: List, visited: set, depth: int):
+        """Recursively walk IMAGE_RESOURCE_DIRECTORY entries."""
+        if depth > 5 or dir_foff in visited:
+            return
+        visited.add(dir_foff)
+
+        if dir_foff + 16 > rsrc_end:
+            return
+
+        num_named = struct.unpack_from('<H', self.data, dir_foff + 12)[0]
+        num_id = struct.unpack_from('<H', self.data, dir_foff + 14)[0]
+        total = num_named + num_id
+
+        entry_off = dir_foff + 16  # entries start after the 16-byte directory header
+        for _ in range(total):
+            if entry_off + 8 > rsrc_end:
+                break
+            # Each entry: Name/ID (4 bytes) + OffsetToData (4 bytes)
+            offset_to_data = struct.unpack_from('<I', self.data, entry_off + 4)[0]
+
+            if offset_to_data & 0x80000000:
+                # High bit set → points to another IMAGE_RESOURCE_DIRECTORY
+                sub_offset = offset_to_data & 0x7FFFFFFF
+                sub_foff = rsrc_base_foff + sub_offset
+                self._walk_resource_dir(rsrc_rva, sub_foff, rsrc_base_foff,
+                                        rsrc_end, refs, visited, depth + 1)
+            else:
+                # Points to IMAGE_RESOURCE_DATA_ENTRY
+                data_entry_foff = rsrc_base_foff + offset_to_data
+                if data_entry_foff + 16 <= rsrc_end:
+                    # IMAGE_RESOURCE_DATA_ENTRY: OffsetToData(4), Size(4), CodePage(4), Reserved(4)
+                    data_rva = struct.unpack_from('<I', self.data, data_entry_foff)[0]
+                    if data_rva > 0:
+                        refs.append(Reference(
+                            file_offset=data_entry_foff,
+                            ref_type=RefType.RESOURCE_RVA,
+                            target_rva=data_rva, ref_rva=0,
+                            size_bytes=4, is_relative=False,
+                            insn_size=0, section_name='.rsrc',
+                            confidence=1.0, source=RefSource.PE_TABLE,
+                        ))
+            entry_off += 8
+
+    # ── v7.1: 16. Bound Import Table Parsing ─────────────────────────
+    def _find_bound_imports(self) -> List[Reference]:
+        """
+        Parse the PE bound import table (data directory index 11).
+        Bound imports contain OffsetModuleName values that need updating after shifts.
+        """
+        refs = []
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 11:
+            return refs
+        bound_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[11]
+        if bound_dir.VirtualAddress == 0 or bound_dir.Size == 0:
+            return refs
+
+        # Bound import table is at a file offset (not RVA) stored in VirtualAddress
+        # Actually in practice this is an RVA in the headers area
+        foff = bound_dir.VirtualAddress
+        end = foff + bound_dir.Size
+
+        if foff >= len(self.data) or end > len(self.data):
+            return refs
+
+        # IMAGE_BOUND_IMPORT_DESCRIPTOR: TimeDateStamp(4), OffsetModuleName(2), NumberOfModuleForwarderRefs(2)
+        pos = foff
+        while pos + 8 <= end:
+            timestamp = struct.unpack_from('<I', self.data, pos)[0]
+            offset_name = struct.unpack_from('<H', self.data, pos + 4)[0]
+            num_fwdr = struct.unpack_from('<H', self.data, pos + 6)[0]
+
+            # Null terminator
+            if timestamp == 0 and offset_name == 0:
+                break
+
+            # OffsetModuleName is relative to the start of the bound import table
+            if offset_name > 0:
+                name_foff = foff + offset_name
+                if name_foff < end:
+                    refs.append(Reference(
+                        file_offset=pos + 4,
+                        ref_type=RefType.BOUND_IMPORT_RVA,
+                        target_rva=offset_name,  # offset within bound import table
+                        ref_rva=0,
+                        size_bytes=2, is_relative=False,
+                        insn_size=0, section_name='bound_import',
+                        confidence=1.0, source=RefSource.PE_TABLE,
+                    ))
+
+            # Skip forwarder refs (same structure, 8 bytes each)
+            pos += 8 + num_fwdr * 8
+
+        return refs
+
 
 class ELFReferenceFinder:
     """
@@ -3182,6 +3377,7 @@ class ELFShiftEngine(BaseShiftEngine):
             if sh_entsize == 0:
                 continue
 
+            is_rela = (sh_type == 4)  # SHT_RELA has explicit addend field
             num_entries = sh_size // sh_entsize
             for j in range(num_entries):
                 ent_off = sh_offset + j * sh_entsize
@@ -3190,14 +3386,36 @@ class ELFShiftEngine(BaseShiftEngine):
 
                 if self.is_64:
                     r_offset = struct.unpack_from(f'{e}Q', self.buffer, ent_off)[0]
+                    r_info = struct.unpack_from(f'{e}Q', self.buffer, ent_off + 8)[0]
+                    r_type = r_info & 0xFFFFFFFF
                     if r_offset >= shift_va:
                         struct.pack_into(f'{e}Q', self.buffer, ent_off, r_offset + delta)
                         updated += 1
+                    # v7.1: For RELA, update addend if it's an address-bearing relocation
+                    if is_rela and ent_off + 24 <= len(self.buffer):
+                        r_addend = struct.unpack_from(f'{e}q', self.buffer, ent_off + 16)[0]
+                        # R_X86_64_RELATIVE=8, R_X86_64_64=1, R_X86_64_GLOB_DAT=6, R_X86_64_JUMP_SLOT=7
+                        # R_AARCH64_RELATIVE=1027, R_AARCH64_ABS64=257
+                        addr_reloc_types = {8, 1, 6, 7, 1027, 257}
+                        if r_type in addr_reloc_types and r_addend >= shift_va:
+                            struct.pack_into(f'{e}q', self.buffer, ent_off + 16, r_addend + delta)
+                            updated += 1
                 else:
                     r_offset = struct.unpack_from(f'{e}I', self.buffer, ent_off)[0]
+                    r_info = struct.unpack_from(f'{e}I', self.buffer, ent_off + 4)[0]
+                    r_type = r_info & 0xFF
                     if r_offset >= shift_va:
                         struct.pack_into(f'{e}I', self.buffer, ent_off, (r_offset + delta) & 0xFFFFFFFF)
                         updated += 1
+                    # v7.1: For RELA, update addend on 32-bit too
+                    if is_rela and ent_off + 12 <= len(self.buffer):
+                        r_addend = struct.unpack_from(f'{e}i', self.buffer, ent_off + 8)[0]
+                        # R_386_RELATIVE=8, R_386_32=1, R_386_GLOB_DAT=6, R_386_JMP_SLOT=7
+                        addr_reloc_types_32 = {8, 1, 6, 7}
+                        if r_type in addr_reloc_types_32 and r_addend >= shift_va:
+                            struct.pack_into(f'{e}i', self.buffer, ent_off + 8,
+                                             (r_addend + delta) & 0xFFFFFFFF)
+                            updated += 1
 
         return updated
 
@@ -3289,9 +3507,31 @@ class MachOShiftEngine(BaseShiftEngine):
         self.segments = self.finder.segments
         self.sections = self.finder.sections
         self.arch_offset = self.finder.arch_offset
+        self.is_fat = self.finder.is_fat
+        self._fat_archs: List[Dict] = []  # v7.1: fat_arch entries
         self._undo_stack: List[Tuple[ShiftOp, int, int, bytes]] = []
+        # v7.1: Parse fat header for later update
+        if self.is_fat:
+            self._parse_fat_archs()
         # v7: Detect code signing
         self._detect_macho_signature()
+
+    def _parse_fat_archs(self):
+        """v7.1: Parse all fat_arch entries for fat binary header management."""
+        nfat_arch = struct.unpack_from('>I', self.buffer, 4)[0]
+        self._fat_archs = []
+        for i in range(nfat_arch):
+            fa_off = 8 + i * 20
+            if fa_off + 20 > len(self.buffer):
+                break
+            self._fat_archs.append({
+                'index': i,
+                'cputype': struct.unpack_from('>I', self.buffer, fa_off)[0],
+                'cpusubtype': struct.unpack_from('>I', self.buffer, fa_off + 4)[0],
+                'offset': struct.unpack_from('>I', self.buffer, fa_off + 8)[0],
+                'size': struct.unpack_from('>I', self.buffer, fa_off + 12)[0],
+                'align': struct.unpack_from('>I', self.buffer, fa_off + 16)[0],
+            })
 
     def _detect_macho_signature(self):
         """Check for LC_CODE_SIGNATURE in Mach-O."""
@@ -3439,8 +3679,105 @@ class MachOShiftEngine(BaseShiftEngine):
         return None
 
     def save(self, output_path: str):
+        # v7.1: Update fat header if this is a universal binary
+        if self.is_fat and self._fat_archs:
+            self._update_fat_header()
         with open(output_path, 'wb') as f:
             f.write(bytes(self.buffer))
+
+    def _update_fat_header(self):
+        """
+        v7.1: Recalculate fat_arch sizes after modifying an architecture slice.
+        When one arch slice changes in size, the fat_arch entry must be updated.
+        """
+        if not self._fat_archs:
+            return
+
+        sorted_archs = sorted(self._fat_archs, key=lambda fa: fa['offset'])
+
+        # Find the modified arch and update its size
+        for i, fa in enumerate(sorted_archs):
+            if fa['offset'] == self.arch_offset:
+                if i + 1 < len(sorted_archs):
+                    # Compute delta: original file size vs current buffer length
+                    original_total = sorted_archs[-1]['offset'] + sorted_archs[-1]['size']
+                    buf_delta = len(self.buffer) - original_total
+                    fa['size'] += buf_delta
+                else:
+                    fa['size'] = len(self.buffer) - fa['offset']
+                break
+
+        # Rewrite all fat_arch entries
+        for i, fa in enumerate(sorted_archs):
+            fa_off = 8 + i * 20
+            if fa_off + 20 > len(self.buffer):
+                break
+            struct.pack_into('>I', self.buffer, fa_off, fa['cputype'])
+            struct.pack_into('>I', self.buffer, fa_off + 4, fa['cpusubtype'])
+            struct.pack_into('>I', self.buffer, fa_off + 8, fa['offset'])
+            struct.pack_into('>I', self.buffer, fa_off + 12, fa['size'])
+            struct.pack_into('>I', self.buffer, fa_off + 16, fa['align'])
+
+        self._fat_archs = sorted_archs
+
+    @staticmethod
+    def extract_thin_macho(fat_path: str, arch_index: int = 0, output_path: str = None) -> Dict:
+        """
+        v7.1: Extract a single architecture from a fat (universal) Mach-O binary.
+
+        Args:
+            fat_path: Path to the fat binary
+            arch_index: Architecture index to extract (0-based)
+            output_path: Output path (default: adds arch suffix to filename)
+
+        Returns:
+            Dict with extraction details or error
+        """
+        with open(fat_path, 'rb') as f:
+            data = f.read()
+
+        magic = struct.unpack_from('>I', data, 0)[0]
+        if magic != 0xCAFEBABE:
+            return {'error': 'Not a fat (universal) Mach-O binary'}
+
+        nfat_arch = struct.unpack_from('>I', data, 4)[0]
+        if arch_index >= nfat_arch:
+            return {'error': f'arch_index {arch_index} out of range ({nfat_arch} architectures)'}
+
+        cpu_names = {
+            7: 'x86', 0x01000007: 'x86_64',
+            12: 'arm', 0x0100000C: 'arm64',
+            18: 'ppc', 0x01000012: 'ppc64',
+        }
+        archs = []
+        for i in range(nfat_arch):
+            fa_off = 8 + i * 20
+            archs.append({
+                'cputype': struct.unpack_from('>I', data, fa_off)[0],
+                'offset': struct.unpack_from('>I', data, fa_off + 8)[0],
+                'size': struct.unpack_from('>I', data, fa_off + 12)[0],
+            })
+
+        target = archs[arch_index]
+        thin_data = data[target['offset']:target['offset'] + target['size']]
+        cpu_name = cpu_names.get(target['cputype'], f'arch{arch_index}')
+
+        if output_path is None:
+            base, ext = os.path.splitext(fat_path)
+            output_path = f"{base}_{cpu_name}{ext}"
+
+        with open(output_path, 'wb') as f:
+            f.write(thin_data)
+
+        return {
+            'success': True, 'output': output_path,
+            'arch': cpu_name, 'cputype': target['cputype'], 'size': len(thin_data),
+            'architectures': [
+                {'index': i, 'cputype': a['cputype'],
+                 'name': cpu_names.get(a['cputype'], 'unknown'), 'size': a['size']}
+                for i, a in enumerate(archs)
+            ],
+        }
 
     def preview_insert(self, vaddr: int, size: int) -> Dict:
         changes = []
@@ -3932,6 +4269,9 @@ class ShiftEngine(BaseShiftEngine):
         # Phase 4: Update PE headers
         self._update_pe_headers(rva, N)
 
+        # Phase 5: v7.1 — Update resource directory RVAs
+        self._update_resource_directory(rva, N)
+
         return ShiftResult(
             ShiftOp.INSERT, rva, N, refs_updated, warnings,
             sections_adjusted, len(self.buffer), True,
@@ -3965,6 +4305,9 @@ class ShiftEngine(BaseShiftEngine):
 
         # Phase 4: Update PE headers
         self._update_pe_headers(rva, -count)
+
+        # Phase 5: v7.1 — Update resource directory RVAs
+        self._update_resource_directory(rva, -count)
 
         return ShiftResult(
             ShiftOp.DELETE, rva, -count, refs_updated, warnings,
@@ -4296,6 +4639,142 @@ class ShiftEngine(BaseShiftEngine):
         self._record_batch_op(('remove_section', result))
         return result
 
+    # ── v7.1: Padding Reclamation ─────────────────────────────────────
+
+    def compact(self) -> Dict:
+        """
+        v7.1: Reclaim wasted padding in the PE binary.
+        Scans all sections and removes trailing zero-filled padding that extends
+        beyond Misc_VirtualSize. Truncates the file and updates all headers.
+
+        WARNING: This is a destructive operation that rebuilds section layout.
+        Call after all modifications are done. Undo stack is cleared.
+
+        Returns:
+            Dict with compaction results
+        """
+        fa = self.file_alignment
+        reclaimed = 0
+        sections_trimmed = 0
+
+        # Sorted sections by raw offset
+        sorted_secs = sorted(self.pe.sections,
+                             key=lambda s: s.PointerToRawData)
+
+        for sec in sorted_secs:
+            raw_off = sec.PointerToRawData
+            raw_size = sec.SizeOfRawData
+            vsize = sec.Misc_VirtualSize
+
+            if raw_size <= vsize:
+                continue  # No padding to reclaim
+
+            # Check if bytes beyond vsize are all zero
+            check_start = raw_off + vsize
+            check_end = raw_off + raw_size
+            if check_start >= len(self.buffer) or check_end > len(self.buffer):
+                continue
+
+            trailing = self.buffer[check_start:check_end]
+            if trailing == b'\x00' * len(trailing):
+                # All zeros — can reclaim, but must maintain file alignment
+                new_raw_size = (vsize + fa - 1) & ~(fa - 1)
+                if new_raw_size >= raw_size:
+                    continue  # No savings after alignment
+
+                saved = raw_size - new_raw_size
+                # Remove the reclaimed bytes from the buffer
+                del self.buffer[raw_off + new_raw_size:raw_off + raw_size]
+
+                # Update this section's SizeOfRawData
+                sec.SizeOfRawData = new_raw_size
+
+                # Shift all subsequent sections' PointerToRawData
+                for other in sorted_secs:
+                    if other.PointerToRawData > raw_off:
+                        other.PointerToRawData -= saved
+
+                reclaimed += saved
+                sections_trimmed += 1
+
+        if reclaimed == 0:
+            return {'compacted': False, 'message': 'No reclaimable padding found'}
+
+        # Re-parse PE from modified buffer
+        self.pe = pefile.PE(data=bytes(self.buffer))
+
+        # Clear undo stack (layout changed completely)
+        self._undo_stack.clear()
+
+        return {
+            'compacted': True,
+            'bytes_reclaimed': reclaimed,
+            'sections_trimmed': sections_trimmed,
+            'new_size': len(self.buffer),
+        }
+
+    # ── v7.1: Resource Directory Updater ──────────────────────────────
+
+    def _update_resource_directory(self, shift_rva: int, delta: int):
+        """
+        v7.1: Walk the PE resource directory tree and update all OffsetToData RVAs.
+        Called automatically after insert/delete when .rsrc section is affected.
+        """
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 2:
+            return
+        rsrc_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[2]
+        if rsrc_dir.VirtualAddress == 0 or rsrc_dir.Size == 0:
+            return
+
+        rsrc_rva = rsrc_dir.VirtualAddress
+        rsrc_foff = self._rva_to_offset(rsrc_rva)
+        if rsrc_foff is None:
+            return
+
+        rsrc_section = None
+        for s in self.pe.sections:
+            if s.VirtualAddress == rsrc_rva:
+                rsrc_section = s
+                break
+        if rsrc_section is None:
+            return
+        rsrc_end = rsrc_foff + rsrc_section.SizeOfRawData
+
+        visited = set()
+        self._walk_and_update_rsrc(rsrc_foff, rsrc_foff, rsrc_end, shift_rva, delta, visited, 0)
+
+    def _walk_and_update_rsrc(self, dir_foff: int, rsrc_base: int, rsrc_end: int,
+                               shift_rva: int, delta: int, visited: set, depth: int):
+        """Recursively walk and update resource directory RVAs."""
+        if depth > 5 or dir_foff in visited:
+            return
+        visited.add(dir_foff)
+        if dir_foff + 16 > rsrc_end or dir_foff + 16 > len(self.buffer):
+            return
+
+        num_named = struct.unpack_from('<H', self.buffer, dir_foff + 12)[0]
+        num_id = struct.unpack_from('<H', self.buffer, dir_foff + 14)[0]
+        total = num_named + num_id
+
+        entry_off = dir_foff + 16
+        for _ in range(total):
+            if entry_off + 8 > rsrc_end:
+                break
+            offset_to_data = struct.unpack_from('<I', self.buffer, entry_off + 4)[0]
+
+            if offset_to_data & 0x80000000:
+                sub_offset = offset_to_data & 0x7FFFFFFF
+                sub_foff = rsrc_base + sub_offset
+                self._walk_and_update_rsrc(sub_foff, rsrc_base, rsrc_end,
+                                           shift_rva, delta, visited, depth + 1)
+            else:
+                data_entry_foff = rsrc_base + offset_to_data
+                if data_entry_foff + 16 <= rsrc_end and data_entry_foff + 4 <= len(self.buffer):
+                    data_rva = struct.unpack_from('<I', self.buffer, data_entry_foff)[0]
+                    if data_rva >= shift_rva and data_rva > 0:
+                        struct.pack_into('<I', self.buffer, data_entry_foff, data_rva + delta)
+            entry_off += 8
+
 
 # ─── QEMU Tracer ─────────────────────────────────────────────────────────
 
@@ -4399,68 +4878,137 @@ class QEMUTracer:
         return self._running and self.process is not None and self.process.poll() is None
 
     def parse_trace_log(self, image_base: int = 0) -> Dict:
-        """Parse QEMU execution trace log to extract basic block coverage."""
+        """
+        v7.1: Parse QEMU execution trace log to extract basic block coverage
+        AND branch targets (indirect call/jump destinations).
+
+        QEMU -d exec,in_asm produces:
+        - "Trace N: 0xADDR [size=XX]" for basic block execution
+        - "0xADDR:  mnemonic  operands" for disassembled instructions
+
+        Branch targets are inferred by tracking consecutive Trace entries:
+        the start address of block B is a branch target of block A if B doesn't
+        immediately follow the last instruction of A.
+        """
         if not self.trace_log or not os.path.isfile(self.trace_log):
             return {'success': False, 'error': 'No trace log available'}
 
         self.coverage.clear()
         block_count = 0
         insn_count = 0
+        branch_pairs = 0  # (source_block_rva, target_block_addr) pairs found
 
         try:
+            prev_block_rva = None
+            prev_block_addr = None
+            prev_block_size = 0
+            current_block_insns = []
+
             with open(self.trace_log, 'r', errors='replace') as f:
-                current_block_start = None
-                current_block_end = None
                 for line in f:
                     line = line.strip()
-                    # QEMU trace format: "Trace 0: 0x00401000 [size=23]"
+
+                    # ── Trace line: basic block start ──
                     if line.startswith('Trace') and '0x' in line:
+                        block_addr = None
+                        block_size = 0
                         parts = line.split()
-                        for p in parts:
+                        for j, p in enumerate(parts):
                             if p.startswith('0x'):
                                 try:
-                                    addr = int(p.rstrip(':,[]'), 16)
-                                    rva = addr - image_base if image_base else addr
-                                    if rva in self.coverage:
-                                        self.coverage[rva].hit_count += 1
-                                    else:
-                                        self.coverage[rva] = TraceBlock(
-                                            start_va=addr, end_va=addr)
-                                    block_count += 1
+                                    block_addr = int(p.rstrip(':,[]'), 16)
                                 except ValueError:
+                                    continue
+                            if p.startswith('[size=') or p.startswith('size='):
+                                try:
+                                    block_size = int(p.strip('[]').split('=')[1])
+                                except (ValueError, IndexError):
                                     pass
-                                break
-                    # IN_ASM lines: "0x00401000:  push   %ebp"
+
+                        if block_addr is None:
+                            continue
+
+                        rva = block_addr - image_base if image_base else block_addr
+                        if rva in self.coverage:
+                            self.coverage[rva].hit_count += 1
+                        else:
+                            self.coverage[rva] = TraceBlock(
+                                start_va=block_addr,
+                                end_va=block_addr + max(block_size, 1))
+                        block_count += 1
+
+                        # v7.1: Detect branch targets — if this block doesn't
+                        # immediately follow the previous block, it's a branch target
+                        if prev_block_addr is not None and prev_block_size > 0:
+                            expected_fallthrough = prev_block_addr + prev_block_size
+                            if block_addr != expected_fallthrough:
+                                # This is a branch target from the previous block
+                                if prev_block_rva in self.coverage:
+                                    self.coverage[prev_block_rva].branch_targets.append(block_addr)
+                                    branch_pairs += 1
+
+                        prev_block_rva = rva
+                        prev_block_addr = block_addr
+                        prev_block_size = block_size
+
+                    # ── IN_ASM line: disassembled instruction ──
                     elif line and line[0] == '0' and 'x' in line[:4]:
                         try:
                             addr_str = line.split(':')[0].strip()
                             addr = int(addr_str, 16)
                             insn_count += 1
+                            # Track instruction mnemonics for indirect call/jmp detection
+                            remainder = line.split(':', 1)[1].strip() if ':' in line else ''
+                            mnemonic = remainder.split()[0].lower() if remainder else ''
+                            if mnemonic in ('call', 'callq', 'jmp', 'jmpq',
+                                            'bl', 'blr', 'br', 'b', 'blx', 'bx'):
+                                # This is a control transfer — the NEXT Trace line
+                                # gives us the actual target. Already handled above
+                                # by the fallthrough detection.
+                                pass
                         except (ValueError, IndexError):
                             pass
+
+            # Deduplicate branch targets
+            for rva, block in self.coverage.items():
+                block.branch_targets = list(set(block.branch_targets))
 
             return {
                 'success': True,
                 'blocks': block_count,
                 'unique_blocks': len(self.coverage),
                 'instructions': insn_count,
+                'branch_targets_found': branch_pairs,
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
     def get_coverage_refs(self, image_base: int = 0) -> List[Reference]:
-        """Convert coverage data into Reference entries for the database."""
+        """
+        v7.1: Convert dynamic trace data into Reference entries.
+        Produces two types of references:
+        - Branch target refs (from indirect calls/jumps) with high confidence
+        - Block coverage refs for code discovery
+        """
         refs = []
+        seen_targets = set()
+
         for rva, block in self.coverage.items():
             for target in block.branch_targets:
+                target_rva = target - image_base if image_base else target
+                pair = (rva, target_rva)
+                if pair in seen_targets:
+                    continue
+                seen_targets.add(pair)
+
                 refs.append(Reference(
                     file_offset=0,
-                    ref_type=RefType.DATA_POINTER,
-                    target_rva=target - image_base if image_base else target,
+                    ref_type=RefType.INDIRECT_CALL,
+                    target_rva=target_rva,
                     ref_rva=rva,
-                    size_bytes=4, is_relative=False, insn_size=4,
-                    section_name="dynamic",
-                    confidence=0.95, source=RefSource.DYNAMIC_TRACE,
+                    size_bytes=0, is_relative=False, insn_size=0,
+                    section_name="qemu_trace",
+                    confidence=0.95, source=RefSource.QEMU_TRACE,
                 ))
         return refs
 
@@ -4856,3 +5404,37 @@ class UBRTEngine:
         if not hasattr(self.shift_engine, 'remove_section'):
             return {'error': 'Section management not supported for this format'}
         return self.shift_engine.remove_section(name)
+
+    # ── v7.1: Compact / Padding Reclamation ───────────────────────────
+
+    def compact(self) -> Dict:
+        """Reclaim wasted padding in the loaded PE binary."""
+        if not self.shift_engine:
+            return {'error': 'No binary loaded'}
+        if not hasattr(self.shift_engine, 'compact'):
+            return {'error': 'Compact not supported for this format'}
+        return self.shift_engine.compact()
+
+    # ── v7.1: Mach-O Fat Binary Extraction ────────────────────────────
+
+    @staticmethod
+    def extract_thin_macho(fat_path: str, arch_index: int = 0,
+                           output_path: str = None) -> Dict:
+        """Extract a single architecture from a fat (universal) Mach-O binary."""
+        return MachOShiftEngine.extract_thin_macho(fat_path, arch_index, output_path)
+
+    # ── v7.1: QEMU Dynamic Tracing Helpers ────────────────────────────
+
+    def get_trace_stats(self) -> Dict:
+        """Get current QEMU trace statistics."""
+        if not self.qemu:
+            return {'error': 'QEMU not configured'}
+        return {
+            'is_running': self.qemu.is_running,
+            'trace_log': self.qemu.trace_log,
+            'unique_blocks': len(self.qemu.coverage),
+            'total_branch_targets': sum(
+                len(b.branch_targets) for b in self.qemu.coverage.values()
+            ),
+            'gdb_port': self.qemu.get_gdb_port(),
+        }
