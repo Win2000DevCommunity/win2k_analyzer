@@ -6016,27 +6016,40 @@ class KernelDebuggerTab(ttk.Frame):
     # ── split view ────────────────────────────────────────────────────────
 
     def _toggle_split_view(self):
-        """Toggle between tabbed mode and side-by-side (trace + disasm)."""
+        """Toggle between tabbed mode and side-by-side split."""
         if self._split_mode:
             self._restore_tabbed_view()
         else:
-            self._enter_split_view()
+            self._show_split_picker()
 
-    def _enter_split_view(self):
-        """Switch to side-by-side: trace left, disasm right — same area."""
-        # Find the trace tab
-        trace_tab_title = self._trace_tab_title
-        if not trace_tab_title:
-            for tab_id in reversed(self.output._nb.tabs()):
-                title = self.output._nb.tab(tab_id, "text").strip()
-                if any(title.startswith(p) for p in
-                       ("Run:", "Debug:", "Run\u2192BP:")):
-                    trace_tab_title = title
-                    break
+    # ── split-view tab picker ─────────────────────────────────
+    def _show_split_picker(self):
+        """Show a popup menu listing open tabs — user picks one to split out."""
+        tabs = self.output._nb.tabs()
+        if not tabs:
+            self.status_var.set("\u26A0 No tabs open to split")
+            return
+        menu = tk.Menu(self, tearoff=0)
+        for tab_id in tabs:
+            title = self.output._nb.tab(tab_id, "text").strip()
+            menu.add_command(
+                label=title,
+                command=lambda t=title: self._enter_split_view(t))
+        # Post menu under the split button
+        try:
+            x = self._split_btn.winfo_rootx()
+            y = self._split_btn.winfo_rooty() + self._split_btn.winfo_height()
+            menu.tk_popup(x, y)
+        except Exception:
+            menu.tk_popup(
+                self.winfo_rootx() + 200, self.winfo_rooty() + 300)
 
-        if not trace_tab_title and not self._disasm_view:
-            self.status_var.set(
-                "\u26A0 Need a trace or disassembly tab for split view")
+    def _enter_split_view(self, tab_title):
+        """Split *tab_title* out into a right pane; tabs stay on the left."""
+        # Look up the source widget for the chosen tab
+        src_tab_id, src_widget = self.output.find_tab(tab_title)
+        if src_tab_id is None:
+            self.status_var.set(f"\u26A0 Tab '{tab_title}' not found")
             return
 
         # Hide the normal output notebook
@@ -6048,81 +6061,95 @@ class KernelDebuggerTab(ttk.Frame):
                             opaqueresize=True, bd=0)
         pw.grid(row=8, column=0, sticky="nsew", padx=10, pady=(4, 10))
 
-        # ── Left pane: trace output ──
-        left_frm = tk.Frame(pw, bg=T["bg_dark"])
-        left_frm.columnconfigure(0, weight=1)
-        left_frm.rowconfigure(1, weight=1)
+        # ── Left pane: the TabbedOutput (all remaining tabs) ──
+        pw.add(self.output, stretch="always")
+        self.output.grid_forget()       # PanedWindow manages geometry now
 
-        left_hdr = tk.Frame(left_frm, bg=T["bg"])
-        left_hdr.grid(row=0, column=0, sticky="ew")
-        tk.Label(left_hdr, text=f"  {trace_tab_title or 'Trace'}  ",
-                 bg=T["bg"], fg=T["accent"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=4, pady=2)
-
-        left_txt = scrolledtext.ScrolledText(
-            left_frm, bg=T["bg_dark"], fg=T["fg"], insertbackground=T["fg"],
-            font=("Consolas", 10), relief="flat", bd=8,
-            wrap="none", state="disabled")
-        left_txt.grid(row=1, column=0, sticky="nsew")
-        _configure_output_tags(left_txt)
-
-        # Copy trace content from the existing tab
-        if trace_tab_title:
-            _, src_widget = self.output.find_tab(trace_tab_title)
-            if src_widget and hasattr(src_widget, 'get'):
-                content = src_widget.get("1.0", "end-1c")
-                left_txt.configure(state="normal")
-                left_txt.insert("1.0", content)
-                left_txt.see("end")
-                left_txt.configure(state="disabled")
-
-        pw.add(left_frm, stretch="always")
-
-        # ── Right pane: disassembly ──
+        # ── Right pane: a copy of the selected tab ──
         right_frm = tk.Frame(pw, bg=T["bg_dark"])
         right_frm.columnconfigure(0, weight=1)
-        right_frm.rowconfigure(0, weight=1)
+        right_frm.rowconfigure(1, weight=1)
 
-        if self._disasm_view:
-            # Reparent disasm view into right pane
-            self._disasm_view_original_parent = self._disasm_view.master
-            self._disasm_view.grid_forget()
-            self._disasm_view.grid(in_=right_frm, row=0, column=0,
-                                   sticky="nsew")
+        # Header bar with tab title + close button
+        right_hdr = tk.Frame(right_frm, bg=T["bg"])
+        right_hdr.grid(row=0, column=0, sticky="ew")
+        tk.Label(right_hdr, text=f"  {tab_title}  ",
+                 bg=T["bg"], fg=T["accent"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=4, pady=2)
+        tk.Button(right_hdr, text="\u2716", bg=T["bg"], fg=T["fg_dim"],
+                  relief="flat", bd=0, font=("Segoe UI", 9),
+                  command=self._restore_tabbed_view).pack(
+                      side="right", padx=6, pady=2)
+
+        is_disasm = isinstance(src_widget, DisassemblyView)
+
+        if is_disasm:
+            # Create a NEW DisassemblyView and reload the same data
+            dv = DisassemblyView(right_frm, self)
+            dv.grid(row=1, column=0, sticky="nsew")
+            if src_widget._functions:
+                dv.load_functions(src_widget._functions)
+            # Sync breakpoints and EIP
+            if src_widget._eip_line is not None:
+                for addr, line in src_widget._addr_to_line.items():
+                    if line == src_widget._eip_line:
+                        dv.update_eip(addr)
+                        break
+            if src_widget._exec_lines:
+                exec_addrs = set()
+                for line in src_widget._exec_lines:
+                    a = src_widget._line_to_addr.get(line)
+                    if a is not None:
+                        exec_addrs.add(a)
+                if exec_addrs:
+                    dv.mark_executed(exec_addrs)
+            self._split_disasm_copy = dv
         else:
-            tk.Label(right_frm,
-                     text="No disassembly loaded.\nClick Disassemble first.",
-                     bg=T["bg_dark"], fg=T["fg_dim"],
-                     font=("Consolas", 10)).grid(
-                         row=0, column=0, sticky="nsew")
+            # Text-based tab — copy content into a new ScrolledText
+            txt = scrolledtext.ScrolledText(
+                right_frm, bg=T["bg_dark"], fg=T["fg"],
+                insertbackground=T["fg"],
+                font=("Consolas", 10), relief="flat", bd=8,
+                wrap="none", state="disabled")
+            txt.grid(row=1, column=0, sticky="nsew")
+            _configure_output_tags(txt)
+            # Copy content
+            if hasattr(src_widget, 'get'):
+                content = src_widget.get("1.0", "end-1c")
+                if content.strip():
+                    txt.configure(state="normal")
+                    txt.insert("1.0", content)
+                    txt.see("end")
+                    txt.configure(state="disabled")
+            self._split_disasm_copy = None
 
         pw.add(right_frm, stretch="always")
 
         self._split_pane = pw
-        self._split_left_txt = left_txt
-        self._split_left_title = trace_tab_title
+        self._split_right_frm = right_frm
+        self._split_tab_title = tab_title
         self._split_mode = True
         self._split_btn.configure(text="\u2B0C Tabbed View")
         self.status_var.set(
-            "\u2B0C Split view \u2014 trace | disassembly")
+            f"\u2B0C Split view \u2014 tabs | {tab_title}")
 
     def _restore_tabbed_view(self):
         """Restore the normal tabbed output view."""
         if not self._split_mode:
             return
 
-        # Reparent disasm view back to its original tab
-        if (self._disasm_view and
-                hasattr(self, '_disasm_view_original_parent')):
-            orig = self._disasm_view_original_parent
-            self._disasm_view.grid_forget()
-            self._disasm_view.grid(in_=orig, row=0, column=0, sticky="nsew")
-
-        # Destroy the split pane
+        # Remove output from PanedWindow before destroying it
         if self._split_pane:
+            try:
+                self._split_pane.forget(self.output)
+            except Exception:
+                pass
             self._split_pane.grid_forget()
             self._split_pane.destroy()
             self._split_pane = None
+
+        self._split_disasm_copy = None
+        self._split_right_frm = None
 
         # Re-grid the normal output
         self.output.grid(row=8, column=0, sticky="nsew",

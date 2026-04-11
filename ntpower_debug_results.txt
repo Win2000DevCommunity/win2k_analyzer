@@ -1,12 +1,12 @@
 ================================================================================
   NtPowerInformation — LIVE KERNEL DEBUGGER TEST REPORT
-  Date: 2026-04-11 03:20:37
+  Date: 2026-04-11 03:36:19
   System32: C:\Users\win2000\Desktop\2kDEBUG\system32
 ================================================================================
 
 [1] LOADING KERNEL ENVIRONMENT
 ------------------------------------------------------------
-  Load time: 0.770s
+  Load time: 0.768s
   Modules loaded: 3
   Available files: 2142
     ntoskrnl.exe              base=0x00400000  exports= 1258  unresolved=0
