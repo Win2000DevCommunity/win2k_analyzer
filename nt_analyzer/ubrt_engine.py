@@ -437,13 +437,16 @@ class PEReferenceFinder:
                                 op.mem.index == 0):
                             disp = op.mem.disp
                             target_rva = insn_rva + insn.size + disp
-                            # The disp32 is always the last 4 bytes before any immediate
-                            disp_foff = insn_foff + insn.size - 4
-                            # If instruction has an immediate operand after, adjust
-                            for op2 in insn.operands:
-                                if op2.type == cs_x86.X86_OP_IMM:
-                                    disp_foff -= op2.size
-                                    break
+                            # Use Capstone's disp_offset for exact byte position
+                            if hasattr(insn, 'disp_offset') and insn.disp_offset > 0:
+                                disp_foff = insn_foff + insn.disp_offset
+                            else:
+                                # Fallback: disp32 before any trailing immediate
+                                disp_foff = insn_foff + insn.size - 4
+                                for op2 in insn.operands:
+                                    if op2.type == cs_x86.X86_OP_IMM:
+                                        disp_foff -= op2.size
+                                        break
                             refs.append(Reference(
                                 file_offset=disp_foff,
                                 ref_type=RefType.RIP_RELATIVE,
@@ -719,6 +722,16 @@ class PEReferenceFinder:
                         break
 
                 if run_count >= min_vtable_entries:
+                    # Check for RTTI prefix: pointer before vtable pointing to data
+                    has_rtti = False
+                    if run_start >= step:
+                        rtti_val = struct.unpack_from(fmt, data, run_start - step)[0]
+                        rtti_rva = rtti_val - self.image_base
+                        # RTTI pointer should point into a valid data section
+                        if 0 < rtti_rva < self.pe.OPTIONAL_HEADER.SizeOfImage:
+                            if not self._is_executable_rva(rtti_rva):
+                                has_rtti = True
+                    conf = 0.95 if has_rtti else 0.85
                     # This is likely a vtable
                     for j in range(run_count):
                         off = run_start + j * step
@@ -731,7 +744,7 @@ class PEReferenceFinder:
                             ref_rva=rva_base + off,
                             size_bytes=step, is_relative=False,
                             insn_size=step, section_name=sec_name,
-                            confidence=0.85, source=RefSource.HEURISTIC,
+                            confidence=conf, source=RefSource.HEURISTIC,
                         ))
                 else:
                     i += step
@@ -767,8 +780,9 @@ class PEReferenceFinder:
                 val = struct.unpack_from(fmt, data, i)[0]
                 candidate_rva = val - self.image_base
                 if code_rva_min <= candidate_rva < code_rva_max:
-                    # Alignment check for instruction targets
-                    if not self.is_64 or (candidate_rva & 0 == 0):
+                    # Alignment check: must be pointer-aligned
+                    align_mask = 7 if self.is_64 else 3
+                    if candidate_rva & align_mask == 0:
                         refs.append(Reference(
                             file_offset=foff_base + i,
                             ref_type=RefType.DATA_POINTER,
@@ -1090,7 +1104,6 @@ class ShiftEngine:
             new_insn_size = 5
             # New displacement: target_rva - (ref_rva + 5)
             new_disp = ref.target_rva - (ref.ref_rva + new_insn_size)
-            new_bytes = struct.pack('<bI', 0xE9 - 256, new_disp) if False else b''
             new_bytes = bytes([0xE9]) + struct.pack('<i', new_disp)
 
             # Replace the 2-byte instruction with 5-byte version
@@ -1135,6 +1148,11 @@ class ShiftEngine:
         that are after from_rva by expand bytes and update their encoded values.
         This is a mini version of _recalculate_refs for the cascade.
         """
+        # Find the file offset for from_rva to update section headers
+        foff = self._rva_to_offset(from_rva)
+        if foff is None:
+            foff = 0  # fallback
+
         for ref in self.ref_db.get_all():
             if ref.ref_rva >= from_rva:
                 ref.ref_rva += expand
@@ -1148,10 +1166,13 @@ class ShiftEngine:
                 if ref.size_bytes == 1:
                     if -128 <= new_val <= 127:
                         self._write_int(ref.file_offset, new_val, 1, signed=True)
+                elif ref.size_bytes == 2:
+                    self._write_int(ref.file_offset, new_val, 2, signed=True)
                 elif ref.size_bytes == 4:
                     self._write_int(ref.file_offset, new_val, 4, signed=True)
-            elif ref.ref_rva >= from_rva or ref.target_rva >= from_rva:
-                if not ref.is_relative and ref.target_rva >= from_rva:
+            else:
+                # Absolute refs whose target moved
+                if ref.target_rva - expand >= from_rva:  # target was shifted
                     new_abs = ref.target_rva + self.image_base
                     if ref.size_bytes == 4:
                         self._write_int(ref.file_offset, new_abs & 0xFFFFFFFF, 4)
@@ -1159,6 +1180,10 @@ class ShiftEngine:
                         self._write_int(ref.file_offset, new_abs, 8)
 
         self.ref_db.rebuild_indices()
+
+        # Update section headers and PE headers for the expansion
+        self._update_sections_after_insert(from_rva, expand, foff)
+        self._update_pe_headers(from_rva, expand)
 
     def _write_int(self, offset: int, value: int, size: int, signed: bool = False):
         if offset < 0 or offset + size > len(self.buffer):
