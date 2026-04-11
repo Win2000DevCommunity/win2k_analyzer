@@ -351,6 +351,7 @@ class App(tk.Tk):
         self.tab_xref       = XRefScannerTab(self.nb, self)
         self.tab_patcher    = PEPatcherTab(self.nb, self)
         self.tab_kdbg       = KernelDebuggerTab(self.nb, self)
+        self.tab_ubrt       = UBRTTab(self.nb, self)
 
         tabs = [
             (self.tab_exports,    " Exports "),
@@ -369,6 +370,7 @@ class App(tk.Tk):
             (self.tab_xref,       " XRefs "),
             (self.tab_patcher,    " PE Patch "),
             (self.tab_kdbg,       " \U0001F41E KDebug "),
+            (self.tab_ubrt,       " \u2699 UBRT "),
         ]
         for tab, text in tabs:
             self.nb.add(tab, text=text)
@@ -7504,6 +7506,507 @@ class KernelDebuggerTab(ttk.Frame):
 
         run_with_progress_dialog(self.app,
             f"Scanning for callers of {func}\u2026", work, done)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Tab 17: UBRT — Universal Binary Rewriter & Translator
+# ══════════════════════════════════════════════════════════════════════════
+
+class UBRTTab(ttk.Frame):
+    """Surgical binary modification with automatic reference recalculation."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, style="TFrame")
+        self.app = app
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(5, weight=1)
+        self._engine = None
+
+        # ── Row 0: File picker ──
+        _, self._get_pe, self.pe_var = make_file_picker(
+            self, "PE Binary:", row=0,
+            placeholder="C:\\WINNT\\system32\\ntdll.dll", app=app)
+
+        # ── Row 1: Main action buttons ──
+        btn_frm = make_button_bar(self, row=1)
+        ttk.Button(btn_frm, text="\U0001F50D  Analyze References",
+                   style="Accent.TButton",
+                   command=self._analyze).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4CA  Ref Stats",
+                   command=self._show_stats).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4BE  Save Binary\u2026",
+                   command=self._save).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\u21A9  Undo",
+                   command=self._undo).pack(side="left", padx=5)
+
+        # ── Row 2: Operation panel ──
+        op_frm = tk.LabelFrame(self, text=" Shift Engine Operations ",
+                               bg=T["bg"], fg=T["accent"], font=("Segoe UI", 10, "bold"),
+                               padx=8, pady=6)
+        op_frm.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
+        op_frm.columnconfigure(1, weight=1)
+
+        tk.Label(op_frm, text="Op:", bg=T["bg"], fg=T["fg"]).grid(
+            row=0, column=0, padx=(0, 4))
+        self._op_var = tk.StringVar(value="INSERT")
+        op_menu = ttk.Combobox(op_frm, textvariable=self._op_var, width=10,
+                               values=["INSERT", "DELETE", "PATCH", "NOP SLED"],
+                               state="readonly")
+        op_menu.grid(row=0, column=1, sticky="w", padx=4)
+
+        tk.Label(op_frm, text="RVA:", bg=T["bg"], fg=T["fg"]).grid(
+            row=0, column=2, padx=(12, 4))
+        self._rva_var = tk.StringVar()
+        self._rva_ent = tk.Entry(op_frm, textvariable=self._rva_var, width=14,
+                                 bg=T["entry_bg"], fg=T["fg"],
+                                 insertbackground=T["fg"], font=("Consolas", 10),
+                                 relief="flat", bd=4)
+        self._rva_ent.grid(row=0, column=3, padx=4)
+
+        tk.Label(op_frm, text="Hex Data / Size:", bg=T["bg"], fg=T["fg"]).grid(
+            row=0, column=4, padx=(12, 4))
+        self._data_var = tk.StringVar()
+        self._data_ent = tk.Entry(op_frm, textvariable=self._data_var, width=30,
+                                  bg=T["entry_bg"], fg=T["fg"],
+                                  insertbackground=T["fg"], font=("Consolas", 10),
+                                  relief="flat", bd=4)
+        self._data_ent.grid(row=0, column=5, padx=4, sticky="ew")
+
+        ttk.Button(op_frm, text="\U0001F441  Preview",
+                   command=self._preview).grid(row=0, column=6, padx=4)
+        ttk.Button(op_frm, text="\u26A1  Apply",
+                   style="Accent.TButton",
+                   command=self._apply).grid(row=0, column=7, padx=4)
+
+        # ── Row 3: QEMU Tracer panel ──
+        qemu_frm = tk.LabelFrame(self, text=" QEMU Dynamic Tracer ",
+                                 bg=T["bg"], fg=T["accent"],
+                                 font=("Segoe UI", 10, "bold"), padx=8, pady=6)
+        qemu_frm.grid(row=3, column=0, sticky="ew", padx=12, pady=4)
+        qemu_frm.columnconfigure(1, weight=1)
+
+        tk.Label(qemu_frm, text="QEMU:", bg=T["bg"], fg=T["fg"]).grid(
+            row=0, column=0, padx=(0, 4))
+        self._qemu_var = tk.StringVar()
+        self._qemu_ent = tk.Entry(qemu_frm, textvariable=self._qemu_var, width=40,
+                                  bg=T["entry_bg"], fg=T["fg"],
+                                  insertbackground=T["fg"], font=("Consolas", 10),
+                                  relief="flat", bd=4)
+        self._qemu_ent.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(qemu_frm, text="Find",
+                   command=self._find_qemu).grid(row=0, column=2, padx=4)
+
+        tk.Label(qemu_frm, text="Disk Image:", bg=T["bg"], fg=T["fg"]).grid(
+            row=1, column=0, padx=(0, 4), pady=(4, 0))
+        self._disk_var = tk.StringVar()
+        self._disk_ent = tk.Entry(qemu_frm, textvariable=self._disk_var, width=40,
+                                  bg=T["entry_bg"], fg=T["fg"],
+                                  insertbackground=T["fg"], font=("Consolas", 10),
+                                  relief="flat", bd=4)
+        self._disk_ent.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
+        ttk.Button(qemu_frm, text="Browse\u2026",
+                   command=self._browse_disk).grid(row=1, column=2, padx=4, pady=(4, 0))
+
+        qemu_btn_frm = tk.Frame(qemu_frm, bg=T["bg"])
+        qemu_btn_frm.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(qemu_btn_frm, text="\u25B6  Start Trace",
+                   command=self._start_trace).pack(side="left", padx=4)
+        ttk.Button(qemu_btn_frm, text="\u23F9  Stop",
+                   command=self._stop_trace).pack(side="left", padx=4)
+        ttk.Button(qemu_btn_frm, text="\U0001F4C8  Parse Trace Log",
+                   command=self._parse_trace).pack(side="left", padx=4)
+        ttk.Button(qemu_btn_frm, text="\U0001F517  Merge Coverage",
+                   command=self._merge_coverage).pack(side="left", padx=4)
+        self._qemu_status = tk.Label(qemu_btn_frm, text="Status: Idle",
+                                     bg=T["bg"], fg=T["fg_dim"],
+                                     font=("Segoe UI", 9))
+        self._qemu_status.pack(side="left", padx=12)
+
+        # ── Row 4: Status bar ──
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Load a PE binary and click Analyze References", row=4)
+
+        # ── Row 5: Output ──
+        self.output = TabbedOutput(self)
+        self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    # ── Analysis ──────────────────────────────────────────────────────
+
+    def _analyze(self):
+        pe_path = self._get_pe()
+        if not pe_path or not os.path.isfile(pe_path):
+            self.status_var.set("\u26A0 Select a valid PE file first")
+            return
+
+        from nt_analyzer.ubrt_engine import UBRTEngine
+
+        self.status_var.set("\u23F3 Analyzing references\u2026")
+        self._prog_start()
+
+        def work():
+            eng = UBRTEngine()
+            return eng, eng.load(pe_path)
+
+        def done(result):
+            self._prog_stop()
+            eng, info = result
+            if not info.get('success'):
+                self.status_var.set(f"\u26A0 {info.get('error', 'Unknown error')}")
+                return
+            self._engine = eng
+            stats = info['stats']
+            pe = info['pe_info']
+
+            tab = self.output.add_tab(f"Refs: {os.path.basename(pe_path)}")
+            out = lambda t, tag="": output_write(tab, t, tag)
+
+            out(f"\n{'='*72}\n", "accent")
+            out(f"  UBRT Reference Analysis: {os.path.basename(pe_path)}\n", "accent")
+            out(f"{'='*72}\n\n", "accent")
+
+            out(f"  File:        {pe_path}\n")
+            out(f"  Size:        {pe['size']:,} bytes\n")
+            out(f"  ImageBase:   0x{pe['image_base']:X}\n")
+            out(f"  Arch:        {'x64' if pe['is_64'] else 'x86 (32-bit)'}\n")
+            out(f"  Entry Point: 0x{pe['entry_point']:X}\n\n")
+
+            out(f"  Sections:\n", "green")
+            out(f"  {'Name':<12} {'RVA':>10} {'VSize':>10} {'RawSize':>10} {'Flags':<20}\n", "dim")
+            out(f"  {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*20}\n", "dim")
+            for s in pe['sections']:
+                flags = []
+                if s['is_code']:  flags.append('CODE')
+                if s['is_data']:  flags.append('DATA')
+                if s['is_writable']: flags.append('WRITE')
+                out(f"  {s['name']:<12} 0x{s['rva']:08X} 0x{s['vsize']:08X} "
+                    f"0x{s['raw_size']:08X} {','.join(flags)}\n")
+
+            out(f"\n  {'='*60}\n", "accent")
+            out(f"  REFERENCES FOUND: {stats['total']}\n", "accent")
+            out(f"  {'='*60}\n\n", "accent")
+
+            out(f"  By Type:\n", "green")
+            for typ, cnt in sorted(stats['by_type'].items(), key=lambda x: -x[1]):
+                bar = '\u2588' * min(cnt // 20 + 1, 40)
+                out(f"    {typ:<25} {cnt:>6}  {bar}\n")
+
+            out(f"\n  By Source:\n", "green")
+            for src, cnt in sorted(stats['by_source'].items(), key=lambda x: -x[1]):
+                out(f"    {src:<25} {cnt:>6}\n")
+
+            conf = stats['by_confidence']
+            out(f"\n  By Confidence:\n", "green")
+            out(f"    High (≥0.9):   {conf['high']:>6}\n", "green")
+            out(f"    Medium (≥0.7): {conf['medium']:>6}\n", "peach")
+            out(f"    Low (<0.7):    {conf['low']:>6}\n", "red")
+
+            out(f"\n  \u2714 Ready for shift operations. Use the operation panel above.\n", "green")
+
+            self.status_var.set(
+                f"\u2714 Found {stats['total']} references in "
+                f"{os.path.basename(pe_path)}")
+
+        run_with_progress_dialog(self.app,
+            "Analyzing binary references\u2026", work, done)
+
+    # ── Stats ─────────────────────────────────────────────────────────
+
+    def _show_stats(self):
+        if not self._engine or not self._engine.ref_db:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+        refs = self._engine.ref_db.get_all()
+        tab = self.output.add_tab("Reference List")
+        out = lambda t, tag="": output_write(tab, t, tag)
+
+        out(f"\n  {'Offset':<12} {'RVA':<12} {'Type':<22} {'Target RVA':<12} "
+            f"{'Rel?':<6} {'Size':<6} {'Conf':<6} {'Section':<10} {'Symbol'}\n", "dim")
+        out(f"  {'─'*12} {'─'*12} {'─'*22} {'─'*12} {'─'*6} {'─'*6} "
+            f"{'─'*6} {'─'*10} {'─'*20}\n", "dim")
+
+        shown = 0
+        for ref in refs[:2000]:
+            tag = "green" if ref.confidence >= 0.9 else ("peach" if ref.confidence >= 0.7 else "dim")
+            rel = "REL" if ref.is_relative else "ABS"
+            out(f"  0x{ref.file_offset:08X}  0x{ref.ref_rva:08X}  {ref.ref_type.value:<22} "
+                f"0x{ref.target_rva:08X}  {rel:<6} {ref.size_bytes:<6} "
+                f"{ref.confidence:.2f}  {ref.section_name:<10} {ref.symbol_name}\n", tag)
+            shown += 1
+
+        if len(refs) > 2000:
+            out(f"\n  ... and {len(refs) - 2000} more references (showing first 2000)\n", "dim")
+
+        self.status_var.set(f"\U0001F4CA Showing {shown} of {len(refs)} references")
+
+    # ── Preview ───────────────────────────────────────────────────────
+
+    def _parse_rva(self) -> int:
+        raw = self._rva_var.get().strip()
+        if not raw:
+            raise ValueError("RVA is empty")
+        return int(raw, 16) if raw.startswith('0x') or raw.startswith('0X') else int(raw, 16)
+
+    def _parse_hex_data(self) -> bytes:
+        raw = self._data_var.get().strip()
+        if not raw:
+            raise ValueError("Data/size is empty")
+        cleaned = raw.replace(' ', '').replace('0x', '').replace('0X', '')
+        return bytes.fromhex(cleaned)
+
+    def _parse_size(self) -> int:
+        raw = self._data_var.get().strip()
+        if not raw:
+            raise ValueError("Size is empty")
+        if raw.startswith('0x') or raw.startswith('0X'):
+            return int(raw, 16)
+        return int(raw)
+
+    def _preview(self):
+        if not self._engine or not self._engine.ref_db:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+        try:
+            rva = self._parse_rva()
+        except ValueError as e:
+            self.status_var.set(f"\u26A0 Bad RVA: {e}")
+            return
+
+        op = self._op_var.get()
+        try:
+            if op == "INSERT":
+                data = self._parse_hex_data()
+                size = len(data)
+            elif op == "NOP SLED":
+                size = self._parse_size()
+            elif op == "DELETE":
+                size = self._parse_size()
+            elif op == "PATCH":
+                data = self._parse_hex_data()
+                size = len(data)
+            else:
+                size = self._parse_size()
+        except ValueError as e:
+            self.status_var.set(f"\u26A0 Bad data/size: {e}")
+            return
+
+        preview = self._engine.preview('insert', rva, size)
+        tab = self.output.add_tab(f"Preview @0x{rva:X}")
+        out = lambda t, tag="": output_write(tab, t, tag)
+
+        out(f"\n{'='*72}\n", "accent")
+        out(f"  SHIFT PREVIEW: {op} {size} bytes at RVA 0x{rva:X}\n", "accent")
+        out(f"{'='*72}\n\n", "accent")
+
+        out(f"  Total references:  {preview.get('total_refs', 0)}\n")
+        out(f"  Refs affected:     {preview.get('refs_affected', 0)}\n")
+        out(f"  Warnings:          {len(preview.get('warnings', []))}\n\n")
+
+        if preview.get('warnings'):
+            out("  \u26A0 WARNINGS:\n", "red")
+            for w in preview['warnings']:
+                out(f"    {w}\n", "red")
+            out("\n")
+
+        changes = preview.get('changes', [])
+        if changes:
+            out(f"  Changes ({len(changes)}):\n", "green")
+            for ch in changes[:500]:
+                out(f"    {ch}\n")
+            if len(changes) > 500:
+                out(f"\n    ... and {len(changes)-500} more\n", "dim")
+
+        self.status_var.set(
+            f"\U0001F441 Preview: {preview.get('refs_affected', 0)} refs affected, "
+            f"{len(preview.get('warnings', []))} warnings")
+
+    # ── Apply ─────────────────────────────────────────────────────────
+
+    def _apply(self):
+        if not self._engine or not self._engine.ref_db:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+        try:
+            rva = self._parse_rva()
+        except ValueError as e:
+            self.status_var.set(f"\u26A0 Bad RVA: {e}")
+            return
+
+        op = self._op_var.get()
+        try:
+            if op == "INSERT":
+                data = self._parse_hex_data()
+                result = self._engine.insert(rva, data)
+            elif op == "NOP SLED":
+                size = self._parse_size()
+                result = self._engine.insert_nops(rva, size)
+            elif op == "DELETE":
+                size = self._parse_size()
+                result = self._engine.delete(rva, size)
+            elif op == "PATCH":
+                data = self._parse_hex_data()
+                result = self._engine.patch(rva, data)
+            else:
+                self.status_var.set(f"\u26A0 Unknown op: {op}")
+                return
+        except Exception as e:
+            self.status_var.set(f"\u26A0 {e}")
+            return
+
+        tab = self.output.add_tab(f"{op} @0x{rva:X}")
+        out = lambda t, tag="": output_write(tab, t, tag)
+
+        status_icon = "\u2714" if result.success else "\u274C"
+        tag = "green" if result.success else "red"
+        out(f"\n{'='*72}\n", "accent")
+        out(f"  {status_icon} {result.message}\n", tag)
+        out(f"{'='*72}\n\n", "accent")
+
+        out(f"  Operation:       {result.operation.value}\n")
+        out(f"  RVA:             0x{result.rva:X}\n")
+        out(f"  Delta:           {result.delta:+d} bytes\n")
+        out(f"  Refs updated:    {result.refs_updated}\n")
+        out(f"  Sections adj:    {result.sections_adjusted}\n")
+        out(f"  New file size:   {result.new_file_size:,} bytes\n")
+
+        if result.warnings:
+            out(f"\n  \u26A0 WARNINGS ({len(result.warnings)}):\n", "red")
+            for w in result.warnings:
+                out(f"    {w}\n", "red")
+
+        # Show history
+        history = self._engine.get_history()
+        if history:
+            out(f"\n  Operation History ({len(history)}):\n", "dim")
+            for i, h in enumerate(history):
+                out(f"    {i+1}. {h['op']} at {h['rva']}: "
+                    f"delta={h['delta']:+d}, refs={h['refs_updated']}\n", "dim")
+
+        self.status_var.set(f"{status_icon} {result.message}")
+
+    # ── Undo ──────────────────────────────────────────────────────────
+
+    def _undo(self):
+        if not self._engine:
+            self.status_var.set("\u26A0 No binary loaded")
+            return
+        msg = self._engine.undo()
+        if msg:
+            self.status_var.set(f"\u21A9 {msg}")
+        else:
+            self.status_var.set("\u26A0 Nothing to undo")
+
+    # ── Save ──────────────────────────────────────────────────────────
+
+    def _save(self):
+        if not self._engine or not self._engine.shift_engine:
+            self.status_var.set("\u26A0 No binary loaded")
+            return
+        out_path = filedialog.asksaveasfilename(
+            defaultextension=".exe",
+            filetypes=[("PE Files", "*.dll;*.sys;*.exe"), ("All", "*.*")],
+            initialfile=os.path.basename(self._engine.pe_path or "output.exe"))
+        if not out_path:
+            return
+        try:
+            self._engine.save(out_path)
+            self.status_var.set(f"\U0001F4BE Saved to {out_path}")
+        except Exception as e:
+            self.status_var.set(f"\u26A0 Save failed: {e}")
+
+    # ── QEMU ──────────────────────────────────────────────────────────
+
+    def _find_qemu(self):
+        from nt_analyzer.ubrt_engine import QEMUTracer
+        found = QEMUTracer.find_qemu()
+        if found:
+            self._qemu_var.set(found)
+            self._qemu_status.config(text=f"Found: {os.path.basename(found)}", fg=T["green"])
+        else:
+            self._qemu_status.config(text="QEMU not found — install or set path manually", fg=T["red"])
+
+    def _browse_disk(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Disk Images", "*.qcow2;*.img;*.vmdk;*.vdi;*.raw"),
+                       ("All Files", "*.*")])
+        if path:
+            self._disk_var.set(path)
+
+    def _start_trace(self):
+        if not self._engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+        qemu_path = self._qemu_var.get().strip()
+        disk = self._disk_var.get().strip()
+        if not qemu_path:
+            self.status_var.set("\u26A0 Set QEMU path first")
+            return
+        if not disk or not os.path.isfile(disk):
+            self.status_var.set("\u26A0 Set a valid disk image path")
+            return
+
+        self._engine.setup_qemu(qemu_path)
+        result = self._engine.start_trace(disk)
+        if result.get('success'):
+            self._qemu_status.config(
+                text=f"Running (PID {result['pid']}, GDB :{result['gdb_port']})",
+                fg=T["green"])
+            self.status_var.set(f"\u25B6 QEMU started — trace log: {result['trace_log']}")
+        else:
+            self._qemu_status.config(text=f"Error: {result['error']}", fg=T["red"])
+            self.status_var.set(f"\u26A0 {result['error']}")
+
+    def _stop_trace(self):
+        if not self._engine or not self._engine.qemu:
+            self.status_var.set("\u26A0 QEMU not running")
+            return
+        result = self._engine.stop_trace()
+        self._qemu_status.config(text="Stopped", fg=T["fg_dim"])
+        self.status_var.set(result.get('message', result.get('error', '')))
+
+    def _parse_trace(self):
+        if not self._engine or not self._engine.qemu:
+            self.status_var.set("\u26A0 No QEMU trace available")
+            return
+        ib = self._engine.pe_info.get('image_base', 0)
+        result = self._engine.qemu.parse_trace_log(image_base=ib)
+        if not result.get('success'):
+            self.status_var.set(f"\u26A0 {result.get('error')}")
+            return
+
+        tab = self.output.add_tab("Trace Coverage")
+        out = lambda t, tag="": output_write(tab, t, tag)
+        out(f"\n{'='*60}\n", "accent")
+        out(f"  QEMU Trace Log Coverage\n", "accent")
+        out(f"{'='*60}\n\n", "accent")
+        out(f"  Basic blocks executed: {result['blocks']}\n")
+        out(f"  Unique blocks:         {result['unique_blocks']}\n")
+        out(f"  Instructions traced:   {result['instructions']}\n\n")
+
+        cov = self._engine.qemu.coverage
+        out(f"  {'RVA':<14} {'Hit Count'}\n", "dim")
+        out(f"  {'─'*14} {'─'*10}\n", "dim")
+        for rva in sorted(cov.keys())[:500]:
+            blk = cov[rva]
+            out(f"  0x{rva:08X}    {blk.hit_count}\n")
+        if len(cov) > 500:
+            out(f"\n  ... {len(cov)-500} more blocks\n", "dim")
+
+        self.status_var.set(
+            f"\U0001F4C8 Trace: {result['unique_blocks']} unique blocks, "
+            f"{result['instructions']} instructions")
+
+    def _merge_coverage(self):
+        if not self._engine:
+            self.status_var.set("\u26A0 No engine loaded")
+            return
+        result = self._engine.merge_trace_coverage()
+        if result.get('success'):
+            self.status_var.set(
+                f"\U0001F517 Merged: {result.get('refs_added', 0)} new refs, "
+                f"total {result.get('total_refs', 0)}")
+        else:
+            self.status_var.set(f"\u26A0 {result.get('error')}")
+
 
 if __name__ == '__main__':
     app = App()

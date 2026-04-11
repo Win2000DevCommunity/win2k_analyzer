@@ -648,6 +648,69 @@ def cmd_hex_dump(args):
     print(patcher.hex_dump(rva, length))
 
 
+def cmd_ubrt_refs(args):
+    """Analyze all references in a PE binary (UBRT engine)."""
+    from nt_analyzer.ubrt_engine import UBRTEngine
+    eng = UBRTEngine()
+    def progress(name, cur, total):
+        print(f"  [{cur+1}/{total}] {name}...")
+    result = eng.load(args.pe, callback=progress)
+    if not result['success']:
+        print(f"Error: {result['error']}")
+        return
+    stats = result['stats']
+    pe = result['pe_info']
+    print(f"\n{'='*60}")
+    print(f"  UBRT Reference Analysis: {os.path.basename(args.pe)}")
+    print(f"{'='*60}")
+    print(f"  Image Base: 0x{pe['image_base']:X}  Arch: {'x64' if pe['is_64'] else 'x86'}")
+    print(f"  Entry:      0x{pe['entry_point']:X}")
+    print(f"\n  References Found: {stats['total']}")
+    for typ, cnt in sorted(stats['by_type'].items(), key=lambda x: -x[1]):
+        print(f"    {typ:<25} {cnt:>6}")
+    conf = stats['by_confidence']
+    print(f"\n  Confidence: High={conf['high']}  Med={conf['medium']}  Low={conf['low']}")
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(eng.ref_db.to_json())
+        print(f"\n  Saved to {args.output}")
+
+
+def cmd_ubrt_shift(args):
+    """Apply a shift operation to a PE binary (UBRT engine)."""
+    from nt_analyzer.ubrt_engine import UBRTEngine
+    eng = UBRTEngine()
+    result = eng.load(args.pe)
+    if not result['success']:
+        print(f"Error: {result['error']}")
+        return
+    rva = int(args.rva, 16)
+    op = args.op.upper()
+    if op == 'INSERT':
+        data = bytes.fromhex(args.data.replace('0x', '').replace(' ', ''))
+        sr = eng.insert(rva, data)
+    elif op == 'DELETE':
+        count = int(args.data, 16) if args.data.startswith('0x') else int(args.data)
+        sr = eng.delete(rva, count)
+    elif op == 'NOP':
+        count = int(args.data, 16) if args.data.startswith('0x') else int(args.data)
+        sr = eng.insert_nops(rva, count)
+    elif op == 'PATCH':
+        data = bytes.fromhex(args.data.replace('0x', '').replace(' ', ''))
+        sr = eng.patch(rva, data)
+    else:
+        print(f"Unknown op: {op}")
+        return
+    status = "\u2714" if sr.success else "\u274C"
+    print(f"\n{status} {sr.message}")
+    print(f"  Delta: {sr.delta:+d}  Refs updated: {sr.refs_updated}  Warnings: {len(sr.warnings)}")
+    for w in sr.warnings:
+        print(f"  \u26A0 {w}")
+    out = args.output or args.pe.replace('.', '_ubrt.')
+    eng.save(out)
+    print(f"  Saved: {out}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Win2K NT Internals Analyzer - Analyze Windows 2000 SP4 system DLLs for ReactOS compatibility',
@@ -837,6 +900,19 @@ Examples:
     p.add_argument('rva', help='RVA to dump (hex, e.g. 0x1000)')
     p.add_argument('-l', '--length', help='Number of bytes (hex, default: 0x80)')
 
+    # ubrt-refs
+    p = subparsers.add_parser('ubrt-refs', help='UBRT: Analyze all address references in a PE binary')
+    p.add_argument('pe', help='Path to PE file')
+    p.add_argument('-o', '--output', help='Save reference database to JSON')
+
+    # ubrt-shift
+    p = subparsers.add_parser('ubrt-shift', help='UBRT: Insert/delete/patch bytes with auto reference recalculation')
+    p.add_argument('pe', help='Path to PE file')
+    p.add_argument('op', help='Operation: INSERT, DELETE, NOP, PATCH')
+    p.add_argument('rva', help='RVA target (hex, e.g. 0x1000)')
+    p.add_argument('data', help='Hex bytes (INSERT/PATCH) or byte count (DELETE/NOP)')
+    p.add_argument('-o', '--output', help='Output path (default: <name>_ubrt.<ext>)')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -870,6 +946,8 @@ Examples:
         'compile-inject': cmd_compile_inject,
         'rebase': cmd_rebase,
         'hex-dump': cmd_hex_dump,
+        'ubrt-refs': cmd_ubrt_refs,
+        'ubrt-shift': cmd_ubrt_shift,
     }
 
     try:
