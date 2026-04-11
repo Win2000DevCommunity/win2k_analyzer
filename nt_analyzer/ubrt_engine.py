@@ -162,13 +162,30 @@ class ReferenceDatabase:
         self._by_target: Dict[int, List[int]] = defaultdict(list)
         self._by_type: Dict[RefType, List[int]] = defaultdict(list)
         self._by_section: Dict[str, List[int]] = defaultdict(list)
+        self._by_offset: Dict[Tuple[int, int], int] = {}  # (file_offset, size) → idx
 
     def add(self, ref: Reference):
+        # Deduplicate by (file_offset, size_bytes) — prevents double-writes
+        if ref.file_offset > 0:
+            key = (ref.file_offset, ref.size_bytes)
+            existing_idx = self._by_offset.get(key)
+            if existing_idx is not None:
+                existing = self._refs[existing_idx]
+                # Keep the higher-confidence entry
+                if ref.confidence > existing.confidence:
+                    existing.confidence = ref.confidence
+                    existing.source = ref.source
+                    existing.ref_type = ref.ref_type
+                    if ref.symbol_name:
+                        existing.symbol_name = ref.symbol_name
+                return  # don't add duplicate
         idx = len(self._refs)
         self._refs.append(ref)
         self._by_target[ref.target_rva].append(idx)
         self._by_type[ref.ref_type].append(idx)
         self._by_section[ref.section_name].append(idx)
+        if ref.file_offset > 0:
+            self._by_offset[(ref.file_offset, ref.size_bytes)] = idx
 
     def get_all(self) -> List[Reference]:
         return list(self._refs)
@@ -190,10 +207,13 @@ class ReferenceDatabase:
         self._by_target.clear()
         self._by_type.clear()
         self._by_section.clear()
+        self._by_offset.clear()
         for i, ref in enumerate(self._refs):
             self._by_target[ref.target_rva].append(i)
             self._by_type[ref.ref_type].append(i)
             self._by_section[ref.section_name].append(i)
+            if ref.file_offset > 0:
+                self._by_offset[(ref.file_offset, ref.size_bytes)] = i
 
     def stats(self) -> Dict:
         by_type = defaultdict(int)
@@ -224,6 +244,7 @@ class ReferenceDatabase:
         self._by_target.clear()
         self._by_type.clear()
         self._by_section.clear()
+        self._by_offset.clear()
 
 
 # ─── PE Reference Finder ─────────────────────────────────────────────────
@@ -1257,9 +1278,537 @@ class ELFReferenceFinder:
         return refs
 
 
+# ─── Mach-O Reference Finder ─────────────────────────────────────────────
+
+class MachOReferenceFinder:
+    """
+    Finds address references in Mach-O binaries (macOS/iOS).
+
+    Supports: Mach-O 32/64, fat (universal) binaries.
+
+    Analysis passes:
+    1. Segment/section enumeration from load commands
+    2. Capstone disassembly → relative jumps/calls, RIP-relative
+    3. __got / __la_symbol_ptr pointer scanning
+    4. Relocation entries from LC_DYSYMTAB
+    5. __mod_init_func / __mod_term_func pointer scanning
+    """
+
+    # Mach-O magic numbers
+    MH_MAGIC_32 = 0xFEEDFACE
+    MH_MAGIC_64 = 0xFEEDFACF
+    FAT_MAGIC   = 0xCAFEBABE
+    FAT_MAGIC_LE = 0xBEBAFECA
+
+    # Load command types
+    LC_SEGMENT    = 0x01
+    LC_SEGMENT_64 = 0x19
+    LC_DYSYMTAB   = 0x0B
+
+    def __init__(self, path: str, arch_index: int = 0):
+        self.path = path
+        with open(path, 'rb') as f:
+            self.data = f.read()
+        self.buffer = bytearray(self.data)
+        self.is_64 = False
+        self.is_fat = False
+        self.image_base = 0
+        self.arch_offset = 0
+        self.sections: List[Dict] = []
+        self.segments: List[Dict] = []
+        self._parse_header(arch_index)
+
+    def _parse_header(self, arch_index: int):
+        magic = struct.unpack_from('<I', self.buffer, 0)[0]
+
+        if magic == self.FAT_MAGIC or magic == self.FAT_MAGIC_LE:
+            self.is_fat = True
+            # Fat binary: use big-endian header
+            nfat_arch = struct.unpack_from('>I', self.buffer, 4)[0]
+            if arch_index >= nfat_arch:
+                arch_index = 0
+            # Each fat_arch is 20 bytes: cputype(4), cpusubtype(4), offset(4), size(4), align(4)
+            fa_off = 8 + arch_index * 20
+            self.arch_offset = struct.unpack_from('>I', self.buffer, fa_off + 8)[0]
+            magic = struct.unpack_from('<I', self.buffer, self.arch_offset)[0]
+        else:
+            self.arch_offset = 0
+
+        base = self.arch_offset
+        if magic == self.MH_MAGIC_64:
+            self.is_64 = True
+            # Mach-O 64 header: 32 bytes
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            sizeofcmds = struct.unpack_from('<I', self.buffer, base + 20)[0]
+            cmd_offset = base + 32
+        elif magic == self.MH_MAGIC_32:
+            self.is_64 = False
+            # Mach-O 32 header: 28 bytes
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            sizeofcmds = struct.unpack_from('<I', self.buffer, base + 20)[0]
+            cmd_offset = base + 28
+        else:
+            return  # Not a valid Mach-O
+
+        self._parse_load_commands(cmd_offset, ncmds)
+
+    def _parse_load_commands(self, offset: int, ncmds: int):
+        for _ in range(ncmds):
+            if offset + 8 > len(self.buffer):
+                break
+            cmd = struct.unpack_from('<I', self.buffer, offset)[0]
+            cmdsize = struct.unpack_from('<I', self.buffer, offset + 4)[0]
+            if cmdsize < 8:
+                break
+
+            if cmd == self.LC_SEGMENT_64:
+                self._parse_segment64(offset)
+            elif cmd == self.LC_SEGMENT:
+                self._parse_segment32(offset)
+
+            offset += cmdsize
+
+    def _parse_segment64(self, offset: int):
+        segname = self.buffer[offset + 8:offset + 24].rstrip(b'\x00').decode('ascii', errors='replace')
+        vmaddr = struct.unpack_from('<Q', self.buffer, offset + 24)[0]
+        vmsize = struct.unpack_from('<Q', self.buffer, offset + 32)[0]
+        fileoff = struct.unpack_from('<Q', self.buffer, offset + 40)[0]
+        filesize = struct.unpack_from('<Q', self.buffer, offset + 48)[0]
+        nsects = struct.unpack_from('<I', self.buffer, offset + 64)[0]
+
+        if segname == '__TEXT' and self.image_base == 0:
+            self.image_base = vmaddr
+
+        self.segments.append({
+            'name': segname, 'vmaddr': vmaddr, 'vmsize': vmsize,
+            'fileoff': fileoff, 'filesize': filesize,
+        })
+
+        # Parse sections: each section64 is 80 bytes, starts at offset+72
+        sec_off = offset + 72
+        for _ in range(nsects):
+            if sec_off + 80 > len(self.buffer):
+                break
+            secname = self.buffer[sec_off:sec_off + 16].rstrip(b'\x00').decode('ascii', errors='replace')
+            sec_segname = self.buffer[sec_off + 16:sec_off + 32].rstrip(b'\x00').decode('ascii', errors='replace')
+            addr = struct.unpack_from('<Q', self.buffer, sec_off + 32)[0]
+            size = struct.unpack_from('<Q', self.buffer, sec_off + 40)[0]
+            sec_fileoff = struct.unpack_from('<I', self.buffer, sec_off + 48)[0]
+            sec_type = struct.unpack_from('<I', self.buffer, sec_off + 64)[0] & 0xFF
+
+            is_code = secname in ('__text', '__stubs', '__stub_helper')
+            self.sections.append({
+                'name': secname, 'segment': sec_segname,
+                'addr': addr, 'size': size, 'offset': sec_fileoff,
+                'type': sec_type, 'is_code': is_code,
+            })
+            sec_off += 80
+
+    def _parse_segment32(self, offset: int):
+        segname = self.buffer[offset + 8:offset + 24].rstrip(b'\x00').decode('ascii', errors='replace')
+        vmaddr = struct.unpack_from('<I', self.buffer, offset + 24)[0]
+        vmsize = struct.unpack_from('<I', self.buffer, offset + 28)[0]
+        fileoff = struct.unpack_from('<I', self.buffer, offset + 32)[0]
+        filesize = struct.unpack_from('<I', self.buffer, offset + 36)[0]
+        nsects = struct.unpack_from('<I', self.buffer, offset + 48)[0]
+
+        if segname == '__TEXT' and self.image_base == 0:
+            self.image_base = vmaddr
+
+        self.segments.append({
+            'name': segname, 'vmaddr': vmaddr, 'vmsize': vmsize,
+            'fileoff': fileoff, 'filesize': filesize,
+        })
+
+        # Parse sections: each section32 is 68 bytes, starts at offset+56
+        sec_off = offset + 56
+        for _ in range(nsects):
+            if sec_off + 68 > len(self.buffer):
+                break
+            secname = self.buffer[sec_off:sec_off + 16].rstrip(b'\x00').decode('ascii', errors='replace')
+            sec_segname = self.buffer[sec_off + 16:sec_off + 32].rstrip(b'\x00').decode('ascii', errors='replace')
+            addr = struct.unpack_from('<I', self.buffer, sec_off + 32)[0]
+            size = struct.unpack_from('<I', self.buffer, sec_off + 36)[0]
+            sec_fileoff = struct.unpack_from('<I', self.buffer, sec_off + 40)[0]
+            sec_type = struct.unpack_from('<I', self.buffer, sec_off + 48)[0] & 0xFF
+
+            is_code = secname in ('__text', '__stubs', '__stub_helper')
+            self.sections.append({
+                'name': secname, 'segment': sec_segname,
+                'addr': addr, 'size': size, 'offset': sec_fileoff,
+                'type': sec_type, 'is_code': is_code,
+            })
+            sec_off += 68
+
+    def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
+        for seg in self.segments:
+            va = seg['vmaddr']
+            fo = seg['fileoff']
+            fs = seg['filesize']
+            if va <= vaddr < va + fs:
+                return vaddr - va + fo
+        return None
+
+    def find_all(self, callback=None) -> ReferenceDatabase:
+        db = ReferenceDatabase()
+        total_passes = 3
+        current = 0
+
+        # Pass 1: Disassemble code sections
+        if callback:
+            current += 1
+            callback(current, total_passes, "Disassembling Mach-O code sections...")
+        refs = self._pass_disasm()
+        for r in refs:
+            db.add(r)
+
+        # Pass 2: Pointer tables (__got, __la_symbol_ptr, __mod_init_func, etc.)
+        if callback:
+            current += 1
+            callback(current, total_passes, "Scanning Mach-O pointer tables...")
+        refs = self._pass_pointer_tables()
+        for r in refs:
+            db.add(r)
+
+        # Pass 3: Data pointer heuristic scan
+        if callback:
+            current += 1
+            callback(current, total_passes, "Scanning Mach-O data pointers...")
+        refs = self._pass_data_pointers()
+        for r in refs:
+            db.add(r)
+
+        return db
+
+    def _pass_disasm(self) -> List[Reference]:
+        refs = []
+        if capstone is None:
+            return refs
+
+        if self.is_64:
+            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        else:
+            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+
+        for sec in self.sections:
+            if not sec['is_code']:
+                continue
+            start_off = sec['offset']
+            size = sec['size']
+            va = sec['addr']
+            code = bytes(self.buffer[start_off:start_off + size])
+            sec_name = sec['name']
+
+            for insn in md.disasm(code, va):
+                if insn.id == 0:
+                    continue
+                # Relative jumps and calls
+                if len(insn.groups) > 0:
+                    is_jump = capstone.CS_GRP_JUMP in insn.groups
+                    is_call = capstone.CS_GRP_CALL in insn.groups
+                    if (is_jump or is_call) and insn.operands:
+                        op0 = insn.operands[0]
+                        if op0.type == capstone.CS_OP_IMM:
+                            target = op0.imm
+                            disp_size = insn.size - 1
+                            if insn.size == 2:
+                                rt = RefType.REL_JUMP_SHORT if is_jump else RefType.REL_CALL
+                                disp_size = 1
+                            elif insn.size == 5:
+                                rt = RefType.REL_CALL if is_call else RefType.REL_JUMP_NEAR
+                                disp_size = 4
+                            elif insn.size == 6:
+                                rt = RefType.REL_COND_NEAR
+                                disp_size = 4
+                            else:
+                                rt = RefType.REL_JUMP_NEAR
+                                disp_size = 4
+
+                            disp_off = self._vaddr_to_offset(insn.address + (insn.size - disp_size))
+                            if disp_off is not None:
+                                refs.append(Reference(
+                                    file_offset=disp_off,
+                                    ref_rva=insn.address,
+                                    target_rva=target,
+                                    ref_type=rt,
+                                    size_bytes=disp_size,
+                                    is_relative=True,
+                                    insn_size=insn.size,
+                                    section_name=sec_name,
+                                    confidence=1.0,
+                                    source=RefSource.STATIC_DISASM,
+                                ))
+
+                # RIP-relative addressing (x64 only)
+                if self.is_64:
+                    for op in insn.operands:
+                        if op.type == capstone.CS_OP_MEM and op.mem.base == capstone.x86.X86_REG_RIP:
+                            target = insn.address + insn.size + op.mem.disp
+                            disp_off = self._vaddr_to_offset(insn.address + (insn.size - 4))
+                            if disp_off is not None:
+                                refs.append(Reference(
+                                    file_offset=disp_off,
+                                    ref_rva=insn.address,
+                                    target_rva=target,
+                                    ref_type=RefType.RIP_RELATIVE,
+                                    size_bytes=4,
+                                    is_relative=True,
+                                    insn_size=insn.size,
+                                    section_name=sec_name,
+                                    confidence=1.0,
+                                    source=RefSource.STATIC_DISASM,
+                                ))
+        return refs
+
+    def _pass_pointer_tables(self) -> List[Reference]:
+        refs = []
+        ptr_size = 8 if self.is_64 else 4
+        ptr_sections = ('__got', '__la_symbol_ptr', '__mod_init_func', '__mod_term_func')
+
+        for sec in self.sections:
+            if sec['name'] not in ptr_sections:
+                continue
+            start_off = sec['offset']
+            count = sec['size'] // ptr_size
+            va = sec['addr']
+
+            if sec['name'] == '__got':
+                rtype = RefType.GOT_ENTRY
+            elif sec['name'] == '__la_symbol_ptr':
+                rtype = RefType.PLT_STUB
+            else:
+                rtype = RefType.INIT_FINI_PTR
+
+            for i in range(count):
+                off = start_off + i * ptr_size
+                if off + ptr_size > len(self.buffer):
+                    break
+                if ptr_size == 8:
+                    val = struct.unpack_from('<Q', self.buffer, off)[0]
+                else:
+                    val = struct.unpack_from('<I', self.buffer, off)[0]
+                if val == 0:
+                    continue
+                refs.append(Reference(
+                    file_offset=off,
+                    ref_rva=va + i * ptr_size,
+                    target_rva=val,
+                    ref_type=rtype,
+                    size_bytes=ptr_size,
+                    is_relative=False,
+                    insn_size=ptr_size,
+                    section_name=sec['name'],
+                    confidence=1.0,
+                    source=RefSource.ELF_TABLE,
+                ))
+        return refs
+
+    def _pass_data_pointers(self) -> List[Reference]:
+        refs = []
+        ptr_size = 8 if self.is_64 else 4
+        # Determine valid VA range
+        min_va = min((s['vmaddr'] for s in self.segments if s['vmsize'] > 0), default=0)
+        max_va = max((s['vmaddr'] + s['vmsize'] for s in self.segments if s['vmsize'] > 0), default=0)
+        if min_va == 0 and max_va == 0:
+            return refs
+
+        data_sections = [s for s in self.sections if not s['is_code'] and s['size'] > 0
+                         and s['name'] not in ('__got', '__la_symbol_ptr',
+                                               '__mod_init_func', '__mod_term_func')]
+
+        step = ptr_size
+        for sec in data_sections:
+            start_off = sec['offset']
+            count = sec['size'] // step
+            va = sec['addr']
+            sec_name = sec['name']
+
+            for i in range(count):
+                off = start_off + i * step
+                if off + ptr_size > len(self.buffer):
+                    break
+                if ptr_size == 8:
+                    val = struct.unpack_from('<Q', self.buffer, off)[0]
+                else:
+                    val = struct.unpack_from('<I', self.buffer, off)[0]
+
+                if min_va <= val < max_va and val != 0:
+                    refs.append(Reference(
+                        file_offset=off,
+                        ref_rva=va + i * step,
+                        target_rva=val,
+                        ref_type=RefType.DATA_POINTER,
+                        size_bytes=ptr_size,
+                        is_relative=False,
+                        insn_size=step, section_name=sec_name,
+                        confidence=0.6, source=RefSource.HEURISTIC,
+                    ))
+        return refs
+
+    def close(self):
+        pass
+
+
+# ─── Base Shift Engine ────────────────────────────────────────────────────
+
+class BaseShiftEngine:
+    """
+    Shared base for PE and ELF shift engines.
+
+    Provides:
+    - _write_int: safe byte writing to buffer
+    - _relax_short_branch: EB→E9 / 7x→0F 8x auto-upgrade
+    - _cascade_shift: mini-recalc after relaxation
+    - _SHORT_TO_NEAR_JCC: opcode mapping table
+    """
+
+    # Mapping from short conditional branch opcodes (7x) to near conditional (0F 8x)
+    _SHORT_TO_NEAR_JCC = {
+        0x70: (0x0F, 0x80), 0x71: (0x0F, 0x81), 0x72: (0x0F, 0x82), 0x73: (0x0F, 0x83),
+        0x74: (0x0F, 0x84), 0x75: (0x0F, 0x85), 0x76: (0x0F, 0x86), 0x77: (0x0F, 0x87),
+        0x78: (0x0F, 0x88), 0x79: (0x0F, 0x89), 0x7A: (0x0F, 0x8A), 0x7B: (0x0F, 0x8B),
+        0x7C: (0x0F, 0x8C), 0x7D: (0x0F, 0x8D), 0x7E: (0x0F, 0x8E), 0x7F: (0x0F, 0x8F),
+    }
+
+    def __init__(self):
+        self.buffer: bytearray = bytearray()
+        self.ref_db: Optional[ReferenceDatabase] = None
+        self.is_64: bool = False
+
+    def _write_int(self, offset: int, value: int, size: int, signed: bool = False):
+        if offset < 0 or offset + size > len(self.buffer):
+            return
+        if signed:
+            fmt = {1: '<b', 2: '<h', 4: '<i', 8: '<q'}[size]
+        else:
+            fmt = {1: '<B', 2: '<H', 4: '<I', 8: '<Q'}[size]
+        try:
+            struct.pack_into(fmt, self.buffer, offset, value)
+        except struct.error:
+            pass
+
+    def _relax_short_branch(self, ref: Reference) -> bool:
+        """
+        Upgrade a short branch (2 bytes) to a near branch (5-6 bytes).
+
+        EB rel8 (JMP short)  → E9 rel32 (JMP near)     : +3 bytes
+        7x rel8 (Jcc short)  → 0F 8x rel32 (Jcc near)  : +4 bytes
+
+        Returns True if relaxation succeeded.
+        """
+        insn_foff = ref.file_offset - 1  # file_offset points to disp byte, opcode is 1 before
+        if insn_foff < 0 or insn_foff + 2 > len(self.buffer):
+            return False
+
+        opcode = self.buffer[insn_foff]
+
+        if ref.ref_type == RefType.REL_JUMP_SHORT and opcode == 0xEB:
+            # EB rel8 → E9 rel32 (expand by 3 bytes)
+            expand = 3
+            new_insn_size = 5
+            new_disp = ref.target_rva - (ref.ref_rva + new_insn_size)
+            new_bytes = bytes([0xE9]) + struct.pack('<i', new_disp)
+
+            self.buffer[insn_foff:insn_foff + 2] = new_bytes
+
+            ref.ref_type = RefType.REL_JUMP_NEAR
+            ref.size_bytes = 4
+            ref.insn_size = 5
+            ref.file_offset = insn_foff + 1
+
+            self._cascade_shift(ref.ref_rva + 2, expand)
+            return True
+
+        elif ref.ref_type == RefType.REL_COND_SHORT and opcode in self._SHORT_TO_NEAR_JCC:
+            # 7x rel8 → 0F 8x rel32 (expand by 4 bytes)
+            expand = 4
+            new_insn_size = 6
+            near_op = self._SHORT_TO_NEAR_JCC[opcode]
+            new_disp = ref.target_rva - (ref.ref_rva + new_insn_size)
+            new_bytes = bytes([near_op[0], near_op[1]]) + struct.pack('<i', new_disp)
+
+            self.buffer[insn_foff:insn_foff + 2] = new_bytes
+
+            ref.ref_type = RefType.REL_COND_NEAR
+            ref.size_bytes = 4
+            ref.insn_size = 6
+            ref.file_offset = insn_foff + 2
+
+            self._cascade_shift(ref.ref_rva + 2, expand)
+            return True
+
+        return False
+
+    def _cascade_shift(self, from_addr: int, expand: int):
+        """
+        After a branch relaxation expands an instruction, shift all refs
+        that are after from_addr by expand bytes and update their encoded values.
+        Subclasses override _cascade_finalize() for format-specific header updates.
+        """
+        for ref in self.ref_db.get_all():
+            if ref.ref_rva >= from_addr:
+                ref.ref_rva += expand
+                ref.file_offset += expand
+            if ref.target_rva >= from_addr:
+                ref.target_rva += expand
+
+            # Re-encode the reference with updated positions
+            if ref.file_offset <= 0:
+                continue
+            if ref.is_relative:
+                new_val = ref.target_rva - (ref.ref_rva + ref.insn_size)
+                if ref.size_bytes == 1:
+                    if -128 <= new_val <= 127:
+                        self._write_int(ref.file_offset, new_val, 1, signed=True)
+                elif ref.size_bytes == 2:
+                    self._write_int(ref.file_offset, new_val, 2, signed=True)
+                elif ref.size_bytes == 4:
+                    self._write_int(ref.file_offset, new_val, 4, signed=True)
+            else:
+                if ref.target_rva - expand >= from_addr:
+                    self._encode_absolute(ref)
+
+        self.ref_db.rebuild_indices()
+        self._cascade_finalize(from_addr, expand)
+
+    def _encode_absolute(self, ref: Reference):
+        """Encode an absolute reference value into the buffer. Override per format."""
+        pass
+
+    def _cascade_finalize(self, from_addr: int, expand: int):
+        """Called after cascade to update format-specific headers. Override per format."""
+        pass
+
+    def _run_relaxation_pass(self, relaxations: list, updated: int,
+                              warnings: List[str]) -> Tuple[int, List[str]]:
+        """
+        Process short branch overflows by relaxing them to near branches.
+        Shared by PE and ELF shift engines.
+        """
+        if not relaxations:
+            return updated, warnings
+
+        relaxations.sort(key=lambda x: x[2], reverse=True)  # highest addr first
+        for ref, foff, ref_addr, target_addr in relaxations:
+            result = self._relax_short_branch(ref)
+            if result:
+                updated += 1
+                warnings.append(
+                    f"RELAXED short→near @0x{ref_addr:X}: "
+                    f"{ref.ref_type.value} (auto-upgraded)"
+                )
+            else:
+                warnings.append(
+                    f"SHORT BRANCH OVERFLOW @0x{ref_addr:X}: "
+                    f"could not auto-relax (type={ref.ref_type.value})"
+                )
+        return updated, warnings
+
+
 # ─── ELF Shift Engine ────────────────────────────────────────────────────
 
-class ELFShiftEngine:
+class ELFShiftEngine(BaseShiftEngine):
     """
     Applies insert/delete/patch operations on ELF binaries with reference recalculation.
 
@@ -1268,6 +1817,7 @@ class ELFShiftEngine:
     """
 
     def __init__(self, elf_path: str, ref_db: ReferenceDatabase):
+        super().__init__()
         if not HAS_ELFTOOLS:
             raise ImportError("pyelftools is required")
         self.elf_path = elf_path
@@ -1307,6 +1857,7 @@ class ELFShiftEngine:
         self.buffer[insert_foff:insert_foff] = data
 
         sections_adjusted = self._update_elf_headers(vaddr, N, insert_foff)
+        self._update_elf_relocations(vaddr, N)
         refs_updated, warnings = self._recalculate_refs(vaddr, N)
 
         return ShiftResult(
@@ -1331,6 +1882,7 @@ class ELFShiftEngine:
         del self.buffer[foff:foff + count]
 
         sections_adjusted = self._update_elf_headers(vaddr, -count, foff)
+        self._update_elf_relocations(vaddr, -count)
         refs_updated, warnings = self._recalculate_refs(vaddr, -count)
 
         return ShiftResult(
@@ -1356,15 +1908,25 @@ class ELFShiftEngine:
     def insert_nop_sled(self, vaddr: int, count: int) -> ShiftResult:
         return self.insert_bytes(vaddr, b'\x90' * count)
 
+    def _reparse_elf(self):
+        """Re-open and re-parse the ELF object from the current buffer."""
+        import io
+        if hasattr(self, '_fobj') and self._fobj and not self._fobj.closed:
+            self._fobj.close()
+        self._fobj = io.BytesIO(bytes(self.buffer))
+        self.elf = ELFFile(self._fobj)
+
     def undo(self) -> Optional[str]:
         if not self._undo_stack:
             return None
         op, foff, n, saved = self._undo_stack.pop()
         if op == ShiftOp.INSERT:
             del self.buffer[foff:foff + n]
+            self._reparse_elf()
             return f"Undid INSERT of {n} bytes at offset 0x{foff:X}"
         elif op == ShiftOp.DELETE:
             self.buffer[foff:foff] = saved
+            self._reparse_elf()
             return f"Undid DELETE of {n} bytes at offset 0x{foff:X}"
         elif op == ShiftOp.PATCH:
             self.buffer[foff:foff + n] = saved
@@ -1408,9 +1970,24 @@ class ELFShiftEngine:
             'changes': changes, 'warnings': warnings,
         }
 
+    def _encode_absolute(self, ref: Reference):
+        """Encode ELF absolute reference (target_rva directly, no image_base)."""
+        if ref.size_bytes == 4:
+            self._write_int(ref.file_offset, ref.target_rva & 0xFFFFFFFF, 4)
+        elif ref.size_bytes == 8:
+            self._write_int(ref.file_offset, ref.target_rva, 8)
+
+    def _cascade_finalize(self, from_addr: int, expand: int):
+        """Update ELF section/program headers after cascade expansion."""
+        foff = self._vaddr_to_offset(from_addr)
+        if foff is None:
+            foff = 0
+        self._update_elf_headers(from_addr, expand, foff)
+
     def _recalculate_refs(self, insert_va: int, delta: int) -> Tuple[int, List[str]]:
         updated = 0
         warnings = []
+        relaxations = []
 
         for ref in self.ref_db.get_all():
             ref_moved = ref.ref_rva >= insert_va
@@ -1427,10 +2004,7 @@ class ELFShiftEngine:
                 if old_val != new_val:
                     if ref.size_bytes == 1:
                         if new_val < -128 or new_val > 127:
-                            warnings.append(
-                                f"SHORT BRANCH OVERFLOW @0x{ref.ref_rva:X}: "
-                                f"displacement {new_val:+d}"
-                            )
+                            relaxations.append((ref, new_foff, new_ref_va, new_target_va))
                             ref.ref_rva = new_ref_va
                             ref.target_rva = new_target_va
                             ref.file_offset = new_foff
@@ -1452,19 +2026,7 @@ class ELFShiftEngine:
             ref.file_offset = new_foff
 
         self.ref_db.rebuild_indices()
-        return updated, warnings
-
-    def _write_int(self, offset: int, value: int, size: int, signed: bool = False):
-        if offset < 0 or offset + size > len(self.buffer):
-            return
-        if signed:
-            fmt = {1: '<b', 2: '<h', 4: '<i', 8: '<q'}[size]
-        else:
-            fmt = {1: '<B', 2: '<H', 4: '<I', 8: '<Q'}[size]
-        try:
-            struct.pack_into(fmt, self.buffer, offset, value)
-        except struct.error:
-            pass
+        return self._run_relaxation_pass(relaxations, updated, warnings)
 
     def _update_elf_headers(self, vaddr: int, delta: int, foff: int) -> int:
         """
@@ -1576,6 +2138,364 @@ class ELFShiftEngine:
                     if sh_addr and sh_addr >= vaddr:
                         struct.pack_into('<I', self.buffer, sh_off + 12, sh_addr + delta)
                     adjusted += 1
+
+        return adjusted
+
+    def _update_elf_relocations(self, shift_va: int, delta: int) -> int:
+        """
+        Patch r_offset fields in ELF .rel/.rela sections after a shift.
+        Any relocation whose r_offset >= shift_va gets adjusted by delta.
+        Returns the number of relocation entries updated.
+        """
+        updated = 0
+        if self.is_64:
+            e_shoff = struct.unpack_from('<Q', self.buffer, 40)[0]
+            e_shentsize = struct.unpack_from('<H', self.buffer, 58)[0]
+            e_shnum = struct.unpack_from('<H', self.buffer, 60)[0]
+        else:
+            e_shoff = struct.unpack_from('<I', self.buffer, 32)[0]
+            e_shentsize = struct.unpack_from('<H', self.buffer, 46)[0]
+            e_shnum = struct.unpack_from('<H', self.buffer, 48)[0]
+
+        # SHT_REL=9, SHT_RELA=4
+        for i in range(e_shnum):
+            sh_off = e_shoff + i * e_shentsize
+            if sh_off + e_shentsize > len(self.buffer):
+                break
+            if self.is_64:
+                sh_type = struct.unpack_from('<I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from('<Q', self.buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from('<Q', self.buffer, sh_off + 32)[0]
+                sh_entsize = struct.unpack_from('<Q', self.buffer, sh_off + 56)[0]
+            else:
+                sh_type = struct.unpack_from('<I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from('<I', self.buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from('<I', self.buffer, sh_off + 20)[0]
+                sh_entsize = struct.unpack_from('<I', self.buffer, sh_off + 36)[0]
+
+            if sh_type not in (4, 9):  # SHT_RELA=4, SHT_REL=9
+                continue
+            if sh_entsize == 0:
+                continue
+
+            num_entries = sh_size // sh_entsize
+            for j in range(num_entries):
+                ent_off = sh_offset + j * sh_entsize
+                if ent_off + sh_entsize > len(self.buffer):
+                    break
+
+                if self.is_64:
+                    r_offset = struct.unpack_from('<Q', self.buffer, ent_off)[0]
+                    if r_offset >= shift_va:
+                        struct.pack_into('<Q', self.buffer, ent_off, r_offset + delta)
+                        updated += 1
+                else:
+                    r_offset = struct.unpack_from('<I', self.buffer, ent_off)[0]
+                    if r_offset >= shift_va:
+                        struct.pack_into('<I', self.buffer, ent_off, (r_offset + delta) & 0xFFFFFFFF)
+                        updated += 1
+
+        return updated
+
+
+# ─── Mach-O Shift Engine ─────────────────────────────────────────────────
+
+class MachOShiftEngine(BaseShiftEngine):
+    """
+    Applies insert/delete/patch operations on Mach-O binaries with reference recalculation.
+    """
+
+    def __init__(self, macho_path: str, ref_db: ReferenceDatabase):
+        super().__init__()
+        self.macho_path = macho_path
+        with open(macho_path, 'rb') as f:
+            self.buffer = bytearray(f.read())
+        self.ref_db = ref_db
+        self.finder = MachOReferenceFinder(macho_path)
+        self.is_64 = self.finder.is_64
+        self.image_base = self.finder.image_base
+        self.segments = self.finder.segments
+        self.sections = self.finder.sections
+        self.arch_offset = self.finder.arch_offset
+        self._undo_stack: List[Tuple[ShiftOp, int, int, bytes]] = []
+
+    def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
+        for seg in self.segments:
+            va = seg['vmaddr']
+            fo = seg['fileoff']
+            fs = seg['filesize']
+            if va <= vaddr < va + fs:
+                return vaddr - va + fo
+        return None
+
+    def _encode_absolute(self, ref: Reference):
+        """Encode Mach-O absolute reference (target_rva directly)."""
+        if ref.size_bytes == 4:
+            self._write_int(ref.file_offset, ref.target_rva & 0xFFFFFFFF, 4)
+        elif ref.size_bytes == 8:
+            self._write_int(ref.file_offset, ref.target_rva, 8)
+
+    def _cascade_finalize(self, from_addr: int, expand: int):
+        """Update Mach-O headers after cascade expansion."""
+        foff = self._vaddr_to_offset(from_addr)
+        if foff is None:
+            foff = 0
+        self._update_macho_headers(from_addr, expand, foff)
+
+    def insert_bytes(self, vaddr: int, data: bytes) -> ShiftResult:
+        N = len(data)
+        if N == 0:
+            return ShiftResult(ShiftOp.INSERT, vaddr, 0, 0, [], 0,
+                               len(self.buffer), True, "Nothing to insert")
+
+        insert_foff = self._vaddr_to_offset(vaddr)
+        if insert_foff is None:
+            return ShiftResult(ShiftOp.INSERT, vaddr, N, 0, [],
+                               0, len(self.buffer), False,
+                               f"VA 0x{vaddr:X} does not map to any segment")
+
+        self._undo_stack.append((ShiftOp.INSERT, insert_foff, N, b''))
+        self.buffer[insert_foff:insert_foff] = data
+
+        sections_adjusted = self._update_macho_headers(vaddr, N, insert_foff)
+        refs_updated, warnings = self._recalculate_refs(vaddr, N)
+
+        return ShiftResult(
+            ShiftOp.INSERT, vaddr, N, refs_updated, warnings,
+            sections_adjusted, len(self.buffer), True,
+            f"Inserted {N} bytes at VA 0x{vaddr:X}, updated {refs_updated} references"
+        )
+
+    def delete_bytes(self, vaddr: int, count: int) -> ShiftResult:
+        if count == 0:
+            return ShiftResult(ShiftOp.DELETE, vaddr, 0, 0, [], 0,
+                               len(self.buffer), True, "Nothing to delete")
+
+        foff = self._vaddr_to_offset(vaddr)
+        if foff is None:
+            return ShiftResult(ShiftOp.DELETE, vaddr, -count, 0, [],
+                               0, len(self.buffer), False,
+                               f"VA 0x{vaddr:X} does not map to any segment")
+
+        deleted = bytes(self.buffer[foff:foff + count])
+        self._undo_stack.append((ShiftOp.DELETE, foff, count, deleted))
+        del self.buffer[foff:foff + count]
+
+        sections_adjusted = self._update_macho_headers(vaddr, -count, foff)
+        refs_updated, warnings = self._recalculate_refs(vaddr, -count)
+
+        return ShiftResult(
+            ShiftOp.DELETE, vaddr, -count, refs_updated, warnings,
+            sections_adjusted, len(self.buffer), True,
+            f"Deleted {count} bytes at VA 0x{vaddr:X}, updated {refs_updated} references"
+        )
+
+    def patch_bytes(self, vaddr: int, data: bytes) -> ShiftResult:
+        N = len(data)
+        foff = self._vaddr_to_offset(vaddr)
+        if foff is None:
+            return ShiftResult(ShiftOp.PATCH, vaddr, 0, 0, [],
+                               0, len(self.buffer), False,
+                               f"VA 0x{vaddr:X} not found")
+        old = bytes(self.buffer[foff:foff + N])
+        self._undo_stack.append((ShiftOp.PATCH, foff, N, old))
+        self.buffer[foff:foff + N] = data
+        return ShiftResult(ShiftOp.PATCH, vaddr, 0, 0, [], 0,
+                           len(self.buffer), True,
+                           f"Patched {N} bytes at VA 0x{vaddr:X} (no shift)")
+
+    def insert_nop_sled(self, vaddr: int, count: int) -> ShiftResult:
+        return self.insert_bytes(vaddr, b'\x90' * count)
+
+    def undo(self) -> Optional[str]:
+        if not self._undo_stack:
+            return None
+        op, foff, n, saved = self._undo_stack.pop()
+        if op == ShiftOp.INSERT:
+            del self.buffer[foff:foff + n]
+            return f"Undid INSERT of {n} bytes at offset 0x{foff:X}"
+        elif op == ShiftOp.DELETE:
+            self.buffer[foff:foff] = saved
+            return f"Undid DELETE of {n} bytes at offset 0x{foff:X}"
+        elif op == ShiftOp.PATCH:
+            self.buffer[foff:foff + n] = saved
+            return f"Undid PATCH of {n} bytes at offset 0x{foff:X}"
+        return None
+
+    def save(self, output_path: str):
+        with open(output_path, 'wb') as f:
+            f.write(bytes(self.buffer))
+
+    def preview_insert(self, vaddr: int, size: int) -> Dict:
+        changes = []
+        warnings = []
+        for ref in self.ref_db.get_all():
+            ref_moved = ref.ref_rva >= vaddr
+            target_moved = ref.target_rva >= vaddr
+            new_ref_va = ref.ref_rva + (size if ref_moved else 0)
+            new_target_va = ref.target_rva + (size if target_moved else 0)
+
+            if ref.is_relative:
+                old_val = ref.target_rva - (ref.ref_rva + ref.insn_size)
+                new_val = new_target_va - (new_ref_va + ref.insn_size)
+                if old_val != new_val:
+                    changes.append(
+                        f"REF @0x{ref.ref_rva:X} → 0x{ref.target_rva:X}: "
+                        f"rel {old_val:+d} → {new_val:+d}"
+                    )
+                    if ref.size_bytes == 1 and (new_val < -128 or new_val > 127):
+                        warnings.append(f"⚠ SHORT BRANCH OVERFLOW at 0x{ref.ref_rva:X}")
+            else:
+                if target_moved:
+                    changes.append(
+                        f"REF @0x{ref.ref_rva:X}: abs 0x{ref.target_rva:X} → 0x{new_target_va:X}"
+                    )
+
+        return {
+            'operation': 'INSERT', 'vaddr': vaddr, 'size': size,
+            'total_refs': self.ref_db.count, 'refs_affected': len(changes),
+            'changes': changes, 'warnings': warnings,
+        }
+
+    def _recalculate_refs(self, insert_va: int, delta: int) -> Tuple[int, List[str]]:
+        updated = 0
+        warnings = []
+        relaxations = []
+
+        for ref in self.ref_db.get_all():
+            ref_moved = ref.ref_rva >= insert_va
+            target_moved = ref.target_rva >= insert_va
+
+            new_ref_va = ref.ref_rva + (delta if ref_moved else 0)
+            new_target_va = ref.target_rva + (delta if target_moved else 0)
+            new_foff = ref.file_offset + (delta if ref_moved else 0)
+
+            if ref.is_relative:
+                old_val = ref.target_rva - (ref.ref_rva + ref.insn_size)
+                new_val = new_target_va - (new_ref_va + ref.insn_size)
+
+                if old_val != new_val:
+                    if ref.size_bytes == 1:
+                        if new_val < -128 or new_val > 127:
+                            relaxations.append((ref, new_foff, new_ref_va, new_target_va))
+                            ref.ref_rva = new_ref_va
+                            ref.target_rva = new_target_va
+                            ref.file_offset = new_foff
+                            continue
+                        self._write_int(new_foff, new_val, 1, signed=True)
+                    elif ref.size_bytes == 4:
+                        self._write_int(new_foff, new_val, 4, signed=True)
+                    updated += 1
+            else:
+                if target_moved and ref.file_offset > 0:
+                    if ref.size_bytes == 4:
+                        self._write_int(new_foff, new_target_va & 0xFFFFFFFF, 4)
+                    elif ref.size_bytes == 8:
+                        self._write_int(new_foff, new_target_va, 8)
+                    updated += 1
+
+            ref.ref_rva = new_ref_va
+            ref.target_rva = new_target_va
+            ref.file_offset = new_foff
+
+        self.ref_db.rebuild_indices()
+        return self._run_relaxation_pass(relaxations, updated, warnings)
+
+    def _update_macho_headers(self, vaddr: int, delta: int, foff: int) -> int:
+        """Update Mach-O segment/section headers after insert/delete."""
+        adjusted = 0
+        base = self.arch_offset
+
+        if self.is_64:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            cmd_offset = base + 32
+        else:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            cmd_offset = base + 28
+
+        for _ in range(ncmds):
+            if cmd_offset + 8 > len(self.buffer):
+                break
+            cmd = struct.unpack_from('<I', self.buffer, cmd_offset)[0]
+            cmdsize = struct.unpack_from('<I', self.buffer, cmd_offset + 4)[0]
+            if cmdsize < 8:
+                break
+
+            if cmd == MachOReferenceFinder.LC_SEGMENT_64:
+                seg_vmaddr = struct.unpack_from('<Q', self.buffer, cmd_offset + 24)[0]
+                seg_vmsize = struct.unpack_from('<Q', self.buffer, cmd_offset + 32)[0]
+                seg_fileoff = struct.unpack_from('<Q', self.buffer, cmd_offset + 40)[0]
+                seg_filesize = struct.unpack_from('<Q', self.buffer, cmd_offset + 48)[0]
+                nsects = struct.unpack_from('<I', self.buffer, cmd_offset + 64)[0]
+
+                if seg_vmaddr <= vaddr < seg_vmaddr + seg_vmsize:
+                    struct.pack_into('<Q', self.buffer, cmd_offset + 32, seg_vmsize + delta)
+                    struct.pack_into('<Q', self.buffer, cmd_offset + 48, seg_filesize + delta)
+                    adjusted += 1
+                elif seg_fileoff > foff:
+                    struct.pack_into('<Q', self.buffer, cmd_offset + 40, seg_fileoff + delta)
+                    adjusted += 1
+
+                sec_off = cmd_offset + 72
+                for _ in range(nsects):
+                    if sec_off + 80 > len(self.buffer):
+                        break
+                    s_addr = struct.unpack_from('<Q', self.buffer, sec_off + 32)[0]
+                    s_size = struct.unpack_from('<Q', self.buffer, sec_off + 40)[0]
+                    s_offset = struct.unpack_from('<I', self.buffer, sec_off + 48)[0]
+
+                    if s_addr <= vaddr < s_addr + s_size:
+                        struct.pack_into('<Q', self.buffer, sec_off + 40, s_size + delta)
+                        adjusted += 1
+                    elif s_offset > foff:
+                        struct.pack_into('<I', self.buffer, sec_off + 48, s_offset + delta)
+                        if s_addr >= vaddr:
+                            struct.pack_into('<Q', self.buffer, sec_off + 32, s_addr + delta)
+                        adjusted += 1
+                    sec_off += 80
+
+            elif cmd == MachOReferenceFinder.LC_SEGMENT:
+                seg_vmaddr = struct.unpack_from('<I', self.buffer, cmd_offset + 24)[0]
+                seg_vmsize = struct.unpack_from('<I', self.buffer, cmd_offset + 28)[0]
+                seg_fileoff = struct.unpack_from('<I', self.buffer, cmd_offset + 32)[0]
+                seg_filesize = struct.unpack_from('<I', self.buffer, cmd_offset + 36)[0]
+                nsects = struct.unpack_from('<I', self.buffer, cmd_offset + 48)[0]
+
+                if seg_vmaddr <= vaddr < seg_vmaddr + seg_vmsize:
+                    struct.pack_into('<I', self.buffer, cmd_offset + 28, seg_vmsize + delta)
+                    struct.pack_into('<I', self.buffer, cmd_offset + 36, seg_filesize + delta)
+                    adjusted += 1
+                elif seg_fileoff > foff:
+                    struct.pack_into('<I', self.buffer, cmd_offset + 32, seg_fileoff + delta)
+                    adjusted += 1
+
+                sec_off = cmd_offset + 56
+                for _ in range(nsects):
+                    if sec_off + 68 > len(self.buffer):
+                        break
+                    s_addr = struct.unpack_from('<I', self.buffer, sec_off + 32)[0]
+                    s_size = struct.unpack_from('<I', self.buffer, sec_off + 36)[0]
+                    s_offset = struct.unpack_from('<I', self.buffer, sec_off + 40)[0]
+
+                    if s_addr <= vaddr < s_addr + s_size:
+                        struct.pack_into('<I', self.buffer, sec_off + 36, s_size + delta)
+                        adjusted += 1
+                    elif s_offset > foff:
+                        struct.pack_into('<I', self.buffer, sec_off + 40, s_offset + delta)
+                        if s_addr >= vaddr:
+                            struct.pack_into('<I', self.buffer, sec_off + 32, s_addr + delta)
+                        adjusted += 1
+                    sec_off += 68
+
+            cmd_offset += cmdsize
+
+        # Update in-memory segment list
+        for seg in self.segments:
+            if seg['vmaddr'] <= vaddr < seg['vmaddr'] + seg['vmsize']:
+                seg['vmsize'] += delta
+                seg['filesize'] += delta
+            elif seg['fileoff'] > foff:
+                seg['fileoff'] += delta
 
         return adjusted
 
@@ -1739,7 +2659,7 @@ class SymbolUpdater:
 
 # ─── Shift Engine ─────────────────────────────────────────────────────────
 
-class ShiftEngine:
+class ShiftEngine(BaseShiftEngine):
     """
     Applies insert/delete/patch operations with universal reference recalculation.
 
@@ -1752,6 +2672,7 @@ class ShiftEngine:
     """
 
     def __init__(self, pe_path: str, ref_db: ReferenceDatabase):
+        super().__init__()
         if pefile is None:
             raise ImportError("pefile is required")
         self.pe_path = pe_path
@@ -1764,6 +2685,22 @@ class ShiftEngine:
         self.file_alignment = self.pe.OPTIONAL_HEADER.FileAlignment
         self.section_alignment = self.pe.OPTIONAL_HEADER.SectionAlignment
         self._undo_stack: List[Tuple[ShiftOp, int, int, bytes]] = []
+
+    def _encode_absolute(self, ref: Reference):
+        """Encode PE absolute reference (target_rva + image_base)."""
+        new_abs = ref.target_rva + self.image_base
+        if ref.size_bytes == 4:
+            self._write_int(ref.file_offset, new_abs & 0xFFFFFFFF, 4)
+        elif ref.size_bytes == 8:
+            self._write_int(ref.file_offset, new_abs, 8)
+
+    def _cascade_finalize(self, from_addr: int, expand: int):
+        """Update PE section headers and PE headers after cascade expansion."""
+        foff = self._rva_to_offset(from_addr)
+        if foff is None:
+            foff = 0
+        self._update_sections_after_insert(from_addr, expand, foff)
+        self._update_pe_headers(from_addr, expand)
 
     def _rva_to_offset(self, rva: int) -> Optional[int]:
         for s in self.pe.sections:
@@ -1944,19 +2881,11 @@ class ShiftEngine:
 
     # ── Internal: Reference Recalculation ─────────────────────────────
 
-    # Mapping from short conditional branch opcodes (7x) to near conditional (0F 8x)
-    _SHORT_TO_NEAR_JCC = {
-        0x70: (0x0F, 0x80), 0x71: (0x0F, 0x81), 0x72: (0x0F, 0x82), 0x73: (0x0F, 0x83),
-        0x74: (0x0F, 0x84), 0x75: (0x0F, 0x85), 0x76: (0x0F, 0x86), 0x77: (0x0F, 0x87),
-        0x78: (0x0F, 0x88), 0x79: (0x0F, 0x89), 0x7A: (0x0F, 0x8A), 0x7B: (0x0F, 0x8B),
-        0x7C: (0x0F, 0x8C), 0x7D: (0x0F, 0x8D), 0x7E: (0x0F, 0x8E), 0x7F: (0x0F, 0x8F),
-    }
-
     def _recalculate_refs(self, insert_rva: int, delta: int) -> Tuple[int, List[str]]:
         """Recalculate all references after a shift at insert_rva by delta bytes."""
         updated = 0
         warnings = []
-        relaxations = []  # (ref, new_foff, new_ref_rva, new_target_rva) for deferred relaxation
+        relaxations = []
 
         for ref in self.ref_db.get_all():
             ref_moved = ref.ref_rva >= insert_rva
@@ -1971,12 +2900,9 @@ class ShiftEngine:
                 new_val = new_target_rva - (new_ref_rva + ref.insn_size)
 
                 if old_val != new_val:
-                    # Check for short branch overflow
                     if ref.size_bytes == 1:
                         if new_val < -128 or new_val > 127:
-                            # Queue for relaxation instead of skipping
                             relaxations.append((ref, new_foff, new_ref_rva, new_target_rva))
-                            # Still update the record positions
                             ref.ref_rva = new_ref_rva
                             ref.target_rva = new_target_rva
                             ref.file_offset = new_foff
@@ -1988,7 +2914,7 @@ class ShiftEngine:
                         self._write_int(new_foff, new_val, 4, signed=True)
                     updated += 1
             else:
-                if target_moved:
+                if target_moved and ref.file_offset > 0:
                     new_abs = new_target_rva + self.image_base
                     if ref.size_bytes == 4:
                         self._write_int(new_foff, new_abs & 0xFFFFFFFF, 4)
@@ -1996,148 +2922,12 @@ class ShiftEngine:
                         self._write_int(new_foff, new_abs, 8)
                     updated += 1
 
-            # Update the reference record
             ref.ref_rva = new_ref_rva
             ref.target_rva = new_target_rva
             ref.file_offset = new_foff
 
         self.ref_db.rebuild_indices()
-
-        # ── Short Branch Relaxation Pass ──
-        # Upgrade overflowed rel8 branches to rel32 (EB→E9, 7x→0F 8x)
-        # Each relaxation inserts 3-4 bytes, which may cascade. We process
-        # from highest RVA to lowest to minimize cascading re-adjustments.
-        if relaxations:
-            relaxations.sort(key=lambda x: x[2], reverse=True)  # highest RVA first
-            for ref, foff, ref_rva, target_rva in relaxations:
-                result = self._relax_short_branch(ref)
-                if result:
-                    updated += 1
-                    warnings.append(
-                        f"RELAXED short→near @0x{ref_rva:X}: "
-                        f"{ref.ref_type.value} (auto-upgraded)"
-                    )
-                else:
-                    warnings.append(
-                        f"SHORT BRANCH OVERFLOW @0x{ref_rva:X}: "
-                        f"could not auto-relax (type={ref.ref_type.value})"
-                    )
-
-        return updated, warnings
-
-    def _relax_short_branch(self, ref: Reference) -> bool:
-        """
-        Upgrade a short branch (2 bytes) to a near branch (5-6 bytes).
-
-        EB rel8 (JMP short)  → E9 rel32 (JMP near)     : +3 bytes
-        7x rel8 (Jcc short)  → 0F 8x rel32 (Jcc near)  : +4 bytes
-
-        Returns True if relaxation succeeded.
-        """
-        insn_foff = ref.file_offset - 1  # file_offset points to disp byte, opcode is 1 before
-        if insn_foff < 0 or insn_foff + 2 > len(self.buffer):
-            return False
-
-        opcode = self.buffer[insn_foff]
-
-        if ref.ref_type == RefType.REL_JUMP_SHORT and opcode == 0xEB:
-            # EB rel8 → E9 rel32 (expand by 3 bytes)
-            expand = 3
-            new_insn_size = 5
-            # New displacement: target_rva - (ref_rva + 5)
-            new_disp = ref.target_rva - (ref.ref_rva + new_insn_size)
-            new_bytes = bytes([0xE9]) + struct.pack('<i', new_disp)
-
-            # Replace the 2-byte instruction with 5-byte version
-            self.buffer[insn_foff:insn_foff + 2] = new_bytes
-
-            # Update ref record
-            ref.ref_type = RefType.REL_JUMP_NEAR
-            ref.size_bytes = 4
-            ref.insn_size = 5
-            ref.file_offset = insn_foff + 1  # disp starts at byte 1
-
-            # Now shift everything after by +3 bytes
-            self._cascade_shift(ref.ref_rva + 2, expand)  # old end was ref_rva+2
-            return True
-
-        elif ref.ref_type == RefType.REL_COND_SHORT and opcode in self._SHORT_TO_NEAR_JCC:
-            # 7x rel8 → 0F 8x rel32 (expand by 4 bytes)
-            expand = 4
-            new_insn_size = 6
-            near_op = self._SHORT_TO_NEAR_JCC[opcode]
-            new_disp = ref.target_rva - (ref.ref_rva + new_insn_size)
-            new_bytes = bytes([near_op[0], near_op[1]]) + struct.pack('<i', new_disp)
-
-            # Replace the 2-byte instruction with 6-byte version
-            self.buffer[insn_foff:insn_foff + 2] = new_bytes
-
-            # Update ref record
-            ref.ref_type = RefType.REL_COND_NEAR
-            ref.size_bytes = 4
-            ref.insn_size = 6
-            ref.file_offset = insn_foff + 2  # disp starts at byte 2
-
-            # Shift everything after by +4 bytes
-            self._cascade_shift(ref.ref_rva + 2, expand)
-            return True
-
-        return False
-
-    def _cascade_shift(self, from_rva: int, expand: int):
-        """
-        After a branch relaxation expands an instruction, shift all refs
-        that are after from_rva by expand bytes and update their encoded values.
-        This is a mini version of _recalculate_refs for the cascade.
-        """
-        # Find the file offset for from_rva to update section headers
-        foff = self._rva_to_offset(from_rva)
-        if foff is None:
-            foff = 0  # fallback
-
-        for ref in self.ref_db.get_all():
-            if ref.ref_rva >= from_rva:
-                ref.ref_rva += expand
-                ref.file_offset += expand
-            if ref.target_rva >= from_rva:
-                ref.target_rva += expand
-
-            # Re-encode the reference with updated positions
-            if ref.is_relative:
-                new_val = ref.target_rva - (ref.ref_rva + ref.insn_size)
-                if ref.size_bytes == 1:
-                    if -128 <= new_val <= 127:
-                        self._write_int(ref.file_offset, new_val, 1, signed=True)
-                elif ref.size_bytes == 2:
-                    self._write_int(ref.file_offset, new_val, 2, signed=True)
-                elif ref.size_bytes == 4:
-                    self._write_int(ref.file_offset, new_val, 4, signed=True)
-            else:
-                # Absolute refs whose target moved
-                if ref.target_rva - expand >= from_rva:  # target was shifted
-                    new_abs = ref.target_rva + self.image_base
-                    if ref.size_bytes == 4:
-                        self._write_int(ref.file_offset, new_abs & 0xFFFFFFFF, 4)
-                    elif ref.size_bytes == 8:
-                        self._write_int(ref.file_offset, new_abs, 8)
-
-        self.ref_db.rebuild_indices()
-
-        # Update section headers and PE headers for the expansion
-        self._update_sections_after_insert(from_rva, expand, foff)
-        self._update_pe_headers(from_rva, expand)
-
-    def _write_int(self, offset: int, value: int, size: int, signed: bool = False):
-        if offset < 0 or offset + size > len(self.buffer):
-            return
-        if signed:
-            fmt = {1: '<b', 2: '<h', 4: '<i', 8: '<q'}[size]
-        else:
-            fmt = {1: '<B', 2: '<H', 4: '<I', 8: '<Q'}[size]
-        try:
-            struct.pack_into(fmt, self.buffer, offset, value)
-        except struct.error:
-            pass
+        return self._run_relaxation_pass(relaxations, updated, warnings)
 
     # ── Internal: Section Header Updates ──────────────────────────────
 
@@ -2401,6 +3191,15 @@ class UBRTEngine:
             return 'pe'
         if magic[:4] == b'\x7fELF':
             return 'elf'
+        # Mach-O: little-endian magic
+        if len(magic) >= 4:
+            m32 = struct.unpack_from('<I', magic, 0)[0]
+            if m32 in (0xFEEDFACE, 0xFEEDFACF):
+                return 'macho'
+            # Fat/universal binary (big-endian magic)
+            m32_be = struct.unpack_from('>I', magic, 0)[0]
+            if m32_be == 0xCAFEBABE:
+                return 'macho'
         return 'unknown'
 
     def load(self, pe_path: str, callback=None) -> Dict:
@@ -2415,8 +3214,10 @@ class UBRTEngine:
             return self._load_elf(pe_path, callback)
         elif self.binary_format == 'pe':
             return self._load_pe(pe_path, callback)
+        elif self.binary_format == 'macho':
+            return self._load_macho(pe_path, callback)
         else:
-            return {'success': False, 'error': 'Unknown binary format (expected PE or ELF)'}
+            return {'success': False, 'error': 'Unknown binary format (expected PE, ELF, or Mach-O)'}
 
     def _load_pe(self, pe_path: str, callback=None) -> Dict:
         """Load a PE binary and analyze all references."""
@@ -2482,6 +3283,43 @@ class UBRTEngine:
                     'is_code': bool(sec.header['sh_flags'] & 0x4),
                     'is_data': bool(sec.header['sh_flags'] & 0x1),
                     'is_writable': bool(sec.header['sh_flags'] & 0x1),
+                })
+            finder.close()
+            return {
+                'success': True,
+                'refs_found': self.ref_db.count,
+                'stats': self.ref_db.stats(),
+                'pe_info': self.pe_info,
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def _load_macho(self, macho_path: str, callback=None) -> Dict:
+        """Load a Mach-O binary and analyze all references."""
+        try:
+            finder = MachOReferenceFinder(macho_path)
+            self.ref_db = finder.find_all(callback=callback)
+            self.shift_engine = MachOShiftEngine(macho_path, self.ref_db)
+            self.pe_info = {
+                'path': macho_path,
+                'format': 'macho',
+                'size': os.path.getsize(macho_path),
+                'image_base': finder.image_base,
+                'is_64': finder.is_64,
+                'is_fat': finder.is_fat,
+                'sections': [],
+                'entry_point': 0,
+            }
+            for sec in finder.sections:
+                self.pe_info['sections'].append({
+                    'name': sec['name'],
+                    'rva': sec['addr'],
+                    'vsize': sec['size'],
+                    'raw_size': sec['size'],
+                    'raw_offset': sec['offset'],
+                    'is_code': sec['is_code'],
+                    'is_data': not sec['is_code'],
+                    'is_writable': False,
                 })
             finder.close()
             return {
