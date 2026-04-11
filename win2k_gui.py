@@ -5565,8 +5565,6 @@ class _DetachedTabWindow(tk.Toplevel):
         self.configure(bg=T["bg"])
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Keep on top initially so user sees it
-        self.transient("")
         self.lift()
 
         self.columnconfigure(0, weight=1)
@@ -5577,14 +5575,14 @@ class _DetachedTabWindow(tk.Toplevel):
         toolbar.grid(row=0, column=0, sticky="ew", padx=6)
 
         tk.Button(toolbar, text="\u2795 Pull Tab",
-                  bg=T["button"], fg=T["fg"],
+                  bg=T["btn_bg"], fg=T["fg"],
                   activebackground=T["accent"], activeforeground="#fff",
                   relief="flat", bd=1, padx=8, pady=3,
                   font=("Segoe UI", 9),
                   command=self._pull_tab_menu).pack(side="left", padx=4)
 
         tk.Button(toolbar, text="\u21A9 Return All to Main",
-                  bg=T["button"], fg=T["fg"],
+                  bg=T["btn_bg"], fg=T["fg"],
                   activebackground=T["accent"], activeforeground="#fff",
                   relief="flat", bd=1, padx=8, pady=3,
                   font=("Segoe UI", 9),
