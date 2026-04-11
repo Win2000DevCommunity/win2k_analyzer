@@ -5568,9 +5568,9 @@ class _DetachedTabWindow(tk.Toplevel):
         self.lift()
 
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
 
-        # ── Toolbar ──
+        # ── Row 0: Toolbar (window management) ──
         toolbar = tk.Frame(self, bg=T["bg"], pady=4)
         toolbar.grid(row=0, column=0, sticky="ew", padx=6)
 
@@ -5596,9 +5596,51 @@ class _DetachedTabWindow(tk.Toplevel):
             font=("Segoe UI", 9))
         self._title_lbl.pack(side="left", padx=4)
 
-        # ── Notebook for tabs in this window ──
+        # ── Row 1: Debugger control buttons ──
+        ctrl = tk.Frame(self, bg=T["bg_light"], pady=3)
+        ctrl.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 2))
+        d = self._dtab  # shortcut to KernelDebuggerTab
+
+        _btn_cfg = dict(bg=T["btn_bg"], fg=T["fg"],
+                        activebackground=T["btn_active"],
+                        activeforeground=T["fg"],
+                        relief="flat", bd=1, padx=6, pady=2,
+                        font=("Segoe UI", 9))
+
+        tk.Button(ctrl, text="\u25B6 Run",
+                  command=d._run, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="\u23F8 Run+Break",
+                  command=d._run_break, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="\u23ED Step",
+                  command=d._step, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="\u25B6\u25B6 Continue",
+                  command=d._continue, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="\u25B6 Run Until BP",
+                  command=d._run_until_bp, **_btn_cfg).pack(side="left", padx=2)
+
+        tk.Frame(ctrl, bg=T["separator"], width=2).pack(
+            side="left", padx=6, fill="y", pady=2)
+
+        tk.Button(ctrl, text="\U0001F6D1 Set BP",
+                  command=d._add_breakpoint, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="List BPs",
+                  command=d._list_breakpoints, **_btn_cfg).pack(side="left", padx=2)
+
+        tk.Frame(ctrl, bg=T["separator"], width=2).pack(
+            side="left", padx=6, fill="y", pady=2)
+
+        tk.Button(ctrl, text="Registers",
+                  command=d._show_regs, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="Call Stack",
+                  command=d._show_callstack, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="Stack",
+                  command=d._show_stack_mem, **_btn_cfg).pack(side="left", padx=2)
+        tk.Button(ctrl, text="Disassemble",
+                  command=d._disassemble, **_btn_cfg).pack(side="left", padx=2)
+
+        # ── Row 2: Notebook for tabs in this window ──
         self._nb = ttk.Notebook(self)
-        self._nb.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self._nb.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._nb.bind("<Button-3>", self._tab_context)
         self._ctx = tk.Menu(self._nb, tearoff=0)
         self._ctx.add_command(label="Return to Main Window",
