@@ -564,6 +564,12 @@ def _configure_output_tags(txt):
     txt.tag_configure("dim",     foreground=T["fg_dim"])
     txt.tag_configure("peach",   foreground=T["peach"])
     txt.tag_configure("heading", foreground=T["accent"], font=("Consolas", 10, "bold"))
+    # Trace coloring tags
+    txt.tag_configure("reg_name", foreground="#4EC9B0", font=("Consolas", 10, "bold"))
+    txt.tag_configure("reg_val",  foreground="#B5CEA8")
+    txt.tag_configure("addr",     foreground="#D7BA7D")
+    txt.tag_configure("sym_name", foreground="#DCDCAA")
+    txt.tag_configure("bp_hit",   foreground="#F44747", font=("Consolas", 11, "bold"))
 
 
 class TabbedOutput(ttk.Frame):
@@ -1527,20 +1533,29 @@ class StructTab(ttk.Frame):
         self.app = app
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
+        self._pdb_info = None
 
         top = tk.Frame(self, bg=T["bg"])
         top.grid(row=0, column=0, sticky="ew", padx=12, pady=8)
 
+        ttk.Button(top, text="\U0001F4C2 Load PDB", style="Accent.TButton",
+                   command=self._load_pdb).pack(side="left", padx=5)
+
         ttk.Label(top, text="Structure:").pack(side="left", padx=5)
         self.struct_var = tk.StringVar()
-        cb = ttk.Combobox(top, textvariable=self.struct_var,
-                          values=_struct_analyzer().list_known_structures(), state="readonly",
+        self._combo = ttk.Combobox(top, textvariable=self.struct_var,
+                          values=[], state="readonly",
                           width=32, font=("Consolas", 10))
-        cb.pack(side="left", padx=5)
-        if _struct_analyzer().list_known_structures():
-            cb.current(0)
+        self._combo.pack(side="left", padx=5)
 
-        ttk.Button(top, text="\U0001F9E9  View Layout", style="Accent.TButton",
+        ttk.Label(top, text="Filter:").pack(side="left", padx=5)
+        self._filter_var = tk.StringVar()
+        self._filter_var.trace_add("write", self._apply_filter)
+        self._filter_entry = ttk.Entry(top, textvariable=self._filter_var,
+                                       width=20, font=("Consolas", 10))
+        self._filter_entry.pack(side="left", padx=3)
+
+        ttk.Button(top, text="\U0001F9E9  View Layout",
                    command=self._show).pack(side="left", padx=5)
         ttk.Button(top, text="\U0001F4C4  Generate C Header",
                    command=self._gen_header).pack(side="left", padx=5)
@@ -1548,16 +1563,46 @@ class StructTab(ttk.Frame):
                    command=self._export_all).pack(side="left", padx=5)
 
         self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
-            self, "\u2022 Select an NT kernel/user structure to inspect", row=1)
+            self, "\u2022 Load a PDB file to inspect NT kernel structures", row=1)
 
         self.output = TabbedOutput(self)
         self.output.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
+        self._all_struct_names = []
+
+    def _load_pdb(self):
+        path = filedialog.askopenfilename(
+            title="Select PDB file",
+            filetypes=[("PDB files", "*.pdb"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self._pdb_info = _struct_analyzer().load_pdb(path)
+            self._all_struct_names = self._pdb_info.list_structures()
+            self._combo["values"] = self._all_struct_names
+            if self._all_struct_names:
+                self._combo.current(0)
+            self._filter_var.set("")
+            self.status_var.set(
+                f"\u2705 Loaded {os.path.basename(path)}: "
+                f"{len(self._all_struct_names)} structures")
+        except Exception as e:
+            messagebox.showerror("PDB Load Error", str(e))
+
+    def _apply_filter(self, *_args):
+        filt = self._filter_var.get().upper()
+        if not filt:
+            self._combo["values"] = self._all_struct_names
+        else:
+            self._combo["values"] = [n for n in self._all_struct_names if filt in n.upper()]
+        if self._combo["values"]:
+            self._combo.current(0)
+
     def _show(self):
         name = self.struct_var.get()
-        if not name:
+        if not name or not self._pdb_info:
             return
-        s = _struct_analyzer().get_known_structure(name)
+        s = self._pdb_info.get_structure(name)
         if not s:
             return
         self.output.new_tab("Structures")
@@ -1574,9 +1619,9 @@ class StructTab(ttk.Frame):
 
     def _gen_header(self):
         name = self.struct_var.get()
-        if not name:
+        if not name or not self._pdb_info:
             return
-        s = _struct_analyzer().get_known_structure(name)
+        s = self._pdb_info.get_structure(name)
         if not s:
             return
         self.output.new_tab("Header Gen")
@@ -1587,7 +1632,7 @@ class StructTab(ttk.Frame):
     def _export_all(self):
         d = filedialog.askdirectory(title="Select output directory for .h files")
         if d:
-            files = _struct_analyzer().save_all_headers(d)
+            files = _struct_analyzer().save_all_headers(d, self._pdb_info)
             self.status_var.set(f"\U0001F4BE Exported {len(files)} header files to {d}")
             messagebox.showinfo("Done", f"Generated {len(files)} header files:\n" +
                                 "\n".join(os.path.basename(f) for f in files))
@@ -3452,8 +3497,6 @@ class CompatAnalyzerTab(ttk.Frame):
                    command=self._analyze_both).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F50D  Analyze Single PE",
                    command=self._analyze_single).pack(side="left", padx=5)
-        ttk.Button(btn_frm, text="\U0001F4D6  Known Differences",
-                   command=self._show_known).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F6A8  Bugcheck Lookup",
                    command=self._bugcheck).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F4BE  Save Report",
@@ -3539,28 +3582,6 @@ class CompatAnalyzerTab(ttk.Frame):
             self.status_var.set("\u2705 Done")
 
         run_with_progress(self, work, done)
-
-    def _show_known(self):
-        self.output.new_tab("Known APIs")
-        diffs = _compat().get_known_differences()
-        output_write(self.output, "KNOWN NT 5.0 \u2192 5.1 DIFFERENCES\n", "title")
-        output_write(self.output, "\n\u2500\u2500 Calling Convention Changes \u2500\u2500\n", "heading")
-        for name, info in diffs['calling_convention_changes'].items():
-            output_write(self.output, f"  {name}: {info['from']} \u2192 {info['to']}\n", "warn")
-        output_write(self.output, "\n\u2500\u2500 HAL Dispatch Removed Defines \u2500\u2500\n", "heading")
-        for name, routing in diffs['hal_dispatch_removed_defines'].items():
-            output_write(self.output, f"  {name}: routed through {routing}\n", "error")
-        output_write(self.output, "\n\u2500\u2500 Macro Differences \u2500\u2500\n", "heading")
-        for name, info in diffs['macro_differences'].items():
-            output_write(self.output, f"  {name}: {info['desc']}\n", "peach")
-        output_write(self.output, "\n\u2500\u2500 HAL Functions Removed in XP \u2500\u2500\n", "heading")
-        for name in diffs['hal_functions_removed']:
-            output_write(self.output, f"  {name}\n", "error")
-        output_write(self.output, "\n\u2500\u2500 Bugcheck Codes \u2500\u2500\n", "heading")
-        for code, info in diffs['compat_bugchecks'].items():
-            output_write(self.output, f"  0x{code:08X} {info['name']}\n", "warn")
-            output_write(self.output, f"    {info['compat_hint']}\n", "dim")
-        self.status_var.set("\u2705 Showing known differences")
 
     def _bugcheck(self):
         from tkinter.simpledialog import askstring
@@ -5210,7 +5231,7 @@ class DisassemblyView(tk.Frame):
         # Gutter (breakpoints + line numbers)
         self._gutter = tk.Text(
             self, width=8, bg=T["bg"], fg="#888888",
-            font=("Consolas", 10), relief="flat", bd=4,
+            font=("Consolas", 10), relief="flat", bd=8,
             cursor="hand2", state="disabled",
             wrap="none", highlightthickness=0,
             selectbackground=T["bg"], selectforeground="#888888",
@@ -5264,6 +5285,9 @@ class DisassemblyView(tk.Frame):
                                     font=("Consolas", 10, "bold"))
         self._gutter.tag_configure("linenum", foreground="#555555")
         self._gutter.tag_configure("exec_mark", foreground="#4EC9B0")
+        # Match text widget's func_header line height in gutter
+        self._gutter.tag_configure("gutter_header",
+                                    font=("Consolas", 11, "bold"))
 
         # Bind click on gutter
         self._gutter.bind("<Button-1>", self._on_gutter_click)
@@ -5274,16 +5298,21 @@ class DisassemblyView(tk.Frame):
 
     def _on_scroll(self, *args):
         self._text.yview(*args)
-        self._gutter.yview(*args)
+        # Gutter follows via _sync_scroll (text's yscrollcommand)
 
     def _sync_scroll(self, first, last):
         self._sb.set(first, last)
         self._gutter.yview_moveto(first)
+        # Line-level correction for any sub-pixel rounding
+        tt = int(self._text.index("@0,0").split('.')[0])
+        gt = int(self._gutter.index("@0,0").split('.')[0])
+        if tt != gt:
+            self._gutter.yview_scroll(tt - gt, "units")
 
     def _on_mousewheel(self, event):
         delta = -1 * (event.delta // 120)
         self._text.yview_scroll(delta, "units")
-        self._gutter.yview_scroll(delta, "units")
+        # Gutter follows via _sync_scroll (text's yscrollcommand)
         return "break"
 
     def load_functions(self, functions: list):
@@ -5313,7 +5342,7 @@ class DisassemblyView(tk.Frame):
             line_num += 1
             header = f"  {func['module']}!{func['name']}  (0x{func['address']:08X})\n"
             self._text.insert("end", header, "func_header")
-            self._gutter.insert("end", "\n")
+            self._gutter.insert("end", " \n", "gutter_header")
 
             # Instructions
             for insn in func['instructions']:
@@ -5402,8 +5431,11 @@ class DisassemblyView(tk.Frame):
         self._refresh_breakpoint_markers()
         self._refresh_line_highlights()
 
+        # Sync breakpoint markers across all views (main + detached)
+        self._dtab._sync_all_breakpoint_markers()
+
         # Update status
-        bp_count = len(self._bp_lines)
+        bp_count = len(dbg.list_breakpoints()) if dbg else len(self._bp_lines)
         self._dtab.status_var.set(
             f"\U0001F6D1 {bp_count} breakpoint{'s' if bp_count != 1 else ''} set")
 
@@ -6182,9 +6214,7 @@ class KernelDebuggerTab(ttk.Frame):
         self.output.write_to_tab(tab, "\n")
 
     def _update_disasm_execution(self, result):
-        """Update disassembly view with execution path highlighting."""
-        if not self._disasm_view:
-            return
+        """Update all disassembly views with execution path highlighting."""
         visited = None
         if isinstance(result, dict):
             visited = result.get("visited_addresses")
@@ -6192,10 +6222,11 @@ class KernelDebuggerTab(ttk.Frame):
             # Fallback: read directly from debug session
             visited = set(self._dbg._block_hits.keys()) if hasattr(self._dbg, '_block_hits') else None
         if visited:
-            try:
-                self._disasm_view.mark_executed(visited)
-            except Exception:
-                pass
+            for dv in self._iter_all_disasm_views():
+                try:
+                    dv.mark_executed(visited)
+                except Exception:
+                    pass
 
     # ── arg presets (dynamic) ─────────────────────────────────────────────
     #
@@ -6498,13 +6529,57 @@ class KernelDebuggerTab(ttk.Frame):
         return False
 
     def _update_disasm_eip(self):
-        """Update EIP marker in disassembly view if one is open."""
-        if self._disasm_view and self._dbg:
+        """Update EIP marker in all disassembly views (main + detached)."""
+        if not self._dbg:
+            return
+        try:
+            regs = self._dbg.inspect_registers()
+            eip = regs['eip']
+        except Exception:
+            return
+        for dv in self._iter_all_disasm_views():
             try:
-                regs = self._dbg.inspect_registers()
-                self._disasm_view.update_eip(regs['eip'])
+                dv.update_eip(eip)
             except Exception:
                 pass
+
+    def _iter_all_disasm_views(self):
+        """Yield every DisassemblyView: main window + all detached windows."""
+        if self._disasm_view:
+            yield self._disasm_view
+        for win in getattr(self, '_detached_windows', []):
+            try:
+                if not win.winfo_exists():
+                    continue
+            except Exception:
+                continue
+            for w in win._tabs.values():
+                if isinstance(w, DisassemblyView):
+                    yield w
+
+    def _sync_all_breakpoint_markers(self):
+        """Refresh breakpoint markers on every DisassemblyView."""
+        for dv in self._iter_all_disasm_views():
+            try:
+                dv._refresh_breakpoint_markers()
+                dv._refresh_line_highlights()
+            except Exception:
+                pass
+
+    def _write_colored_regs(self, tab, regs):
+        """Write register dump with per-register coloring to trace tab."""
+        pairs = [
+            ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
+            ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
+            ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
+            ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
+            ("EIP", regs.get("eip", 0)),
+        ]
+        for name, val in pairs:
+            self.output.write_to_tab(tab, f"  {name}", "reg_name")
+            self.output.write_to_tab(tab, "=")
+            self.output.write_to_tab(tab, f"0x{val:08X}", "reg_val")
+        self.output.write_to_tab(tab, "\n")
 
     # ── load / unload ─────────────────────────────────────────────────────
 
@@ -6724,16 +6799,10 @@ class KernelDebuggerTab(ttk.Frame):
                 eip = regs['eip']
                 eip_name = regs.get('eip_name', f'0x{eip:08X}')
                 self.output.write_to_tab(trace_tab,
-                    f"  \u23F8 PAUSED at {eip_name}\n\n", "title")
-                pairs = [
-                    ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
-                    ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
-                    ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
-                    ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
-                    ("EIP", regs.get("eip", 0)),
-                ]
-                reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
-                self.output.write_to_tab(trace_tab, reg_line + "\n", "ok")
+                    "  \u23F8 PAUSED at ", "bp_hit")
+                self.output.write_to_tab(trace_tab,
+                    f"{eip_name}\n\n", "addr")
+                self._write_colored_regs(trace_tab, regs)
                 self.status_var.set(
                     f"\u23F8 Paused at {eip_name} \u2014 use Step / Continue")
                 self._update_disasm_eip()
@@ -6771,10 +6840,13 @@ class KernelDebuggerTab(ttk.Frame):
             return
         eip = result['eip']
         eip_name = result.get('eip_name', f'0x{eip:08X}')
-        self.output.write_to_tab(trace_tab,
-            f"  \u25B6 0x{eip:08X}  {eip_name}\n")
+        self.output.write_to_tab(trace_tab, "  \u25B6 ", "dim")
+        self.output.write_to_tab(trace_tab, f"0x{eip:08X}", "addr")
+        self.output.write_to_tab(trace_tab, "  ")
+        self.output.write_to_tab(trace_tab, f"{eip_name}\n", "sym_name")
         self.status_var.set(f"\u23F8 Step: {eip_name}")
         self._update_disasm_eip()
+        self._update_disasm_execution(result)
 
     def _continue(self):
         kdbg = _kdbg()
@@ -6803,17 +6875,10 @@ class KernelDebuggerTab(ttk.Frame):
                 eip = regs['eip']
                 eip_name = regs.get('eip_name', f'0x{eip:08X}')
                 self.output.write_to_tab(trace_tab,
-                    f"\n  \u23F8 Breakpoint at {eip_name}\n", "title")
-                # Write registers to trace tab
-                pairs = [
-                    ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
-                    ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
-                    ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
-                    ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
-                    ("EIP", regs.get("eip", 0)),
-                ]
-                reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
-                self.output.write_to_tab(trace_tab, reg_line + "\n", "ok")
+                    "\n  \u23F8 Breakpoint at ", "bp_hit")
+                self.output.write_to_tab(trace_tab,
+                    f"{eip_name}\n", "addr")
+                self._write_colored_regs(trace_tab, regs)
                 self.status_var.set(f"\u23F8 Paused at {eip_name}")
                 self._update_disasm_eip()
                 self._update_disasm_execution(result)
@@ -6867,25 +6932,19 @@ class KernelDebuggerTab(ttk.Frame):
                     eip = regs['eip']
                     eip_name = regs.get('eip_name', f'0x{eip:08X}')
                     self.output.write_to_tab(tab,
-                        f"  \u23F8 BREAKPOINT HIT at {eip_name}\n\n", "title")
-                    pairs = [
-                        ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
-                        ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
-                        ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
-                        ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
-                        ("EIP", regs.get("eip", 0)),
-                    ]
-                    reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
-                    self.output.write_to_tab(tab, reg_line + "\n", "ok")
+                        "  \u23F8 BREAKPOINT HIT at ", "bp_hit")
+                    self.output.write_to_tab(tab,
+                        f"{eip_name}\n\n", "addr")
+                    self._write_colored_regs(tab, regs)
                     self.status_var.set(
                         f"\u23F8 Paused at {eip_name} \u2014 use Step / Run Until BP")
                     self._update_disasm_eip()
                     self._update_disasm_execution(result)
                 else:
-                    # Function completed — clear EIP arrow in disassembly
-                    if self._disasm_view:
+                    # Function completed — clear EIP arrow in all disassembly views
+                    for dv in self._iter_all_disasm_views():
                         try:
-                            self._disasm_view.clear_eip()
+                            dv.clear_eip()
                         except Exception:
                             pass
                     retval = result.get("return_value", 0) if isinstance(result, dict) else 0
@@ -6944,16 +7003,10 @@ class KernelDebuggerTab(ttk.Frame):
                 eip = regs['eip']
                 eip_name = regs.get('eip_name', f'0x{eip:08X}')
                 self.output.write_to_tab(trace_tab,
-                    f"  \u23F8 BREAKPOINT HIT at {eip_name}\n\n", "title")
-                pairs = [
-                    ("EAX", regs.get("eax", 0)), ("EBX", regs.get("ebx", 0)),
-                    ("ECX", regs.get("ecx", 0)), ("EDX", regs.get("edx", 0)),
-                    ("ESI", regs.get("esi", 0)), ("EDI", regs.get("edi", 0)),
-                    ("EBP", regs.get("ebp", 0)), ("ESP", regs.get("esp", 0)),
-                    ("EIP", regs.get("eip", 0)),
-                ]
-                reg_line = "".join(f"  {n}=0x{v:08X}" for n, v in pairs)
-                self.output.write_to_tab(trace_tab, reg_line + "\n", "ok")
+                    "  \u23F8 BREAKPOINT HIT at ", "bp_hit")
+                self.output.write_to_tab(trace_tab,
+                    f"{eip_name}\n\n", "addr")
+                self._write_colored_regs(trace_tab, regs)
                 self.status_var.set(
                     f"\u23F8 Paused at {eip_name} \u2014 use Step / Continue")
                 self._update_disasm_eip()

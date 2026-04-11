@@ -26,6 +26,7 @@ from nt_analyzer.comparator import (
     compare_exports, compare_imports, compare_pe_headers, full_comparison, print_comparison_summary
 )
 from nt_analyzer.struct_analyzer import (
+    load_pdb, PDBTypeInfo,
     get_known_structure, list_known_structures, generate_c_header, save_all_headers
 )
 from nt_analyzer.def_generator import generate_def_file
@@ -57,7 +58,7 @@ from nt_analyzer.deep_analyzer import (
     get_function_dependencies, format_dependencies
 )
 from nt_analyzer.compat_analyzer import (
-    compare_compat, analyze_single_pe, get_known_differences, diagnose_bugcheck
+    compare_compat, analyze_single_pe, diagnose_bugcheck
 )
 from nt_analyzer.pe_patcher import (
     PEPatcher, patch_pe_for_win2000, rebase_pe, strip_pe_debug,
@@ -208,23 +209,38 @@ if report:
 # ═════════════════════════════════════════════════════════════════════
 #  MODULE 4: struct_analyzer.py  (Structs tab)
 # ═════════════════════════════════════════════════════════════════════
-section("STRUCT ANALYZER — Known Windows 2000 Structures")
+section("STRUCT ANALYZER — Dynamic PDB Extraction")
+
+# Load PDB
+pdb_info = load_pdb(PDB_ROS)
+check(isinstance(pdb_info, PDBTypeInfo), "load_pdb should return PDBTypeInfo instance")
 
 known = list_known_structures()
-check(len(known) >= 9, f"Known structures: {len(known)} (expected >=9)")
-print(f"    Known structures ({len(known)}):")
+check(len(known) >= 100, f"Structures from PDB: {len(known)} (expected >=100 from ntoskrnl.pdb)")
+print(f"    Structures from PDB ({len(known)}):")
 
-for name in known:
-    s = get_known_structure(name)
-    check(s is not None, f"get_known_structure('{name}') returned None")
+# Spot-check key structures
+for name in ['_PEB', '_TEB', '_EPROCESS', '_ETHREAD', '_KTHREAD', '_KPROCESS',
+             '_KPRCB', '_KPCR', '_DISPATCHER_HEADER']:
+    s = pdb_info.get_structure(name)
     if s:
-        fields = s.get('fields', {})
+        fields = s.get('fields', [])
         size = s.get('size', 'N/A')
         check(len(fields) > 0, f"{name} has 0 fields")
-        print(f"      {name}: size={size}, {len(fields)} fields")
+        print(f"      {s['name']}: size=0x{size:X}, {len(fields)} fields")
+
+# Test auto-prefix lookup (PEB finds _PEB)
+peb = pdb_info.get_structure('PEB')
+check(peb is not None, "get_structure('PEB') should find _PEB")
+if peb:
+    check(peb['size'] == 488, f"PEB size should be 488, got {peb['size']}")
+    check(peb['field_count'] == 56, f"PEB should have 56 fields, got {peb['field_count']}")
+
+# Backward compat aliases work
+peb2 = get_known_structure('PEB')
+check(peb2 is not None, "get_known_structure('PEB') compat alias should work")
 
 # Generate C header
-peb = get_known_structure('PEB')
 if peb:
     hdr_text = generate_c_header(peb)
     check(len(hdr_text) > 100, "PEB C header too short")
@@ -236,9 +252,9 @@ if peb:
 
 # Export all headers to temp dir
 with tempfile.TemporaryDirectory() as tmpdir:
-    saved = save_all_headers(tmpdir)
-    check(len(saved) > 0, "save_all_headers returned 0 files")
-    for f in saved:
+    saved = save_all_headers(tmpdir, pdb_info)
+    check(len(saved) > 50, f"save_all_headers returned {len(saved)} files (expected >50)")
+    for f in saved[:5]:
         check(os.path.exists(f), f"Header file not created: {f}")
         size = os.path.getsize(f)
         check(size > 50, f"Header file too small: {f} ({size} bytes)")
@@ -655,22 +671,7 @@ fmap.close()
 # ═════════════════════════════════════════════════════════════════════
 #  MODULE 13: compat_analyzer.py  (Compat tab)
 # ═════════════════════════════════════════════════════════════════════
-section("COMPAT ANALYZER — NT 5.0 vs 5.1, Bugchecks, Known Diffs")
-
-# Known differences
-diffs = get_known_differences()
-check(len(diffs) >= 5, f"Known diff categories: {len(diffs)} (expected >=5)")
-for cat, items in diffs.items():
-    if isinstance(items, list):
-        print(f"    {cat}: {len(items)} entries")
-    elif isinstance(items, dict):
-        print(f"    {cat}: {len(items)} entries")
-
-# Check specific known differences
-cc_changes = diffs.get('calling_convention_changes', [])
-check(len(cc_changes) > 0, "No calling convention changes listed")
-hal_removed = diffs.get('hal_functions_removed', [])
-check(len(hal_removed) > 0, "No HAL removed functions listed", warn_only=True)
+section("COMPAT ANALYZER — Bugchecks, Single PE, Compare")
 
 # Bugcheck diagnosis
 for code in ['0xA5', '0xC0', '0x7E', '0x50', '0xD1']:
@@ -943,18 +944,18 @@ check('ImageBase' in out or 'image_base' in out.lower() or '0x' in out,
 print(f"    CLI header: {len(out)} chars")
 
 # 4. structs (list)
-rc, out, err = run_cli('structs')
+rc, out, err = run_cli('structs', '--pdb', PDB_ROS)
 check(rc == 0, f"CLI structs (list): rc={rc}")
-check('PEB' in out, "CLI structs missing PEB")
+check('PEB' in out or '_PEB' in out, "CLI structs missing PEB")
 
 # 5. structs PEB
-rc, out, err = run_cli('structs', 'PEB')
+rc, out, err = run_cli('structs', '--pdb', PDB_ROS, 'PEB')
 check(rc == 0, f"CLI structs PEB: rc={rc}")
 check('PEB' in out, "CLI structs PEB missing content")
 print(f"    CLI structs PEB: {len(out)} chars")
 
 # 6. structs PEB --c-header
-rc, out, err = run_cli('structs', 'PEB', '--c-header')
+rc, out, err = run_cli('structs', '--pdb', PDB_ROS, 'PEB', '--c-header')
 check(rc == 0, f"CLI structs --c-header: rc={rc}")
 check('struct' in out.lower() or 'typedef' in out.lower(), "C header missing struct keyword")
 print(f"    CLI structs --c-header: {len(out)} chars")
@@ -997,14 +998,7 @@ rc, out, err = run_cli('batch-decompile', PE_W2K, '--max', '5')
 check(rc == 0, f"CLI batch-decompile: rc={rc}, err={err[:100]}")
 print(f"    CLI batch-decompile (5): {len(out)} chars")
 
-# 14. compat-known
-rc, out, err = run_cli('compat-known')
-check(rc == 0, f"CLI compat-known: rc={rc}")
-check('convention' in out.lower() or 'fastcall' in out.lower() or 'difference' in out.lower(),
-      "CLI compat-known missing content")
-print(f"    CLI compat-known: {len(out)} chars")
-
-# 15. bugcheck
+# 14. bugcheck
 rc, out, err = run_cli('bugcheck', '0xA5')
 check(rc == 0, f"CLI bugcheck: rc={rc}")
 check('ACPI' in out.upper() or 'BIOS' in out.upper(), "CLI bugcheck missing ACPI_BIOS_ERROR")

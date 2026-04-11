@@ -1,494 +1,691 @@
 """
-Structure Offset Analyzer
-=========================
-Attempts to extract structure layout information from:
-  1. PDB debug symbols (if available)
-  2. Known hardcoded offsets for NT 5.0 (Win2000) structures
-  3. Runtime probing via a small helper executable
+Structure Offset Analyzer — Dynamic PDB Extraction
+===================================================
+Extracts structure layouts dynamically from PDB (Program Database) files.
 
-This module provides reference layouts for key undocumented structures
-as they exist in Windows 2000 SP4 (NT 5.0.2195).
+Supports:
+  - PDB 2.0 (JG / MSF 2.0) — Win2K-era format with native parser
+  - PDB 7.0 (DS / MSF 7.0) — native parser (no external deps)
+
+Parses the TPI (Type Program Information) stream to extract full
+struct/union/enum definitions including field names, offsets, sizes,
+and resolved type names.
 """
 
-import json
+import math
 import os
-import struct
+import struct as _struct
 
-# ============================================================================
-# Known Windows 2000 SP4 (NT 5.0 build 2195) structure layouts
-# These are from reverse engineering, debug symbols, and community research.
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════
+#  CodeView leaf type constants
+# ════════════════════════════════════════════════════════════════════
 
-# PEB - Process Environment Block (Windows 2000 SP4, x86)
-PEB_WIN2K = {
-    'name': 'PEB',
-    'size': 0x1E8,  # 488 bytes in Win2000
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 1, 'name': 'InheritedAddressSpace', 'type': 'BOOLEAN'},
-        {'offset': 0x001, 'size': 1, 'name': 'ReadImageFileExecOptions', 'type': 'BOOLEAN'},
-        {'offset': 0x002, 'size': 1, 'name': 'BeingDebugged', 'type': 'BOOLEAN'},
-        {'offset': 0x003, 'size': 1, 'name': 'SpareBool', 'type': 'BOOLEAN'},
-        {'offset': 0x004, 'size': 4, 'name': 'Mutant', 'type': 'HANDLE'},
-        {'offset': 0x008, 'size': 4, 'name': 'ImageBaseAddress', 'type': 'PVOID'},
-        {'offset': 0x00C, 'size': 4, 'name': 'Ldr', 'type': 'PPEB_LDR_DATA'},
-        {'offset': 0x010, 'size': 4, 'name': 'ProcessParameters', 'type': 'PRTL_USER_PROCESS_PARAMETERS'},
-        {'offset': 0x014, 'size': 4, 'name': 'SubSystemData', 'type': 'PVOID'},
-        {'offset': 0x018, 'size': 4, 'name': 'ProcessHeap', 'type': 'PVOID'},
-        {'offset': 0x01C, 'size': 4, 'name': 'FastPebLock', 'type': 'PRTL_CRITICAL_SECTION'},
-        {'offset': 0x020, 'size': 4, 'name': 'FastPebLockRoutine', 'type': 'PVOID'},
-        {'offset': 0x024, 'size': 4, 'name': 'FastPebUnlockRoutine', 'type': 'PVOID'},
-        {'offset': 0x028, 'size': 4, 'name': 'EnvironmentUpdateCount', 'type': 'ULONG'},
-        {'offset': 0x02C, 'size': 4, 'name': 'KernelCallbackTable', 'type': 'PVOID'},
-        {'offset': 0x030, 'size': 4, 'name': 'SystemReserved', 'type': 'ULONG'},
-        {'offset': 0x034, 'size': 4, 'name': 'AtlThunkSListPtr32', 'type': 'ULONG'},
-        {'offset': 0x038, 'size': 4, 'name': 'FreeList', 'type': 'PPEB_FREE_BLOCK'},
-        {'offset': 0x03C, 'size': 4, 'name': 'TlsExpansionCounter', 'type': 'ULONG'},
-        {'offset': 0x040, 'size': 4, 'name': 'TlsBitmap', 'type': 'PVOID'},
-        {'offset': 0x044, 'size': 8, 'name': 'TlsBitmapBits[2]', 'type': 'ULONG[2]'},
-        {'offset': 0x04C, 'size': 4, 'name': 'ReadOnlySharedMemoryBase', 'type': 'PVOID'},
-        {'offset': 0x050, 'size': 4, 'name': 'ReadOnlySharedMemoryHeap', 'type': 'PVOID'},
-        {'offset': 0x054, 'size': 4, 'name': 'ReadOnlyStaticServerData', 'type': 'PPVOID'},
-        {'offset': 0x058, 'size': 4, 'name': 'AnsiCodePageData', 'type': 'PVOID'},
-        {'offset': 0x05C, 'size': 4, 'name': 'OemCodePageData', 'type': 'PVOID'},
-        {'offset': 0x060, 'size': 4, 'name': 'UnicodeCaseTableData', 'type': 'PVOID'},
-        {'offset': 0x064, 'size': 4, 'name': 'NumberOfProcessors', 'type': 'ULONG'},
-        {'offset': 0x068, 'size': 4, 'name': 'NtGlobalFlag', 'type': 'ULONG'},
-        {'offset': 0x070, 'size': 8, 'name': 'CriticalSectionTimeout', 'type': 'LARGE_INTEGER'},
-        {'offset': 0x078, 'size': 4, 'name': 'HeapSegmentReserve', 'type': 'ULONG'},
-        {'offset': 0x07C, 'size': 4, 'name': 'HeapSegmentCommit', 'type': 'ULONG'},
-        {'offset': 0x080, 'size': 4, 'name': 'HeapDeCommitTotalFreeThreshold', 'type': 'ULONG'},
-        {'offset': 0x084, 'size': 4, 'name': 'HeapDeCommitFreeBlockThreshold', 'type': 'ULONG'},
-        {'offset': 0x088, 'size': 4, 'name': 'NumberOfHeaps', 'type': 'ULONG'},
-        {'offset': 0x08C, 'size': 4, 'name': 'MaximumNumberOfHeaps', 'type': 'ULONG'},
-        {'offset': 0x090, 'size': 4, 'name': 'ProcessHeaps', 'type': 'PPVOID'},
-        {'offset': 0x094, 'size': 4, 'name': 'GdiSharedHandleTable', 'type': 'PVOID'},
-        {'offset': 0x098, 'size': 4, 'name': 'ProcessStarterHelper', 'type': 'PVOID'},
-        {'offset': 0x09C, 'size': 4, 'name': 'GdiDCAttributeList', 'type': 'ULONG'},
-        {'offset': 0x0A0, 'size': 4, 'name': 'LoaderLock', 'type': 'PVOID'},
-        {'offset': 0x0A4, 'size': 4, 'name': 'OSMajorVersion', 'type': 'ULONG'},
-        {'offset': 0x0A8, 'size': 4, 'name': 'OSMinorVersion', 'type': 'ULONG'},
-        {'offset': 0x0AC, 'size': 2, 'name': 'OSBuildNumber', 'type': 'USHORT'},
-        {'offset': 0x0AE, 'size': 2, 'name': 'OSCSDVersion', 'type': 'USHORT'},
-        {'offset': 0x0B0, 'size': 4, 'name': 'OSPlatformId', 'type': 'ULONG'},
-        {'offset': 0x0B4, 'size': 4, 'name': 'ImageSubsystem', 'type': 'ULONG'},
-        {'offset': 0x0B8, 'size': 4, 'name': 'ImageSubsystemMajorVersion', 'type': 'ULONG'},
-        {'offset': 0x0BC, 'size': 4, 'name': 'ImageSubsystemMinorVersion', 'type': 'ULONG'},
-        {'offset': 0x0C0, 'size': 4, 'name': 'ImageProcessAffinityMask', 'type': 'ULONG'},
-        {'offset': 0x0C4, 'size': 136, 'name': 'GdiHandleBuffer[34]', 'type': 'ULONG[34]'},
-        {'offset': 0x14C, 'size': 4, 'name': 'PostProcessInitRoutine', 'type': 'PVOID'},
-        {'offset': 0x150, 'size': 4, 'name': 'TlsExpansionBitmap', 'type': 'PVOID'},
-        {'offset': 0x154, 'size': 128, 'name': 'TlsExpansionBitmapBits[32]', 'type': 'ULONG[32]'},
-        {'offset': 0x1D4, 'size': 4, 'name': 'SessionId', 'type': 'ULONG'},
-        # Win2000 SP4 specific - differs from XP here
-        {'offset': 0x1D8, 'size': 8, 'name': 'AppCompatFlags', 'type': 'ULARGE_INTEGER'},
-        {'offset': 0x1E0, 'size': 8, 'name': 'AppCompatFlagsUser', 'type': 'ULARGE_INTEGER'},
-    ]
+LF_MODIFIER    = 0x1001
+LF_POINTER     = 0x1002
+LF_ARRAY_ST    = 0x1003   # PDB 2.0 _ST (length-prefixed name)
+LF_CLASS_ST    = 0x1004
+LF_STRUCTURE   = 0x1005   # LF_STRUCTURE_ST in PDB 2.0
+LF_UNION       = 0x1006   # LF_UNION_ST in PDB 2.0
+LF_ENUM_ST     = 0x1007
+LF_PROCEDURE   = 0x1008
+LF_MFUNCTION   = 0x1009
+LF_ARGLIST     = 0x1201
+LF_FIELDLIST   = 0x1203
+LF_BITFIELD    = 0x1205
+LF_MEMBER_ST   = 0x1405
+LF_MEMBER      = 0x150D
+# PDB 7.0 non-_ST variants
+LF_ARRAY       = 0x1503
+LF_STRUCTURE7  = 0x1505
+LF_UNION7      = 0x1506
+LF_ENUM        = 0x1507
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Built-in primitive type index resolution (TI < 0x1000)
+# ════════════════════════════════════════════════════════════════════
+
+_BUILTIN_BASE = {
+    0x00: 'void',       0x03: 'void',
+    0x10: 'char',       0x11: 'short',       0x12: 'long',        0x13: '__int64',
+    0x20: 'UCHAR',      0x21: 'USHORT',      0x22: 'ULONG',       0x23: 'ULONGLONG',
+    0x30: 'BOOLEAN',    0x31: 'BOOLEAN',
+    0x40: 'float',      0x41: 'double',      0x42: 'long double',
+    0x68: 'int',        0x69: 'unsigned int',
+    0x70: 'HRESULT',    0x72: 'long',        0x73: 'unsigned long',
+    0x74: 'WCHAR',      0x75: '__int16',
 }
 
-# TEB - Thread Environment Block (Windows 2000 SP4, x86)
-TEB_WIN2K = {
-    'name': 'TEB',
-    'size': 0xF88,
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 28, 'name': 'NtTib', 'type': 'NT_TIB'},
-        {'offset': 0x01C, 'size': 4, 'name': 'EnvironmentPointer', 'type': 'PVOID'},
-        {'offset': 0x020, 'size': 8, 'name': 'ClientId', 'type': 'CLIENT_ID'},
-        {'offset': 0x028, 'size': 4, 'name': 'ActiveRpcHandle', 'type': 'PVOID'},
-        {'offset': 0x02C, 'size': 4, 'name': 'ThreadLocalStoragePointer', 'type': 'PVOID'},
-        {'offset': 0x030, 'size': 4, 'name': 'ProcessEnvironmentBlock', 'type': 'PPEB'},
-        {'offset': 0x034, 'size': 4, 'name': 'LastErrorValue', 'type': 'ULONG'},
-        {'offset': 0x038, 'size': 4, 'name': 'CountOfOwnedCriticalSections', 'type': 'ULONG'},
-        {'offset': 0x03C, 'size': 4, 'name': 'CsrClientThread', 'type': 'PVOID'},
-        {'offset': 0x040, 'size': 4, 'name': 'Win32ThreadInfo', 'type': 'PVOID'},
-        {'offset': 0x044, 'size': 104, 'name': 'User32Reserved[26]', 'type': 'ULONG[26]'},
-        {'offset': 0x0AC, 'size': 20, 'name': 'UserReserved[5]', 'type': 'ULONG[5]'},
-        {'offset': 0x0C0, 'size': 4, 'name': 'WOW32Reserved', 'type': 'PVOID'},
-        {'offset': 0x0C4, 'size': 4, 'name': 'CurrentLocale', 'type': 'LCID'},
-        {'offset': 0x0C8, 'size': 4, 'name': 'FpSoftwareStatusRegister', 'type': 'ULONG'},
-        {'offset': 0x0CC, 'size': 216, 'name': 'SystemReserved1[54]', 'type': 'PVOID[54]'},
-        {'offset': 0x1A4, 'size': 4, 'name': 'ExceptionCode', 'type': 'NTSTATUS'},
-        {'offset': 0x1A8, 'size': 4, 'name': 'ActivationContextStack', 'type': 'PVOID'},
-        {'offset': 0x1AC, 'size': 24, 'name': 'SpareBytes1[24]', 'type': 'UCHAR[24]'},
-        {'offset': 0x1C4, 'size': 4, 'name': 'GdiTebBatch_Offset', 'type': 'ULONG'},
-        # GdiTebBatch is a large embedded structure
-        {'offset': 0x6DC, 'size': 4, 'name': 'RealClientId_UniqueProcess', 'type': 'HANDLE'},
-        {'offset': 0x6E0, 'size': 4, 'name': 'RealClientId_UniqueThread', 'type': 'HANDLE'},
-        {'offset': 0x6E4, 'size': 4, 'name': 'GdiCachedProcessHandle', 'type': 'PVOID'},
-        {'offset': 0x6E8, 'size': 4, 'name': 'GdiClientPID', 'type': 'ULONG'},
-        {'offset': 0x6EC, 'size': 4, 'name': 'GdiClientTID', 'type': 'ULONG'},
-        {'offset': 0x6F0, 'size': 4, 'name': 'GdiThreadLocalInfo', 'type': 'PVOID'},
-        {'offset': 0x6F4, 'size': 248, 'name': 'Win32ClientInfo[62]', 'type': 'ULONG[62]'},
-        {'offset': 0x7EC, 'size': 932, 'name': 'glDispatchTable[233]', 'type': 'PVOID[233]'},
-        {'offset': 0xB68, 'size': 116, 'name': 'glReserved1[29]', 'type': 'ULONG[29]'},
-        {'offset': 0xBDC, 'size': 4, 'name': 'glReserved2', 'type': 'PVOID'},
-        {'offset': 0xBE0, 'size': 4, 'name': 'glSectionInfo', 'type': 'PVOID'},
-        {'offset': 0xBE4, 'size': 4, 'name': 'glSection', 'type': 'PVOID'},
-        {'offset': 0xBE8, 'size': 4, 'name': 'glTable', 'type': 'PVOID'},
-        {'offset': 0xBEC, 'size': 4, 'name': 'glCurrentRC', 'type': 'PVOID'},
-        {'offset': 0xBF0, 'size': 4, 'name': 'glContext', 'type': 'PVOID'},
-        {'offset': 0xBF4, 'size': 4, 'name': 'LastStatusValue', 'type': 'NTSTATUS'},
-        {'offset': 0xBF8, 'size': 8, 'name': 'StaticUnicodeString', 'type': 'UNICODE_STRING'},
-        {'offset': 0xC00, 'size': 522, 'name': 'StaticUnicodeBuffer[261]', 'type': 'WCHAR[261]'},
-        {'offset': 0xE0C, 'size': 4, 'name': 'DeallocationStack', 'type': 'PVOID'},
-        {'offset': 0xE10, 'size': 256, 'name': 'TlsSlots[64]', 'type': 'PVOID[64]'},
-        {'offset': 0xF10, 'size': 8, 'name': 'TlsLinks', 'type': 'LIST_ENTRY'},
-        {'offset': 0xF18, 'size': 4, 'name': 'Vdm', 'type': 'PVOID'},
-        {'offset': 0xF1C, 'size': 4, 'name': 'ReservedForNtRpc', 'type': 'PVOID'},
-        {'offset': 0xF20, 'size': 8, 'name': 'DbgSsReserved[2]', 'type': 'PVOID[2]'},
-    ]
-}
-
-# KUSER_SHARED_DATA (Windows 2000 SP4, mapped at 0x7FFE0000)
-KUSER_SHARED_DATA_WIN2K = {
-    'name': 'KUSER_SHARED_DATA',
-    'size': 0x300,
-    'os': 'Windows 2000 SP4',
-    'mapped_at': '0x7FFE0000 (user) / 0xFFDF0000 (kernel)',
-    'fields': [
-        {'offset': 0x000, 'size': 4, 'name': 'TickCountLow', 'type': 'ULONG'},
-        {'offset': 0x004, 'size': 4, 'name': 'TickCountMultiplier', 'type': 'ULONG'},
-        {'offset': 0x008, 'size': 8, 'name': 'InterruptTime', 'type': 'KSYSTEM_TIME'},
-        {'offset': 0x014, 'size': 8, 'name': 'SystemTime', 'type': 'KSYSTEM_TIME'},
-        {'offset': 0x020, 'size': 8, 'name': 'TimeZoneBias', 'type': 'KSYSTEM_TIME'},
-        {'offset': 0x02C, 'size': 2, 'name': 'ImageNumberLow', 'type': 'USHORT'},
-        {'offset': 0x02E, 'size': 2, 'name': 'ImageNumberHigh', 'type': 'USHORT'},
-        {'offset': 0x030, 'size': 520, 'name': 'NtSystemRoot[260]', 'type': 'WCHAR[260]'},
-        {'offset': 0x238, 'size': 4, 'name': 'MaxStackTraceDepth', 'type': 'ULONG'},
-        {'offset': 0x23C, 'size': 4, 'name': 'CryptoExponent', 'type': 'ULONG'},
-        {'offset': 0x240, 'size': 4, 'name': 'TimeZoneId', 'type': 'ULONG'},
-        {'offset': 0x244, 'size': 4, 'name': 'Reserved2[8]', 'type': 'ULONG[8]'},
-        {'offset': 0x264, 'size': 4, 'name': 'NtProductType', 'type': 'NT_PRODUCT_TYPE'},
-        {'offset': 0x268, 'size': 1, 'name': 'ProductTypeIsValid', 'type': 'BOOLEAN'},
-        {'offset': 0x26C, 'size': 4, 'name': 'NtMajorVersion', 'type': 'ULONG'},
-        {'offset': 0x270, 'size': 4, 'name': 'NtMinorVersion', 'type': 'ULONG'},
-        {'offset': 0x274, 'size': 64, 'name': 'ProcessorFeatures[64]', 'type': 'BOOLEAN[64]'},
-        {'offset': 0x2B4, 'size': 4, 'name': 'Reserved1', 'type': 'ULONG'},
-        {'offset': 0x2B8, 'size': 4, 'name': 'Reserved3', 'type': 'ULONG'},
-        {'offset': 0x2BC, 'size': 4, 'name': 'TimeSlip', 'type': 'ULONG'},
-        {'offset': 0x2C0, 'size': 4, 'name': 'AlternativeArchitecture', 'type': 'ALTERNATIVE_ARCHITECTURE_TYPE'},
-        {'offset': 0x2C8, 'size': 8, 'name': 'SystemExpirationDate', 'type': 'LARGE_INTEGER'},
-        {'offset': 0x2D0, 'size': 4, 'name': 'SuiteMask', 'type': 'ULONG'},
-        {'offset': 0x2D4, 'size': 1, 'name': 'KdDebuggerEnabled', 'type': 'BOOLEAN'},
-        # Win2000 does NOT have SystemCall fields here (those are XP+)
-        # 0x300 = KiFastSystemCall (added in XP, NOT present in Win2000)
-    ]
+_PTR_MODE = {
+    0: '',      # direct
+    1: '*',     # 16-bit near
+    2: '*',     # 16-bit far
+    3: '*',     # huge
+    4: '*',     # 32-bit near
+    5: '*',     # 32-bit far
+    6: '*',     # 64-bit
 }
 
 
-# EPROCESS - Executive Process Object (Windows 2000 SP4, x86)
-# Kernel-mode structure representing a process. Needed for win32k.sys / ntoskrnl
-EPROCESS_WIN2K = {
-    'name': 'EPROCESS',
-    'size': 0x290,
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 0x6C, 'name': 'Pcb', 'type': 'KPROCESS'},
-        {'offset': 0x06C, 'size': 4,    'name': 'ExitStatus', 'type': 'NTSTATUS'},
-        {'offset': 0x070, 'size': 8,    'name': 'LockEvent', 'type': 'KEVENT'},
-        {'offset': 0x078, 'size': 4,    'name': 'LockCount', 'type': 'ULONG'},
-        {'offset': 0x080, 'size': 8,    'name': 'CreateTime', 'type': 'LARGE_INTEGER'},
-        {'offset': 0x088, 'size': 8,    'name': 'ExitTime', 'type': 'LARGE_INTEGER'},
-        {'offset': 0x090, 'size': 4,    'name': 'LockOwner', 'type': 'PKTHREAD'},
-        {'offset': 0x094, 'size': 4,    'name': 'UniqueProcessId', 'type': 'HANDLE'},
-        {'offset': 0x098, 'size': 8,    'name': 'ActiveProcessLinks', 'type': 'LIST_ENTRY'},
-        {'offset': 0x0A0, 'size': 4,    'name': 'QuotaPeakPoolUsage[0]', 'type': 'ULONG'},
-        {'offset': 0x0A4, 'size': 4,    'name': 'QuotaPeakPoolUsage[1]', 'type': 'ULONG'},
-        {'offset': 0x0A8, 'size': 4,    'name': 'QuotaPoolUsage[0]', 'type': 'ULONG'},
-        {'offset': 0x0AC, 'size': 4,    'name': 'QuotaPoolUsage[1]', 'type': 'ULONG'},
-        {'offset': 0x0B0, 'size': 4,    'name': 'PagefileUsage', 'type': 'ULONG'},
-        {'offset': 0x0B4, 'size': 4,    'name': 'PeakPagefileUsage', 'type': 'ULONG'},
-        {'offset': 0x0B8, 'size': 4,    'name': 'CommitCharge', 'type': 'ULONG'},
-        {'offset': 0x0BC, 'size': 4,    'name': 'PeakVirtualSize', 'type': 'ULONG'},
-        {'offset': 0x0C0, 'size': 4,    'name': 'VirtualSize', 'type': 'SIZE_T'},
-        {'offset': 0x0C4, 'size': 8,    'name': 'SessionProcessLinks', 'type': 'LIST_ENTRY'},
-        {'offset': 0x0CC, 'size': 4,    'name': 'DebugPort', 'type': 'PVOID'},
-        {'offset': 0x0D0, 'size': 4,    'name': 'ExceptionPort', 'type': 'PVOID'},
-        {'offset': 0x0D4, 'size': 4,    'name': 'ObjectTable', 'type': 'PHANDLE_TABLE'},
-        {'offset': 0x0D8, 'size': 4,    'name': 'Token', 'type': 'EX_FAST_REF'},
-        {'offset': 0x0DC, 'size': 0x28, 'name': 'WorkingSetLock', 'type': 'FAST_MUTEX'},
-        {'offset': 0x104, 'size': 4,    'name': 'WorkingSetPage', 'type': 'ULONG'},
-        {'offset': 0x108, 'size': 0x28, 'name': 'AddressCreationLock', 'type': 'FAST_MUTEX'},
-        {'offset': 0x130, 'size': 4,    'name': 'HyperSpaceLock', 'type': 'ULONG'},
-        {'offset': 0x134, 'size': 4,    'name': 'ForkInProgress', 'type': 'PETHREAD'},
-        {'offset': 0x138, 'size': 4,    'name': 'HardwareTrigger', 'type': 'ULONG'},
-        {'offset': 0x13C, 'size': 4,    'name': 'VadRoot', 'type': 'PVOID'},
-        {'offset': 0x140, 'size': 4,    'name': 'VadHint', 'type': 'PVOID'},
-        {'offset': 0x144, 'size': 4,    'name': 'CloneRoot', 'type': 'PVOID'},
-        {'offset': 0x148, 'size': 4,    'name': 'NumberOfPrivatePages', 'type': 'ULONG'},
-        {'offset': 0x14C, 'size': 4,    'name': 'NumberOfLockedPages', 'type': 'ULONG'},
-        {'offset': 0x150, 'size': 4,    'name': 'Win32Process', 'type': 'PVOID'},
-        {'offset': 0x154, 'size': 4,    'name': 'Job', 'type': 'PEJOB'},
-        {'offset': 0x158, 'size': 4,    'name': 'SectionObject', 'type': 'PVOID'},
-        {'offset': 0x15C, 'size': 4,    'name': 'SectionBaseAddress', 'type': 'PVOID'},
-        {'offset': 0x160, 'size': 4,    'name': 'QuotaBlock', 'type': 'PEPROCESS_QUOTA_BLOCK'},
-        {'offset': 0x164, 'size': 4,    'name': 'WorkingSetWatch', 'type': 'PPAGEFAULT_HISTORY'},
-        {'offset': 0x168, 'size': 4,    'name': 'Win32WindowStation', 'type': 'HANDLE'},
-        {'offset': 0x16C, 'size': 4,    'name': 'InheritedFromUniqueProcessId', 'type': 'HANDLE'},
-        {'offset': 0x170, 'size': 4,    'name': 'LdtInformation', 'type': 'PVOID'},
-        {'offset': 0x174, 'size': 4,    'name': 'VadFreeHint', 'type': 'PVOID'},
-        {'offset': 0x178, 'size': 4,    'name': 'VdmObjects', 'type': 'PVOID'},
-        {'offset': 0x17C, 'size': 4,    'name': 'DeviceMap', 'type': 'PVOID'},
-        {'offset': 0x180, 'size': 12,   'name': 'PhysicalVadList', 'type': 'LIST_ENTRY+ULONG'},
-        {'offset': 0x18C, 'size': 8,    'name': 'PageDirectoryPte', 'type': 'HARDWARE_PTE'},
-        {'offset': 0x198, 'size': 16,   'name': 'ImageFileName[16]', 'type': 'UCHAR[16]'},
-        {'offset': 0x1A8, 'size': 4,    'name': 'VmTrimFaultValue', 'type': 'ULONG'},
-        {'offset': 0x1AC, 'size': 1,    'name': 'SetTimerResolution', 'type': 'BOOLEAN'},
-        {'offset': 0x1AD, 'size': 1,    'name': 'PriorityClass', 'type': 'UCHAR'},
-        {'offset': 0x1B0, 'size': 4,    'name': 'SubSystemVersion', 'type': 'ULONG'},
-        {'offset': 0x1B4, 'size': 4,    'name': 'Win32WindowStation_2', 'type': 'PVOID'},
-        {'offset': 0x1B8, 'size': 4,    'name': 'Peb', 'type': 'PPEB'},
-        {'offset': 0x1BC, 'size': 4,    'name': 'SessionId', 'type': 'ULONG'},
-    ]
-}
-
-# ETHREAD - Executive Thread Object (Windows 2000 SP4, x86)
-ETHREAD_WIN2K = {
-    'name': 'ETHREAD',
-    'size': 0x258,
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 0x1B0, 'name': 'Tcb', 'type': 'KTHREAD'},
-        {'offset': 0x1B0, 'size': 8,     'name': 'CreateTime', 'type': 'LARGE_INTEGER'},
-        {'offset': 0x1B8, 'size': 8,     'name': 'ExitTime_or_LpcReplyChain', 'type': 'LARGE_INTEGER'},
-        {'offset': 0x1C0, 'size': 4,     'name': 'ExitStatus_or_OfsChain', 'type': 'NTSTATUS'},
-        {'offset': 0x1C4, 'size': 8,     'name': 'PostBlockList', 'type': 'LIST_ENTRY'},
-        {'offset': 0x1CC, 'size': 8,     'name': 'TerminationPort_or_ReaperLink', 'type': 'PVOID'},
-        {'offset': 0x1D4, 'size': 4,     'name': 'ActiveTimerListLock', 'type': 'KSPIN_LOCK'},
-        {'offset': 0x1D8, 'size': 8,     'name': 'ActiveTimerListHead', 'type': 'LIST_ENTRY'},
-        {'offset': 0x1E0, 'size': 8,     'name': 'Cid', 'type': 'CLIENT_ID'},
-        {'offset': 0x1E8, 'size': 0x10,  'name': 'LpcReplySemaphore', 'type': 'KSEMAPHORE'},
-        {'offset': 0x1F8, 'size': 4,     'name': 'LpcReplyMessage', 'type': 'PVOID'},
-        {'offset': 0x1FC, 'size': 4,     'name': 'LpcReplyMessageId', 'type': 'ULONG'},
-        {'offset': 0x200, 'size': 4,     'name': 'ImpersonationInfo', 'type': 'PPS_IMPERSONATION_INFORMATION'},
-        {'offset': 0x204, 'size': 8,     'name': 'IrpList', 'type': 'LIST_ENTRY'},
-        {'offset': 0x20C, 'size': 4,     'name': 'TopLevelIrp', 'type': 'ULONG'},
-        {'offset': 0x210, 'size': 4,     'name': 'DeviceToVerify', 'type': 'PDEVICE_OBJECT'},
-        {'offset': 0x214, 'size': 4,     'name': 'ThreadsProcess', 'type': 'PEPROCESS'},
-        {'offset': 0x218, 'size': 4,     'name': 'StartAddress', 'type': 'PVOID'},
-        {'offset': 0x21C, 'size': 4,     'name': 'Win32StartAddress_or_LpcReceivedMessageId', 'type': 'PVOID'},
-        {'offset': 0x220, 'size': 1,     'name': 'LpcExitThreadCalled', 'type': 'BOOLEAN'},
-        {'offset': 0x221, 'size': 1,     'name': 'HardErrorsAreDisabled', 'type': 'BOOLEAN'},
-        {'offset': 0x222, 'size': 1,     'name': 'LpcReceivedMsgIdValid', 'type': 'BOOLEAN'},
-        {'offset': 0x223, 'size': 1,     'name': 'ActiveImpersonationInfo', 'type': 'BOOLEAN'},
-        {'offset': 0x224, 'size': 4,     'name': 'PerformanceCountLow', 'type': 'ULONG'},
-        {'offset': 0x228, 'size': 4,     'name': 'PerformanceCountHigh', 'type': 'LONG'},
-    ]
-}
-
-# LDR_DATA_TABLE_ENTRY (Windows 2000 SP4, x86)
-# Used by ntdll loader to track loaded modules
-LDR_DATA_TABLE_ENTRY_WIN2K = {
-    'name': 'LDR_DATA_TABLE_ENTRY',
-    'size': 0x68,
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 8,  'name': 'InLoadOrderLinks', 'type': 'LIST_ENTRY'},
-        {'offset': 0x008, 'size': 8,  'name': 'InMemoryOrderLinks', 'type': 'LIST_ENTRY'},
-        {'offset': 0x010, 'size': 8,  'name': 'InInitializationOrderLinks', 'type': 'LIST_ENTRY'},
-        {'offset': 0x018, 'size': 4,  'name': 'DllBase', 'type': 'PVOID'},
-        {'offset': 0x01C, 'size': 4,  'name': 'EntryPoint', 'type': 'PVOID'},
-        {'offset': 0x020, 'size': 4,  'name': 'SizeOfImage', 'type': 'ULONG'},
-        {'offset': 0x024, 'size': 8,  'name': 'FullDllName', 'type': 'UNICODE_STRING'},
-        {'offset': 0x02C, 'size': 8,  'name': 'BaseDllName', 'type': 'UNICODE_STRING'},
-        {'offset': 0x034, 'size': 4,  'name': 'Flags', 'type': 'ULONG'},
-        {'offset': 0x038, 'size': 2,  'name': 'LoadCount', 'type': 'USHORT'},
-        {'offset': 0x03A, 'size': 2,  'name': 'TlsIndex', 'type': 'USHORT'},
-        {'offset': 0x03C, 'size': 8,  'name': 'HashLinks_or_SectionPointer', 'type': 'LIST_ENTRY'},
-        {'offset': 0x044, 'size': 4,  'name': 'TimeDateStamp', 'type': 'ULONG'},
-        {'offset': 0x048, 'size': 4,  'name': 'LoadedImports', 'type': 'PVOID'},
-        {'offset': 0x04C, 'size': 4,  'name': 'EntryPointActivationContext', 'type': 'PVOID'},
-        {'offset': 0x050, 'size': 4,  'name': 'PatchInformation', 'type': 'PVOID'},
-    ]
-}
-
-# HEAP (Windows 2000 SP4, x86)
-# NT heap manager main structure
-HEAP_WIN2K = {
-    'name': 'HEAP',
-    'size': 0x588,
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 0x38, 'name': 'Entry', 'type': 'HEAP_ENTRY'},
-        {'offset': 0x038, 'size': 4,    'name': 'Signature', 'type': 'ULONG'},
-        {'offset': 0x03C, 'size': 4,    'name': 'Flags', 'type': 'ULONG'},
-        {'offset': 0x040, 'size': 4,    'name': 'ForceFlags', 'type': 'ULONG'},
-        {'offset': 0x044, 'size': 4,    'name': 'VirtualMemoryThreshold', 'type': 'ULONG'},
-        {'offset': 0x048, 'size': 4,    'name': 'SegmentReserve', 'type': 'SIZE_T'},
-        {'offset': 0x04C, 'size': 4,    'name': 'SegmentCommit', 'type': 'SIZE_T'},
-        {'offset': 0x050, 'size': 4,    'name': 'DeCommitFreeBlockThreshold', 'type': 'SIZE_T'},
-        {'offset': 0x054, 'size': 4,    'name': 'DeCommitTotalFreeThreshold', 'type': 'SIZE_T'},
-        {'offset': 0x058, 'size': 4,    'name': 'TotalFreeSize', 'type': 'SIZE_T'},
-        {'offset': 0x05C, 'size': 4,    'name': 'MaximumAllocationSize', 'type': 'SIZE_T'},
-        {'offset': 0x060, 'size': 2,    'name': 'ProcessHeapsListIndex', 'type': 'USHORT'},
-        {'offset': 0x062, 'size': 2,    'name': 'HeaderValidateLength', 'type': 'USHORT'},
-        {'offset': 0x064, 'size': 4,    'name': 'HeaderValidateCopy', 'type': 'PVOID'},
-        {'offset': 0x068, 'size': 2,    'name': 'NextAvailableTagIndex', 'type': 'USHORT'},
-        {'offset': 0x06A, 'size': 2,    'name': 'MaximumTagIndex', 'type': 'USHORT'},
-        {'offset': 0x06C, 'size': 4,    'name': 'TagEntries', 'type': 'PHEAP_TAG_ENTRY'},
-        {'offset': 0x070, 'size': 8,    'name': 'UCRSegments', 'type': 'LIST_ENTRY'},
-        {'offset': 0x078, 'size': 8,    'name': 'UnusedUnCommittedRanges', 'type': 'PHEAP_UCR_SEGMENT'},
-        {'offset': 0x080, 'size': 4,    'name': 'AlignRound', 'type': 'ULONG'},
-        {'offset': 0x084, 'size': 4,    'name': 'AlignMask', 'type': 'ULONG'},
-        {'offset': 0x088, 'size': 8,    'name': 'VirtualAllocdBlocks', 'type': 'LIST_ENTRY'},
-        {'offset': 0x090, 'size': 256,  'name': 'Segments[64]', 'type': 'PHEAP_SEGMENT[64]'},
-        {'offset': 0x190, 'size': 16,   'name': 'u_FreeListBitmap', 'type': 'ULONG[4]'},
-        {'offset': 0x1A0, 'size': 0x400, 'name': 'FreeLists[128]', 'type': 'LIST_ENTRY[128]'},
-        {'offset': 0x5A0, 'size': 0x38, 'name': 'LockVariable', 'type': 'HEAP_LOCK'},
-        {'offset': 0x5D8, 'size': 4,    'name': 'CommitRoutine', 'type': 'PRTL_HEAP_COMMIT_ROUTINE'},
-    ]
-}
-
-# PEB_LDR_DATA (Windows 2000 SP4)
-PEB_LDR_DATA_WIN2K = {
-    'name': 'PEB_LDR_DATA',
-    'size': 0x24,
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 4, 'name': 'Length', 'type': 'ULONG'},
-        {'offset': 0x004, 'size': 1, 'name': 'Initialized', 'type': 'BOOLEAN'},
-        {'offset': 0x008, 'size': 4, 'name': 'SsHandle', 'type': 'HANDLE'},
-        {'offset': 0x00C, 'size': 8, 'name': 'InLoadOrderModuleList', 'type': 'LIST_ENTRY'},
-        {'offset': 0x014, 'size': 8, 'name': 'InMemoryOrderModuleList', 'type': 'LIST_ENTRY'},
-        {'offset': 0x01C, 'size': 8, 'name': 'InInitializationOrderModuleList', 'type': 'LIST_ENTRY'},
-    ]
-}
-
-# RTL_USER_PROCESS_PARAMETERS (Windows 2000 SP4)
-RTL_USER_PROCESS_PARAMETERS_WIN2K = {
-    'name': 'RTL_USER_PROCESS_PARAMETERS',
-    'size': 0x290,
-    'os': 'Windows 2000 SP4',
-    'fields': [
-        {'offset': 0x000, 'size': 4,  'name': 'MaximumLength', 'type': 'ULONG'},
-        {'offset': 0x004, 'size': 4,  'name': 'Length', 'type': 'ULONG'},
-        {'offset': 0x008, 'size': 4,  'name': 'Flags', 'type': 'ULONG'},
-        {'offset': 0x00C, 'size': 4,  'name': 'DebugFlags', 'type': 'ULONG'},
-        {'offset': 0x010, 'size': 4,  'name': 'ConsoleHandle', 'type': 'HANDLE'},
-        {'offset': 0x014, 'size': 4,  'name': 'ConsoleFlags', 'type': 'ULONG'},
-        {'offset': 0x018, 'size': 4,  'name': 'StandardInput', 'type': 'HANDLE'},
-        {'offset': 0x01C, 'size': 4,  'name': 'StandardOutput', 'type': 'HANDLE'},
-        {'offset': 0x020, 'size': 4,  'name': 'StandardError', 'type': 'HANDLE'},
-        {'offset': 0x024, 'size': 8,  'name': 'CurrentDirectory.DosPath', 'type': 'UNICODE_STRING'},
-        {'offset': 0x02C, 'size': 4,  'name': 'CurrentDirectory.Handle', 'type': 'HANDLE'},
-        {'offset': 0x030, 'size': 8,  'name': 'DllPath', 'type': 'UNICODE_STRING'},
-        {'offset': 0x038, 'size': 8,  'name': 'ImagePathName', 'type': 'UNICODE_STRING'},
-        {'offset': 0x040, 'size': 8,  'name': 'CommandLine', 'type': 'UNICODE_STRING'},
-        {'offset': 0x048, 'size': 4,  'name': 'Environment', 'type': 'PVOID'},
-        {'offset': 0x04C, 'size': 4,  'name': 'StartingX', 'type': 'ULONG'},
-        {'offset': 0x050, 'size': 4,  'name': 'StartingY', 'type': 'ULONG'},
-        {'offset': 0x054, 'size': 4,  'name': 'CountX', 'type': 'ULONG'},
-        {'offset': 0x058, 'size': 4,  'name': 'CountY', 'type': 'ULONG'},
-        {'offset': 0x05C, 'size': 4,  'name': 'CountCharsX', 'type': 'ULONG'},
-        {'offset': 0x060, 'size': 4,  'name': 'CountCharsY', 'type': 'ULONG'},
-        {'offset': 0x064, 'size': 4,  'name': 'FillAttribute', 'type': 'ULONG'},
-        {'offset': 0x068, 'size': 4,  'name': 'WindowFlags', 'type': 'ULONG'},
-        {'offset': 0x06C, 'size': 4,  'name': 'ShowWindowFlags', 'type': 'ULONG'},
-        {'offset': 0x070, 'size': 8,  'name': 'WindowTitle', 'type': 'UNICODE_STRING'},
-        {'offset': 0x078, 'size': 8,  'name': 'DesktopInfo', 'type': 'UNICODE_STRING'},
-        {'offset': 0x080, 'size': 8,  'name': 'ShellInfo', 'type': 'UNICODE_STRING'},
-        {'offset': 0x088, 'size': 8,  'name': 'RuntimeData', 'type': 'UNICODE_STRING'},
-    ]
-}
-
-ALL_KNOWN_STRUCTURES = {
-    'PEB': PEB_WIN2K,
-    'TEB': TEB_WIN2K,
-    'KUSER_SHARED_DATA': KUSER_SHARED_DATA_WIN2K,
-    'EPROCESS': EPROCESS_WIN2K,
-    'ETHREAD': ETHREAD_WIN2K,
-    'LDR_DATA_TABLE_ENTRY': LDR_DATA_TABLE_ENTRY_WIN2K,
-    'HEAP': HEAP_WIN2K,
-    'PEB_LDR_DATA': PEB_LDR_DATA_WIN2K,
-    'RTL_USER_PROCESS_PARAMETERS': RTL_USER_PROCESS_PARAMETERS_WIN2K,
-}
+def _builtin_type_name(ti):
+    """Resolve a built-in type index (< 0x1000) to a readable name."""
+    base = ti & 0xFF
+    mode = (ti >> 8) & 0xF
+    name = _BUILTIN_BASE.get(base, f'T_{ti:04X}')
+    ptr = _PTR_MODE.get(mode, '')
+    if ptr:
+        return 'P' + name.upper() if name.islower() else 'P' + name
+    return name
 
 
-def get_known_structure(name):
-    """Get a known structure layout by name."""
-    return ALL_KNOWN_STRUCTURES.get(name)
+# ════════════════════════════════════════════════════════════════════
+#  Numeric leaf reader
+# ════════════════════════════════════════════════════════════════════
+
+def _read_numeric_leaf(buf, off):
+    """Read a CodeView numeric leaf. Returns (value, next_offset)."""
+    if off + 2 > len(buf):
+        return 0, off
+    val = _struct.unpack_from('<H', buf, off)[0]
+    if val < 0x8000:
+        return val, off + 2
+    if val == 0x8000:  # LF_CHAR
+        return _struct.unpack_from('<b', buf, off + 2)[0], off + 3
+    if val == 0x8001:  # LF_SHORT
+        return _struct.unpack_from('<h', buf, off + 2)[0], off + 4
+    if val == 0x8002:  # LF_USHORT
+        return _struct.unpack_from('<H', buf, off + 2)[0], off + 4
+    if val == 0x8003:  # LF_LONG
+        return _struct.unpack_from('<i', buf, off + 2)[0], off + 6
+    if val == 0x8004:  # LF_ULONG
+        return _struct.unpack_from('<I', buf, off + 2)[0], off + 6
+    if val == 0x8009:  # LF_QUADWORD
+        return _struct.unpack_from('<q', buf, off + 2)[0], off + 10
+    if val == 0x800A:  # LF_UQUADWORD
+        return _struct.unpack_from('<Q', buf, off + 2)[0], off + 10
+    return val, off + 2
 
 
-def list_known_structures():
-    """List all known structure names."""
-    return list(ALL_KNOWN_STRUCTURES.keys())
+# ════════════════════════════════════════════════════════════════════
+#  PDB 2.0 MSF reader
+# ════════════════════════════════════════════════════════════════════
+
+PDB20_SIGNATURE = b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00'
 
 
-def compare_structure_with_binary(struct_def, binary_data, base_offset=0):
+class _PDB20Reader:
+    """Reads PDB 2.0 (JG / MSF 2.0) files — native, no dependencies."""
+
+    def __init__(self, data):
+        self.data = data
+        self.page_size = _struct.unpack_from('<I', data, 44)[0]
+        self.file_pages = _struct.unpack_from('<H', data, 50)[0]
+        self.root_size = _struct.unpack_from('<I', data, 52)[0]
+        self._parse_root()
+
+    def _read_pages(self, pages, size):
+        buf = bytearray()
+        for pn in pages:
+            start = pn * self.page_size
+            buf.extend(self.data[start:start + self.page_size])
+        return bytes(buf[:size])
+
+    def _parse_root(self):
+        num_root_pages = math.ceil(self.root_size / self.page_size)
+        root_pages = [_struct.unpack_from('<H', self.data, 60 + i * 2)[0]
+                      for i in range(num_root_pages)]
+        root = self._read_pages(root_pages, self.root_size)
+
+        self.num_streams = _struct.unpack_from('<H', root, 0)[0]
+        off = 4
+        self._stream_sizes = []
+        for _ in range(self.num_streams):
+            self._stream_sizes.append(_struct.unpack_from('<I', root, off)[0])
+            off += 8
+
+        self._stream_pages = []
+        for sz in self._stream_sizes:
+            cnt = math.ceil(sz / self.page_size) if sz > 0 else 0
+            pages = [_struct.unpack_from('<H', root, off + j * 2)[0]
+                     for j in range(cnt)]
+            off += cnt * 2
+            self._stream_pages.append(pages)
+
+    def read_stream(self, idx):
+        if idx >= self.num_streams or self._stream_sizes[idx] == 0:
+            return b''
+        return self._read_pages(self._stream_pages[idx], self._stream_sizes[idx])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  TPI (Type Program Information) stream parser
+# ════════════════════════════════════════════════════════════════════
+
+class PDBTypeInfo:
     """
-    Compare a known structure definition against raw binary data.
-    Useful for verifying if a running system matches expected layout.
+    Parses PDB type information stream and provides structure lookups.
 
-    Returns list of field values extracted from the binary.
+    Usage:
+        ti = PDBTypeInfo(pdb_path)
+        names = ti.list_structures()          # ['_PEB', '_TEB', ...]
+        peb = ti.get_structure('_PEB')        # full layout dict
+        peb = ti.get_structure('PEB')         # also works (auto-prefixes _)
     """
-    results = []
-    for field in struct_def['fields']:
-        offset = field['offset']
-        size = field['size']
 
-        if offset + size > len(binary_data):
-            results.append({**field, 'value': '<out of bounds>', 'raw': None})
-            continue
+    def __init__(self, pdb_path):
+        self.pdb_path = pdb_path
+        self.source = os.path.basename(pdb_path)
+        self._type_records = {}   # ti -> (leaf, data_bytes)
+        self._ti_min = 0
+        self._ti_max = 0
+        self._struct_index = {}   # name -> ti (non-forward-ref structs)
+        self._union_index = {}    # name -> ti
+        self._enum_index = {}     # name -> ti
+        self._type_name_cache = {}
 
-        raw = binary_data[offset:offset + size]
+        with open(pdb_path, 'rb') as f:
+            data = f.read()
 
-        # Try to interpret small fields as integers
-        if size <= 8:
-            if size == 1:
-                val = raw[0]
-            elif size == 2:
-                val = struct.unpack('<H', raw)[0]
-            elif size == 4:
-                val = struct.unpack('<I', raw)[0]
-            elif size == 8:
-                val = struct.unpack('<Q', raw)[0]
-            else:
-                val = raw.hex()
-            results.append({**field, 'value': val, 'value_hex': hex(val) if isinstance(val, int) else val, 'raw': raw.hex()})
+        if data[:44] == PDB20_SIGNATURE:
+            self._parse_pdb20(data)
+        elif b'Microsoft C/C++ MSF 7.00' in data[:32]:
+            self._parse_pdb70(data)
         else:
-            results.append({**field, 'value': f'<{size} bytes>', 'raw': raw[:16].hex() + '...'})
+            raise ValueError(f"Unknown PDB format: {data[:24]!r}")
 
-    return results
+    # ── PDB 2.0 ──────────────────────────────────────────────────
+
+    def _parse_pdb20(self, data):
+        reader = _PDB20Reader(data)
+        tpi = reader.read_stream(2)
+        self._parse_tpi_stream(tpi)
+
+    # ── PDB 7.0 ──────────────────────────────────────────────────
+
+    def _parse_pdb70(self, data):
+        page_size = _struct.unpack_from('<I', data, 32)[0]
+        root_size = _struct.unpack_from('<I', data, 40)[0]
+
+        num_root_pages = math.ceil(root_size / page_size)
+        num_ptr_pages = math.ceil(num_root_pages * 4 / page_size)
+        ptr_start = _struct.unpack_from('<I', data, 52)[0]
+
+        ptr_page_data = data[ptr_start * page_size:
+                             ptr_start * page_size + num_ptr_pages * page_size]
+        root_page_nums = [_struct.unpack_from('<I', ptr_page_data, i * 4)[0]
+                          for i in range(num_root_pages)]
+
+        root = bytearray()
+        for pn in root_page_nums:
+            root.extend(data[pn * page_size:(pn + 1) * page_size])
+        root = bytes(root[:root_size])
+
+        num_streams = _struct.unpack_from('<I', root, 0)[0]
+        off = 4
+        stream_sizes = []
+        for _ in range(num_streams):
+            stream_sizes.append(_struct.unpack_from('<I', root, off)[0])
+            off += 4
+
+        stream_pages = []
+        for sz in stream_sizes:
+            cnt = math.ceil(sz / page_size) if (sz > 0 and sz != 0xFFFFFFFF) else 0
+            pages = [_struct.unpack_from('<I', root, off + j * 4)[0]
+                     for j in range(cnt)]
+            off += cnt * 4
+            stream_pages.append(pages)
+
+        def read_stream(idx):
+            if idx >= num_streams or stream_sizes[idx] in (0, 0xFFFFFFFF):
+                return b''
+            buf = bytearray()
+            for pn in stream_pages[idx]:
+                buf.extend(data[pn * page_size:(pn + 1) * page_size])
+            return bytes(buf[:stream_sizes[idx]])
+
+        tpi = read_stream(2)
+        self._parse_tpi_stream(tpi)
+
+    # ── Common TPI parser ────────────────────────────────────────
+
+    def _parse_tpi_stream(self, tpi):
+        if len(tpi) < 20:
+            return
+
+        hdr_size = _struct.unpack_from('<I', tpi, 4)[0]
+        self._ti_min = _struct.unpack_from('<I', tpi, 8)[0]
+        self._ti_max = _struct.unpack_from('<I', tpi, 12)[0]
+
+        pos = hdr_size
+        ti = self._ti_min
+        while pos + 4 <= len(tpi) and ti < self._ti_max:
+            rec_len = _struct.unpack_from('<H', tpi, pos)[0]
+            if rec_len < 2 or pos + 2 + rec_len > len(tpi):
+                break
+            leaf = _struct.unpack_from('<H', tpi, pos + 2)[0]
+            rec_data = tpi[pos + 4:pos + 2 + rec_len]
+            self._type_records[ti] = (leaf, rec_data)
+            pos += 2 + rec_len
+            if pos % 4:
+                pos += 4 - (pos % 4)
+            ti += 1
+
+        # Index named structures / unions / enums
+        for type_idx, (leaf, rec_data) in self._type_records.items():
+            if leaf in (LF_STRUCTURE, LF_STRUCTURE7) and len(rec_data) >= 16:
+                name, is_fwd, count = self._parse_struct_header(rec_data)
+                if name:
+                    if count > 0 and not is_fwd:
+                        self._struct_index[name] = type_idx
+            elif leaf in (LF_UNION, LF_UNION7) and len(rec_data) >= 12:
+                name, is_fwd, count = self._parse_union_header(rec_data)
+                if name:
+                    if count > 0 and not is_fwd:
+                        self._union_index[name] = type_idx
+            elif leaf in (LF_ENUM_ST, LF_ENUM) and len(rec_data) >= 12:
+                name = self._parse_enum_name(rec_data)
+                if name:
+                    self._enum_index[name] = type_idx
+
+    def _read_name(self, buf, off):
+        """Read length-prefixed or null-terminated name at offset."""
+        if off >= len(buf):
+            return '', off
+        # Length-prefixed (PDB 2.0 _ST variants)
+        name_len = buf[off]
+        if 0 < name_len < 200 and off + 1 + name_len <= len(buf):
+            # Verify it looks like ASCII
+            candidate = buf[off + 1:off + 1 + name_len]
+            if all(32 <= b < 127 for b in candidate):
+                return candidate.decode('ascii', errors='replace'), off + 1 + name_len
+        # Null-terminated (PDB 7.0)
+        null_idx = buf[off:off + 256].find(0)
+        if null_idx >= 0:
+            name = buf[off:off + null_idx].decode('ascii', errors='replace')
+            return name, off + null_idx + 1
+        return '', off
+
+    def _parse_struct_header(self, d):
+        """Parse LF_STRUCTURE record. Returns (name, is_forward_ref, count)."""
+        count = _struct.unpack_from('<H', d, 0)[0]
+        prop = _struct.unpack_from('<H', d, 2)[0]
+        is_fwd = (prop & 0x80) != 0
+        # field_ti(u32), dList(u32), vshape(u32), size(numeric_leaf), name
+        _, name_off = _read_numeric_leaf(d, 16)
+        name, _ = self._read_name(d, name_off)
+        return name, is_fwd, count
+
+    def _parse_union_header(self, d):
+        """Parse LF_UNION record."""
+        count = _struct.unpack_from('<H', d, 0)[0]
+        prop = _struct.unpack_from('<H', d, 2)[0]
+        is_fwd = (prop & 0x80) != 0
+        _, name_off = _read_numeric_leaf(d, 8)
+        name, _ = self._read_name(d, name_off)
+        return name, is_fwd, count
+
+    def _parse_enum_name(self, d):
+        """Parse LF_ENUM record to get name."""
+        if len(d) < 12:
+            return ''
+        name, _ = self._read_name(d, 12)
+        return name
+
+    # ── Type name resolution ─────────────────────────────────────
+
+    def resolve_type_name(self, ti, depth=0):
+        """Resolve a type index to a human-readable C type name."""
+        if ti in self._type_name_cache:
+            return self._type_name_cache[ti]
+        name = self._resolve_type_impl(ti, depth)
+        self._type_name_cache[ti] = name
+        return name
+
+    def _resolve_type_impl(self, ti, depth):
+        if depth > 12:
+            return '...'
+        if ti == 0:
+            return 'void'
+        if ti < 0x1000:
+            return _builtin_type_name(ti)
+
+        rec = self._type_records.get(ti)
+        if not rec:
+            return f'T_{ti:04X}'
+
+        leaf, d = rec
+
+        if leaf in (LF_STRUCTURE, LF_STRUCTURE7):
+            _, name_off = _read_numeric_leaf(d, 16)
+            name, _ = self._read_name(d, name_off)
+            if name:
+                return name.lstrip('_') if not name.startswith('__') else name
+            return f'STRUCT_{ti:04X}'
+
+        if leaf in (LF_UNION, LF_UNION7):
+            _, name_off = _read_numeric_leaf(d, 8)
+            name, _ = self._read_name(d, name_off)
+            if name:
+                return name.lstrip('_') if not name.startswith('__') else name
+            return f'UNION_{ti:04X}'
+
+        if leaf in (LF_ENUM_ST, LF_ENUM):
+            name, _ = self._read_name(d, 12)
+            if name:
+                return name.lstrip('_') if not name.startswith('__') else name
+            return f'ENUM_{ti:04X}'
+
+        if leaf == LF_MODIFIER and len(d) >= 4:
+            return self.resolve_type_name(_struct.unpack_from('<I', d, 0)[0], depth + 1)
+
+        if leaf == LF_POINTER:
+            if len(d) >= 4:
+                base = self.resolve_type_name(_struct.unpack_from('<I', d, 0)[0], depth + 1)
+                if base.islower():
+                    return 'P' + base.upper()
+                return 'P' + base
+            return 'PVOID'
+
+        if leaf in (LF_ARRAY_ST, LF_ARRAY) and len(d) >= 8:
+            elem_ti = _struct.unpack_from('<I', d, 0)[0]
+            arr_size, _ = _read_numeric_leaf(d, 8)
+            elem_name = self.resolve_type_name(elem_ti, depth + 1)
+            if arr_size:
+                elem_sz = self._type_size(elem_ti)
+                count = arr_size // elem_sz if elem_sz else 0
+                if count > 0:
+                    return f'{elem_name}[{count}]'
+                return f'{elem_name}[{arr_size}]'
+            return f'{elem_name}[]'
+
+        if leaf == LF_PROCEDURE:
+            return 'PROC'
+
+        if leaf == LF_MFUNCTION:
+            return 'MFUNC'
+
+        if leaf == LF_BITFIELD and len(d) >= 6:
+            base_ti = _struct.unpack_from('<I', d, 0)[0]
+            n_bits = d[4]
+            base_name = self.resolve_type_name(base_ti, depth + 1)
+            return f'{base_name}:{n_bits}'
+
+        return f'L_{leaf:04X}'
+
+    # ── Compute type size ────────────────────────────────────────
+
+    def _type_size(self, ti):
+        """Compute size of a type in bytes."""
+        if ti == 0:
+            return 0
+        if ti < 0x1000:
+            base = ti & 0xFF
+            mode = (ti >> 8) & 0xF
+            if mode in (4, 5, 6):
+                return 4  # 32-bit pointer
+            sizes = {
+                0x00: 0, 0x03: 0, 0x10: 1, 0x11: 2, 0x12: 4, 0x13: 8,
+                0x20: 1, 0x21: 2, 0x22: 4, 0x23: 8,
+                0x30: 1, 0x31: 1, 0x40: 4, 0x41: 8,
+                0x68: 4, 0x69: 4, 0x70: 4, 0x72: 4, 0x73: 4,
+                0x74: 2, 0x75: 2,
+            }
+            return sizes.get(base, 4)
+
+        rec = self._type_records.get(ti)
+        if not rec:
+            return 0
+        leaf, d = rec
+
+        if leaf in (LF_STRUCTURE, LF_STRUCTURE7) and len(d) >= 16:
+            size, _ = _read_numeric_leaf(d, 16)
+            if size == 0:
+                # Forward ref — look up the real definition
+                _, name_off = _read_numeric_leaf(d, 16)
+                name, _ = self._read_name(d, name_off)
+                real_ti = self._struct_index.get(name)
+                if real_ti and real_ti != ti:
+                    return self._type_size(real_ti)
+            return size
+
+        if leaf in (LF_UNION, LF_UNION7) and len(d) >= 8:
+            size, _ = _read_numeric_leaf(d, 8)
+            if size == 0:
+                _, name_off = _read_numeric_leaf(d, 8)
+                name, _ = self._read_name(d, name_off)
+                real_ti = self._union_index.get(name)
+                if real_ti and real_ti != ti:
+                    return self._type_size(real_ti)
+            return size
+
+        if leaf in (LF_ARRAY_ST, LF_ARRAY) and len(d) >= 8:
+            size, _ = _read_numeric_leaf(d, 8)
+            return size
+
+        if leaf == LF_POINTER:
+            return 4
+
+        if leaf == LF_MODIFIER and len(d) >= 4:
+            return self._type_size(_struct.unpack_from('<I', d, 0)[0])
+
+        if leaf in (LF_ENUM_ST, LF_ENUM) and len(d) >= 8:
+            return self._type_size(_struct.unpack_from('<I', d, 4)[0])
+
+        if leaf == LF_BITFIELD and len(d) >= 4:
+            return self._type_size(_struct.unpack_from('<I', d, 0)[0])
+
+        return 0
+
+    # ── Field list parsing ───────────────────────────────────────
+
+    def _parse_fieldlist(self, fl_ti, struct_size=0):
+        """Parse a LF_FIELDLIST record and return list of member fields."""
+        rec = self._type_records.get(fl_ti)
+        if not rec:
+            return []
+        leaf, d = rec
+        if leaf != LF_FIELDLIST:
+            return []
+
+        fields = []
+        fpos = 0
+        while fpos + 4 <= len(d):
+            sub_leaf = _struct.unpack_from('<H', d, fpos)[0]
+
+            if sub_leaf in (LF_MEMBER_ST, LF_MEMBER):
+                # attr(u16), type_ti(u32), offset(numeric_leaf), name
+                if fpos + 8 > len(d):
+                    break
+                type_ti = _struct.unpack_from('<I', d, fpos + 4)[0]
+                offset_val, noff = _read_numeric_leaf(d, fpos + 8)
+                name, end = self._read_name(d, noff)
+                type_name = self.resolve_type_name(type_ti)
+                size = self._type_size(type_ti)
+                fields.append({
+                    'offset': offset_val,
+                    'size': size,
+                    'name': name,
+                    'type': type_name,
+                })
+                fpos = end
+                if fpos % 4:
+                    fpos += 4 - (fpos % 4)
+
+            elif sub_leaf >= 0xF0:
+                # Padding bytes
+                fpos += sub_leaf - 0xF0 + 1
+
+            else:
+                # Skip unknown sub-records (LF_ENUMERATE, LF_NESTTYPE, etc.)
+                fpos += 2
+                while fpos + 2 <= len(d):
+                    nl = _struct.unpack_from('<H', d, fpos)[0]
+                    if nl in (LF_MEMBER_ST, LF_MEMBER) or nl >= 0xF0:
+                        break
+                    fpos += 1
+
+        # Fill in zero sizes from next field offset
+        for i, f in enumerate(fields):
+            if f['size'] == 0:
+                if i + 1 < len(fields):
+                    f['size'] = fields[i + 1]['offset'] - f['offset']
+                elif struct_size > f['offset']:
+                    f['size'] = struct_size - f['offset']
+
+        return fields
+
+    # ── Public API ───────────────────────────────────────────────
+
+    def list_structures(self):
+        """Return sorted list of all structure names found in PDB."""
+        return sorted(self._struct_index.keys())
+
+    def list_unions(self):
+        """Return sorted list of all union names found in PDB."""
+        return sorted(self._union_index.keys())
+
+    def list_enums(self):
+        """Return sorted list of all enum names found in PDB."""
+        return sorted(self._enum_index.keys())
+
+    def list_all_types(self):
+        """Return sorted list of all named structs, unions, and enums."""
+        return sorted(set(list(self._struct_index.keys()) +
+                          list(self._union_index.keys()) +
+                          list(self._enum_index.keys())))
+
+    def get_structure(self, name):
+        """
+        Get a full structure layout by name.
+        Accepts '_PEB' or 'PEB' (auto-tries _ prefix).
+        Returns dict: {name, size, os, fields, field_count, source, raw_name}
+        """
+        ti = self._struct_index.get(name)
+        if ti is None and not name.startswith('_'):
+            ti = self._struct_index.get('_' + name)
+        if ti is None:
+            # Case-insensitive fallback
+            name_upper = name.upper().lstrip('_')
+            for k, v in self._struct_index.items():
+                if k.upper().lstrip('_') == name_upper:
+                    ti = v
+                    break
+        if ti is None:
+            return None
+
+        leaf, d = self._type_records[ti]
+        count = _struct.unpack_from('<H', d, 0)[0]
+        field_ti = _struct.unpack_from('<I', d, 4)[0]
+        struct_size, name_off = _read_numeric_leaf(d, 16)
+        struct_name, _ = self._read_name(d, name_off)
+
+        fields = self._parse_fieldlist(field_ti, struct_size)
+
+        return {
+            'name': struct_name.lstrip('_'),
+            'size': struct_size,
+            'os': f'from {self.source}',
+            'fields': fields,
+            'field_count': len(fields),
+            'source': self.source,
+            'raw_name': struct_name,
+        }
+
+    def get_structure_names_matching(self, pattern):
+        """Return struct names containing the given substring (case-insensitive)."""
+        p = pattern.upper()
+        return sorted(n for n in self._struct_index if p in n.upper())
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Module-level convenience API
+# ════════════════════════════════════════════════════════════════════
+
+_current_pdb = None  # type: PDBTypeInfo | None
+
+
+def load_pdb(pdb_path):
+    """Load a PDB file and set it as the active type source."""
+    global _current_pdb
+    _current_pdb = PDBTypeInfo(pdb_path)
+    return _current_pdb
+
+
+def get_current_pdb():
+    """Return the currently loaded PDBTypeInfo, or None."""
+    return _current_pdb
+
+
+def list_structures():
+    """List structure names from the currently loaded PDB."""
+    if _current_pdb is None:
+        return []
+    return _current_pdb.list_structures()
+
+
+def get_structure(name):
+    """Get a structure layout from the currently loaded PDB."""
+    if _current_pdb is None:
+        return None
+    return _current_pdb.get_structure(name)
+
+
+# Backward compatibility aliases
+list_known_structures = list_structures
+get_known_structure = get_structure
 
 
 def generate_c_header(struct_def):
-    """
-    Generate a C header definition from a structure layout.
-    Useful for creating compatible headers for ReactOS compilation.
-    """
+    """Generate a C header definition from a structure layout dict."""
     lines = []
-    lines.append(f"/* {struct_def['name']} - {struct_def['os']} */")
-    lines.append(f"/* Total size: 0x{struct_def['size']:X} ({struct_def['size']} bytes) */")
-    lines.append(f"typedef struct _{struct_def['name']} {{")
+    name = struct_def['name']
+    os_label = struct_def.get('os', '')
+    size = struct_def.get('size', 0)
+
+    lines.append(f"/* {name} - {os_label} */")
+    lines.append(f"/* Total size: 0x{size:X} ({size} bytes) */")
+    lines.append(f"typedef struct _{name} {{")
 
     prev_end = 0
-    for field in struct_def['fields']:
+    for field in struct_def.get('fields', []):
         offset = field['offset']
-        # Add padding if there's a gap
+        fsz = field.get('size', 0)
+        ftype = field.get('type', 'UCHAR')
+        fname = field.get('name', '???')
+
         if offset > prev_end:
             gap = offset - prev_end
-            lines.append(f"    UCHAR _padding_{prev_end:03X}[{gap}];  /* offset 0x{prev_end:03X} */")
+            lines.append(f"    UCHAR _padding_{prev_end:03X}[{gap}];  "
+                         f"/* offset 0x{prev_end:03X} */")
 
-        lines.append(f"    {field['type']:40s} {field['name']};  /* offset 0x{offset:03X}, size 0x{field['size']:X} */")
-        prev_end = offset + field['size']
+        lines.append(f"    {ftype:40s} {fname};  "
+                     f"/* offset 0x{offset:03X}, size 0x{fsz:X} */")
+        prev_end = offset + fsz
 
-    lines.append(f"}} {struct_def['name']}, *P{struct_def['name']};")
+    lines.append(f"}} {name}, *P{name};")
     lines.append("")
-
     return '\n'.join(lines)
 
 
-def save_all_headers(output_dir):
-    """Generate C headers for all known structures."""
+def save_all_headers(output_dir, pdb_info=None):
+    """Generate C headers for all structures in the loaded PDB."""
+    src = pdb_info or _current_pdb
+    if src is None:
+        return []
+
     os.makedirs(output_dir, exist_ok=True)
     files = []
-    for name, struct_def in ALL_KNOWN_STRUCTURES.items():
-        path = os.path.join(output_dir, f"{name.lower()}_win2k.h")
+    for name in src.list_structures():
+        s = src.get_structure(name)
+        if not s:
+            continue
+        clean = s['name']
+        path = os.path.join(output_dir, f"{clean.lower()}.h")
+        guard = clean.upper() + '_H'
         with open(path, 'w') as f:
-            f.write(f"#ifndef _{name.upper()}_WIN2K_H\n")
-            f.write(f"#define _{name.upper()}_WIN2K_H\n\n")
-            f.write(generate_c_header(struct_def))
-            f.write(f"\n#endif /* _{name.upper()}_WIN2K_H */\n")
+            f.write(f"#ifndef _{guard}\n")
+            f.write(f"#define _{guard}\n\n")
+            f.write(generate_c_header(s))
+            f.write(f"\n#endif /* _{guard} */\n")
         files.append(path)
     return files

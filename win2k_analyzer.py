@@ -45,8 +45,9 @@ from nt_analyzer.comparator import (
     full_comparison, save_comparison_report, print_comparison_summary
 )
 from nt_analyzer.struct_analyzer import (
-    get_known_structure, list_known_structures,
-    generate_c_header, save_all_headers
+    load_pdb, list_structures, get_structure,
+    generate_c_header, save_all_headers,
+    list_known_structures, get_known_structure,
 )
 from nt_analyzer.def_generator import generate_def_file
 from nt_analyzer.syscall_patcher import generate_syscall_header
@@ -59,7 +60,7 @@ from nt_analyzer.decompiler import (
     decompile, decompile_no_symbols, batch_decompile, X86Decompiler
 )
 from nt_analyzer.compat_analyzer import (
-    compare_compat, analyze_single_pe, get_known_differences, diagnose_bugcheck
+    compare_compat, analyze_single_pe, diagnose_bugcheck
 )
 from nt_analyzer.pe_patcher import (
     PEPatcher, CodeBlob, DiffEntry, PatchSet,
@@ -185,19 +186,23 @@ def cmd_compare(args):
 
 
 def cmd_structs(args):
-    """Show known NT structure layouts."""
-    if args.name:
-        struct_def = get_known_structure(args.name.upper())
-        if not struct_def:
-            # Try case-insensitive
-            for n in list_known_structures():
-                if n.upper() == args.name.upper():
-                    struct_def = get_known_structure(n)
-                    break
+    """Show structure layouts from a PDB file."""
+    if not args.pdb:
+        print("  Error: --pdb <path> is required. Provide a PDB file (e.g. ntoskrnl.pdb)")
+        return
+    try:
+        pdb_info = load_pdb(args.pdb)
+    except Exception as e:
+        print(f"  Error loading PDB: {e}")
+        return
 
+    if args.name:
+        struct_def = pdb_info.get_structure(args.name)
         if not struct_def:
             print(f"  Unknown structure: {args.name}")
-            print(f"  Known structures: {', '.join(list_known_structures())}")
+            matches = pdb_info.get_structure_names_matching(args.name)
+            if matches:
+                print(f"  Similar: {', '.join(matches[:20])}")
             return
 
         print(f"\n{'='*70}")
@@ -214,17 +219,27 @@ def cmd_structs(args):
             print(f"\n  --- C HEADER ---\n")
             print(generate_c_header(struct_def))
     else:
-        print(f"\n  Known Windows 2000 SP4 structures:")
-        for name in list_known_structures():
-            s = get_known_structure(name)
-            print(f"    {name:<25} size=0x{s['size']:X} ({s['size']} bytes), {len(s['fields'])} fields")
-        print(f"\n  Use: win2k_analyzer.py structs <name> to see details")
-        print(f"  Use: win2k_analyzer.py structs <name> --c-header to generate C header")
+        structs = pdb_info.list_structures()
+        print(f"\n  Structures from {os.path.basename(args.pdb)} ({len(structs)} total):")
+        for name in structs:
+            s = pdb_info.get_structure(name)
+            if s:
+                print(f"    {name:<40} size=0x{s['size']:X} ({s['size']} bytes), {len(s['fields'])} fields")
+        print(f"\n  Use: win2k_analyzer.py structs --pdb <file> <name> to see details")
+        print(f"  Use: win2k_analyzer.py structs --pdb <file> <name> --c-header to generate C header")
 
 
 def cmd_gen_headers(args):
-    """Generate C headers for all known structures."""
-    files = save_all_headers(args.output_dir)
+    """Generate C headers for all structures in a PDB."""
+    if not args.pdb:
+        print("  Error: --pdb <path> is required.")
+        return
+    try:
+        pdb_info = load_pdb(args.pdb)
+    except Exception as e:
+        print(f"  Error loading PDB: {e}")
+        return
+    files = save_all_headers(args.output_dir, pdb_info)
     print(f"\n  Generated {len(files)} header files in: {args.output_dir}")
     for f in files:
         print(f"    {os.path.basename(f)}")
@@ -478,30 +493,7 @@ def cmd_compat_single(args):
         print(f"    {s['name']:<10} vsize=0x{s['vsize']:X}  raw=0x{s['rsize']:X}  chars=0x{s['chars']:08X}")
 
 
-def cmd_compat_known(args):
-    """Show known NT version differences."""
-    diffs = get_known_differences()
-    print(f"\n{'='*70}")
-    print(f"  KNOWN NT 5.0 → 5.1 DIFFERENCES")
-    print(f"{'='*70}")
-    print(f"\n  ── Calling Convention Changes ──")
-    for name, info in diffs['calling_convention_changes'].items():
-        print(f"    {name}: {info['from']} → {info['to']}")
-    print(f"\n  ── HAL Dispatch Removed Defines ──")
-    for name, routing in diffs['hal_dispatch_removed_defines'].items():
-        print(f"    {name}: was routed through {routing}")
-    print(f"\n  ── Macro Differences ──")
-    for name, info in diffs['macro_differences'].items():
-        print(f"    {name}: {info['desc']}")
-    print(f"\n  ── HAL Functions Removed in XP ──")
-    for name in diffs['hal_functions_removed']:
-        print(f"    {name}")
-    print(f"\n  ── IDT Dispatch Changes ──")
-    for ver, info in diffs['idt_dispatch_changes'].items():
-        print(f"    NT {ver}: {info['desc']}")
-    print(f"\n  ── Bugcheck Codes ──")
-    for code, info in diffs['compat_bugchecks'].items():
-        print(f"    0x{code:08X} {info['name']}: {info['compat_hint']}")
+
 
 
 def cmd_bugcheck(args):
@@ -667,7 +659,7 @@ Examples:
   %(prog)s compare C:\\win2k\\ntdll.dll C:\\reactos\\ntdll.dll
   %(prog)s structs PEB --c-header
   %(prog)s compat-analyze C:\\win2k\\ntoskrnl.exe C:\\reactos\\ntoskrnl.exe
-  %(prog)s compat-known
+
   %(prog)s patch-pe --quick C:\\reactos\\ntdll.dll
   %(prog)s bugcheck 0xA5
         """
@@ -703,13 +695,15 @@ Examples:
     p.add_argument('-o', '--output', help='Save full report to JSON file')
 
     # structs
-    p = subparsers.add_parser('structs', help='Show known NT structure layouts')
-    p.add_argument('name', nargs='?', help='Structure name (PEB, TEB, KUSER_SHARED_DATA)')
+    p = subparsers.add_parser('structs', help='Show structure layouts from a PDB file')
+    p.add_argument('name', nargs='?', help='Structure name (e.g. PEB, EPROCESS, _KTHREAD)')
+    p.add_argument('--pdb', required=True, help='Path to PDB file (e.g. ntoskrnl.pdb)')
     p.add_argument('--c-header', action='store_true', help='Generate C header output')
 
     # gen-headers
-    p = subparsers.add_parser('gen-headers', help='Generate C header files for all known structures')
+    p = subparsers.add_parser('gen-headers', help='Generate C header files for all structures in a PDB')
     p.add_argument('output_dir', help='Output directory for .h files')
+    p.add_argument('--pdb', required=True, help='Path to PDB file')
 
     # scan
     p = subparsers.add_parser('scan', help='Scan a directory for PE files')
@@ -790,9 +784,6 @@ Examples:
     p.add_argument('pe', help='Path to PE file')
     p.add_argument('--label', default='Unknown', help='Version label')
 
-    # compat-known
-    p = subparsers.add_parser('compat-known', help='Show known NT 5.0 vs 5.1 differences')
-
     # bugcheck
     p = subparsers.add_parser('bugcheck', help='Diagnose a bugcheck code for compat issues')
     p.add_argument('code', help='Bugcheck code (hex: 0xA5 or decimal)')
@@ -872,7 +863,6 @@ Examples:
         'batch-decompile': cmd_batch_decompile,
         'compat-analyze': cmd_compat_analyze,
         'compat-single': cmd_compat_single,
-        'compat-known': cmd_compat_known,
         'bugcheck': cmd_bugcheck,
         'patch-pe': cmd_patch_pe,
         'inspect-pe': cmd_inspect_pe,

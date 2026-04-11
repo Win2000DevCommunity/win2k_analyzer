@@ -4,7 +4,15 @@
 
 Analyze, compare, decompile, emulate, debug, patch, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (16 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.3 — Live Kernel Debugger:**
+**NEW in v3.4 — Dynamic PDB Structure Extraction:**
+- **Zero static data:** All Win2000 kernel structure layouts (PEB, TEB, EPROCESS, ETHREAD, KUSER_SHARED_DATA, etc.) are now extracted **live from real PDB debug symbols** — no hardcoded field tables, no stale offsets.
+- **Native PDB 2.0 / 7.0 parser** — reads Microsoft PDB files (both JG/MSF 2.0 and DS/MSF 7.0 formats) directly in pure Python — no `pdbparse` or external dependency required.
+- **Full TPI stream support** — resolves LF_STRUCTURE, LF_UNION, LF_ARRAY, LF_POINTER, LF_MODIFIER, LF_BITFIELD, LF_FIELDLIST and all CodeView leaf types. Handles forward-reference chains, nested types, and pointer qualifiers (PVOID, PULONG, PPEB_LDR_DATA, etc.).
+- **GUI Load PDB button** — Tab 4 (NT Structures) gains a **Load PDB** button and a live filter box. Point it at `ntoskrnl.pdb` and instantly browse all 309+ structures extracted from the debug symbols.
+- **CLI `--pdb` flag** — `structs --pdb ntoskrnl.pdb [NAME]` and `gen-headers --pdb ntoskrnl.pdb <dir>` now require a PDB path so layouts always come from the binary's own symbols.
+- **Tested on Win2K SP4 retail debug symbols** — 309 structures, 10 unions, 2268 types extracted from `ntoskrnl.pdb` (PDB 2.0 format from the Windows 2000 SP4 DDK/debug package).
+
+**Previously in v3.3 — Live Kernel Debugger:**
 - **Live Kernel State Debugger:** Point it at a Win2K System32 folder and it builds a complete kernel environment in RAM — loads ntoskrnl.exe + hal.dll + dependencies, resolves cross-module IAT imports, builds KPCR/EPROCESS/ETHREAD/handle tables, then lets you run any kernel function with breakpoints, single-stepping, register inspection, call stack reconstruction, and object inspection. Like a portable WinDbg — no live kernel, no VM, no debug cables.
 - **Multi-PE Loader:** Loads multiple PEs into a shared Unicorn x86 address space with real GDT/FS segment setup for kernel FS:[offset] access (KPCR at 0xFFDFF000).
 - **Breakpoints + Stepping:** Set breakpoints by name or address, step instruction-by-instruction, continue from pause, inspect registers/stack/memory at any point.
@@ -33,6 +41,7 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 ## Table of Contents
 
 - [What Does This Tool Do?](#what-does-this-tool-do)
+- [What's New in v3.4 — Dynamic PDB Structure Extraction](#whats-new-in-v34--dynamic-pdb-structure-extraction)
 - [What's New in v3.2](#whats-new-in-v32)
 - [Kernel Function Emulator](#kernel-function-emulator--pre-test-patches-before-deploying)
 - [SSDT Resolver — Zero-Symbol Kernel Intelligence](#ssdt-resolver--zero-symbol-kernel-intelligence)
@@ -54,7 +63,6 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 - [Using with GitHub Copilot](#using-with-github-copilot)
 - [Module Architecture](#module-architecture)
 - [FAQ — Frequently Asked Questions](#faq--frequently-asked-questions)
-- [Known NT 5.0 vs 5.1 Differences](#known-nt-50-vs-51-differences)
 - [Contributing](#contributing)
 
 ---
@@ -74,6 +82,120 @@ This tool gives you everything in one place:
 7. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
 8. **Scan** — System-wide cross-reference scanning: find every PE in a directory that imports or calls a given function
 9. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+
+---
+
+## What's New in v3.4 — Dynamic PDB Structure Extraction
+
+### Native PDB Parser (NEW)
+
+All NT kernel structure layouts are now extracted **live from real Win2K debug symbol files** using a built-in pure-Python PDB parser — no external libraries, no `pdbparse`, no hardcoded tables.
+
+**Supported PDB formats:**
+- **PDB 2.0** (magic `Microsoft C/C++ program database 2.00\r\n\x1aJG\0\0`) — used by Windows 2000 SP4 DDK debug symbols
+- **PDB 7.0** (magic `Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0`) — used by modern MSVC toolchains
+
+**CodeView TPI leaf types fully supported:**
+
+| Leaf Code | Type | Description |
+|-----------|------|-------------|
+| `0x1001` | `LF_MODIFIER` | const/volatile qualifier wrapper |
+| `0x1002` | `LF_POINTER` | pointer type (→ PVOID, PULONG, PPEB, ...) |
+| `0x1003` | `LF_ARRAY_ST` | fixed-size array (PDB 2.0 style) |
+| `0x1005` | `LF_STRUCTURE` | struct type with named fields |
+| `0x1006` | `LF_UNION` | union type |
+| `0x1203` | `LF_FIELDLIST` | list of member fields for a struct/union |
+| `0x1205` | `LF_BITFIELD` | bit-field member |
+| `0x1405` | `LF_MEMBER_ST` | named struct member (name + offset + type) |
+| `0x1503` | `LF_ARRAY` | fixed-size array (PDB 7.0 style) |
+
+**Forward-reference resolution** — if a struct type has size=0 (forward reference), the parser automatically finds the full definition by scanning the TPI stream.
+
+**Pointer name promotion** — `P` + `void` → `PVOID`, `P` + `ULONG` → `PULONG`, `P` + `_PEB_LDR_DATA` → `PPEB_LDR_DATA` (uses uppercase only when base type is all-caps).
+
+**Last-field size inference** — the size of the final field in any struct is inferred from `struct_total_size − last_field_offset` rather than guessing from the type, eliminating zero-byte trailing fields.
+
+### What Was Extracted from Win2K SP4 ntoskrnl.pdb
+
+```
+PDB format:  2.0 (JG/MSF)
+TPI stream:  2268 types
+Structures:  309
+Unions:       10
+```
+
+**Example — PEB (Process Environment Block):**
+```c
+typedef struct _PEB {         // 488 bytes, 56 fields
+    UCHAR  InheritedAddressSpace;          // +0x000  1 bytes
+    UCHAR  ReadImageFileExecOptions;       // +0x001  1 bytes
+    UCHAR  BeingDebugged;                  // +0x002  1 bytes
+    UCHAR  SpareBool;                      // +0x003  1 bytes
+    PVOID  Mutant;                         // +0x004  4 bytes
+    PVOID  ImageBaseAddress;               // +0x008  4 bytes
+    PPEB_LDR_DATA  Ldr;                    // +0x00c  4 bytes
+    // ... 53 more fields
+    ULONG  CSDVersion[2];                  // +0x1e8  8 bytes (last field from struct size)
+} PEB;
+```
+
+### GUI Changes: Tab 4 (NT Structures)
+
+The Structures tab is completely reworked:
+
+- **Load PDB button** — opens a file dialog to select any `.pdb` file
+- **Live filter box** — type to filter structure names in real time (e.g., type `PEB` to instantly find `_PEB`, `_PEB_LDR_DATA`, `_PEB_FREE_BLOCK`)
+- **Dynamic combobox** — populated with all extracted structures after PDB load (309+ entries from ntoskrnl.pdb)
+- **View Layout** — shows field table: name, offset (hex), size (bytes), type string
+- **Generate C Header** — generates a proper C typedef struct block for the selected structure
+- **Export All Headers** — generates `.h` files for every structure/union in the PDB into a chosen output directory
+
+### CLI Changes
+
+```bash
+# List all structures from a PDB
+python win2k_analyzer.py structs --pdb C:\Symbols\ntoskrnl.pdb
+
+# View a specific structure
+python win2k_analyzer.py structs --pdb C:\Symbols\ntoskrnl.pdb _PEB
+
+# Generate C header for one structure
+python win2k_analyzer.py structs --pdb C:\Symbols\ntoskrnl.pdb _EPROCESS --c-header
+
+# Generate all C headers from a PDB
+python win2k_analyzer.py gen-headers --pdb C:\Symbols\ntoskrnl.pdb .\generated_headers\
+```
+
+The `--pdb` flag is **required** for both commands — structures always come from the provided debug symbols, never from embedded static data.
+
+### Python API
+
+```python
+from nt_analyzer.struct_analyzer import load_pdb, list_structures, get_structure, PDBTypeInfo
+
+# Load a PDB file
+info = load_pdb(r"C:\Symbols\ntoskrnl.pdb")
+
+# List all available structure names
+names = list_structures(info)   # ['_ACE', '_ACL', ..., '_PEB', ..., '_ZONE_HEADER']
+print(f"{len(names)} structures found")
+
+# Get one structure's fields
+peb = get_structure(info, "_PEB")
+# → PDBTypeInfo(name='_PEB', size=488, fields=[...56 fields...])
+for field in peb.fields:
+    print(f"  +0x{field.offset:03x}  {field.type_name:<30} {field.name}")
+
+# Generate a C header string
+from nt_analyzer.struct_analyzer import generate_c_header
+header = generate_c_header(info, "_PEB")
+print(header)
+
+# Save all headers to disk
+from nt_analyzer.struct_analyzer import save_all_headers
+saved = save_all_headers(info, r".\generated_headers")
+print(f"Saved {saved} header files")
+```
 
 ---
 
@@ -389,8 +511,8 @@ All long-running operations now show a **real-time progress dialog** with:
 | | Generate syscall headers (napi/define/asm/table styles) | `syscall-patch` | Tab 7 |
 | **Comparison** | Full DLL comparison (exports + imports + headers + syscalls) | `compare` | Tab 3 |
 | | Batch compare all matching DLLs in two directories | `batch-compare` | Tab 3 |
-| **Structures** | 9 known Win2000 SP4 undocumented structure layouts | `structs` | Tab 4 |
-| | Generate C header files (.h) for all structures | `gen-headers` | Tab 4 |
+| **Structures** | Dynamic PDB extraction — 309+ structures from real Win2K debug symbols | `structs --pdb` | Tab 4 |
+| | Generate C header files (.h) for all extracted structures | `gen-headers --pdb` | Tab 4 |
 | **DEF Files** | Auto-generate .def files from DLL exports | `gen-def` | Tab 6 |
 | **Decompiler** | Decompile exported functions to C pseudocode | `decompile` | Tab 11 |
 | | **Annotated x86 disassembly with color highlighting** | — | Tab 11 |
@@ -417,7 +539,6 @@ All long-running operations now show a **real-time progress dialog** with:
 | | **Merge symbols into function discovery and disassembly** | — | Tab 10, 13 |
 | **Compat Analysis** | Deep compatibility analysis between two PE binaries | `compat-analyze` | Tab 12 |
 | | Single PE compatibility profile | `compat-single` | Tab 12 |
-| | Show all known NT 5.0→5.1 differences | `compat-known` | Tab 12 |
 | | Bugcheck code diagnosis with compat hints | `bugcheck` | Tab 12 |
 | **PE Patching** | Quick Win2000 patch (version + syscalls) | `patch-pe --quick` | Tab 15 |
 | | Patch sysenter stubs to int 0x2E | `patch-pe --syscalls` | Tab 15 |
@@ -533,7 +654,7 @@ Double-click `win2k_gui.py` (if Python is associated with `.py` files).
 | 1 | Exports / Imports | Browse any PE file's export and import tables |
 | 2 | Syscall Extractor | Extract syscall numbers from ntdll.dll |
 | 3 | DLL Comparison | Side-by-side comparison of two DLLs |
-| 4 | NT Structures | View 9 known Win2000 undocumented structures, generate C headers |
+| 4 | NT Structures | Load PDB, extract 309+ structures live, filter, C header generation |
 | 5 | PE Header / Scan | Full PE header dump, scan directories for PE files |
 | 6 | DEF Generator | Auto-generate .def files from DLL exports |
 | 7 | Syscall Patcher | Generate syscall headers in 4 styles |
@@ -615,7 +736,7 @@ This tool is fully compatible with **GitHub Copilot** in VS Code:
 - **Copilot Agent Mode** can run CLI commands for you directly, analyze the output, and suggest next steps
 - Copilot can read the Python modules and help you extend them with new analysis features
 - You can ask Copilot to analyze the output of `compat-analyze` and explain what each issue means
-- Copilot can help you write patches based on the `compat-known` output
+- Copilot can help you write patches based on the `compat-analyze` output
 
 **Example Copilot workflow:**
 1. Ask Copilot: *"Run compat-analyze on my Win2000 ntoskrnl.exe vs ReactOS one and explain the results"*
@@ -691,20 +812,23 @@ Compares all matching DLLs between two directories.
 
 #### `structs` — Show NT Structure Layouts
 ```bash
-python win2k_analyzer.py structs [name] [--c-header]
+python win2k_analyzer.py structs --pdb <pdb_path> [name] [--c-header]
 ```
-Shows known Win2000 SP4 undocumented structure layouts. Available structures: `PEB`, `TEB`, `KUSER_SHARED_DATA`, `EPROCESS`, `ETHREAD`, `LDR_DATA_TABLE_ENTRY`, `HEAP`, `PEB_LDR_DATA`, `RTL_USER_PROCESS_PARAMETERS`.
+Extracts and displays Win2000 kernel structure layouts **directly from a PDB debug symbol file**. Pass the name of any structure to view its field list, or omit the name to list all available structures.
 
 ```bash
-python win2k_analyzer.py structs PEB --c-header   # Generate C header for PEB
-python win2k_analyzer.py structs                   # List all known structures
+python win2k_analyzer.py structs --pdb ntoskrnl.pdb PEB --c-header   # C header for PEB
+python win2k_analyzer.py structs --pdb ntoskrnl.pdb                   # List all 309+ structures
+python win2k_analyzer.py structs --pdb ntoskrnl.pdb EPROCESS          # View EPROCESS layout
 ```
+
+> **Required:** You need the Win2K SP4 debug symbols (`ntoskrnl.pdb`, available from the Windows 2000 SP4 DDK/debug package or Microsoft Symbol Server). PDB 2.0 (`JG`) and PDB 7.0 (`DS`) formats are both supported natively.
 
 #### `gen-headers` — Generate All C Headers
 ```bash
-python win2k_analyzer.py gen-headers <output_dir>
+python win2k_analyzer.py gen-headers --pdb <pdb_path> <output_dir>
 ```
-Generates `.h` files for all 9 known structures.
+Extracts every structure and union from the PDB file and generates a `.h` file for each one in `<output_dir>`.
 
 ---
 
@@ -800,12 +924,6 @@ python win2k_analyzer.py compat-analyze C:\win2k\ntdll.dll C:\reactos\ntdll.dll 
 python win2k_analyzer.py compat-single <pe_path> [--label Win2000]
 ```
 Analyzes a single binary: type, machine, syscall mechanism, calling convention statistics, section layout.
-
-#### `compat-known` — Known NT Version Differences
-```bash
-python win2k_analyzer.py compat-known
-```
-Displays the built-in knowledge base of all known NT 5.0 → 5.1 differences: calling convention changes, removed HAL defines, macro differences, IDT dispatch changes, bugcheck codes.
 
 #### `bugcheck` — Bugcheck Code Diagnosis
 ```bash
@@ -985,7 +1103,7 @@ python win2k_analyzer.py patch-pe C:\reactos\ntoskrnl.exe \
   -o ntoskrnl_w2k.exe
 ```
 
-**Known NT 5.0 → 5.1 calling convention changes detected by our tool:**
+**Calling convention changes dynamically detected by our tool:**
 
 | Function | Win2000 (5.0) | XP/ReactOS (5.1) |
 |---|---|---|
@@ -1220,10 +1338,13 @@ A full 13-scenario debug test is included in [`ntpower_debug_results.txt`](ntpow
 - Shows: exports only in A, only in B, common, ordinal mismatches, import differences, header differences
 
 ### Tab 4: NT Structures
-- Select from 9 known Win2000 SP4 undocumented structures
-- View field names, offsets, sizes, types
-- Generate C header files (.h)
-- Structures: PEB, TEB, KUSER_SHARED_DATA, EPROCESS, ETHREAD, LDR_DATA_TABLE_ENTRY, HEAP, PEB_LDR_DATA, RTL_USER_PROCESS_PARAMETERS
+- Click **Load PDB** and browse to a Win2K debug symbol file (e.g., `ntoskrnl.pdb`)
+- All structures and unions are extracted live from the PDB — 309+ structures from the Win2K SP4 ntoskrnl symbols
+- Type in the **Filter** box to search by structure name in real time
+- Select a structure from the dropdown to view its field names, offsets, sizes, and types
+- **Generate C Header** — generate a `.h` file for the selected structure
+- **Export All Headers** — generate `.h` files for every extracted structure into a chosen directory
+- Supports both PDB 2.0 (JG/MSF, Win2K DDK format) and PDB 7.0 (DS/MSF, modern format)
 
 ### Tab 5: PE Header / Scan
 - Detailed PE header dump for any file
@@ -1282,7 +1403,6 @@ A full 13-scenario debug test is included in [`ntpower_debug_results.txt`](ntpow
 - Set version labels (e.g., "Win2000" and "ReactOS")
 - **Full Compat Analysis** — runs all detection engines
 - **Analyze Single PE** — compatibility profile for one binary
-- **Known Differences** — browse the built-in NT 5.0→5.1 knowledge base
 - **Bugcheck Lookup** — enter a BSOD code, get compat-specific diagnosis
 - Color-coded output: red for critical, yellow for warnings
 
@@ -1704,7 +1824,7 @@ win2k_analyzer/
 │   ├── pe_analyzer.py         # PE export/import/header analysis
 │   ├── syscall_extractor.py   # Syscall number extraction from ntdll stubs
 │   ├── comparator.py          # Side-by-side DLL comparison
-│   ├── struct_analyzer.py     # 9 known Win2000 SP4 structure layouts
+│   ├── struct_analyzer.py     # Dynamic PDB structure extractor — native PDB 2.0/7.0 parser, zero static data
 │   ├── def_generator.py       # Auto .def file generation
 │   ├── syscall_patcher.py     # Syscall header generation (4 styles)
 │   ├── ros_patcher.py         # ReactOS source tree auto-patcher
@@ -1723,8 +1843,9 @@ win2k_analyzer/
 │   ├── teb_win2k.h
 │   └── kuser_shared_data_win2k.h
 │
-└── tests/                     # Test suite
+└── tests/                     # Test suite (479+ checks across 20 modules)
     ├── __init__.py
+    ├── test_full_app.py        # Full application test suite (20 modules, 479+ checks)
     └── test_gui.py            # GUI widget + integration tests
 ```
 
@@ -1755,7 +1876,7 @@ A: CLI: `python win2k_analyzer.py exports <file>` or GUI: Tab 1, browse to file,
 A: CLI: `python win2k_analyzer.py compare <win2k.dll> <reactos.dll>` for basic comparison, or `python win2k_analyzer.py compat-analyze <win2k.dll> <reactos.dll>` for deep compatibility analysis.
 
 **Q: How do I see the undocumented PEB/TEB/EPROCESS structures?**
-A: CLI: `python win2k_analyzer.py structs PEB` or GUI: Tab 4, select PEB from the list.
+A: CLI: `python win2k_analyzer.py structs --pdb ntoskrnl.pdb PEB` or GUI: Tab 4, click **Load PDB**, select your `ntoskrnl.pdb`, then pick any structure from the dropdown. The tool extracts 309+ structure layouts live from the PDB — no hardcoded data.
 
 **Q: How do I extract syscall numbers?**
 A: CLI: `python win2k_analyzer.py syscalls C:\WINNT\system32\ntdll.dll` or GUI: Tab 2.
@@ -1843,10 +1964,10 @@ A: Run `python win2k_analyzer.py bugcheck 0xA5`. Common cause: HalpVector macro 
 A: Run `python win2k_analyzer.py bugcheck 0x7F`. Common cause: Calling convention mismatch — stdcall callee cleans N bytes from stack but fastcall only cleans N-8, causing stack corruption.
 
 **Q: What are the known NT 5.0→5.1 calling convention changes?**
-A: Run `python win2k_analyzer.py compat-known`. Key ones: IoAssignDriveLetters, IoReadPartitionTable, IoSetPartitionInformation, IoWritePartitionTable changed from stdcall to fastcall. Also IofCallDriver, IofCompleteRequest, KfAcquireSpinLock, KfReleaseSpinLock, KfRaiseIrql, KfLowerIrql.
+A: Run `python win2k_analyzer.py compat-analyze` with a Win2000 and XP kernel to dynamically detect calling convention differences such as IoAssignDriveLetters, IoReadPartitionTable, IofCallDriver, KfAcquireSpinLock, etc.
 
 **Q: What HAL defines were removed in XP?**
-A: HalIoAssignDriveLetters, HalIoReadPartitionTable, HalIoSetPartitionInformation, HalIoWritePartitionTable — these macros routed through HalDispatchTable in Win2000 but were removed in XP (kernel handles them directly).
+A: Use `compat-analyze` to compare two binaries — the tool will dynamically detect missing exports and HAL dispatch routing differences.
 
 ### Patching
 
@@ -1886,30 +2007,7 @@ A: Yes. Open the `win2k_analyzer` folder in VS Code. Use the integrated terminal
 A: Yes. Copilot can run CLI commands via Agent Mode, analyze output, suggest patches, and even extend the analyzer modules. Ask Copilot things like *"Run compat-analyze and explain the results"* or *"Patch this DLL for Windows 2000"*.
 
 **Q: Can I extend the analyzer with new features?**
-A: Yes. Each module in `nt_analyzer/` is standalone. Add new detection rules to `compat_analyzer.py`, new structure layouts to `struct_analyzer.py`, or new patch types to `pe_patcher.py`. The CLI and GUI will pick them up automatically.
-
----
-
-## Known NT 5.0 vs 5.1 Differences
-
-This knowledge base is built into the tool (see `compat-known` command):
-
-| Category | NT 5.0 (Windows 2000) | NT 5.1 (Windows XP) |
-|----------|----------------------|---------------------|
-| Syscall mechanism | `int 0x2E` | `sysenter` |
-| HalpVector macro | `Vector << 4` | `Vector << 8` |
-| IDT entry calculation | Uses Vector directly | Uses `HalVectorToIDTEntry(Vector)` |
-| IoReadPartitionTable | stdcall, routed through HalDispatchTable | fastcall, kernel-direct |
-| IoWritePartitionTable | stdcall, routed through HalDispatchTable | fastcall, kernel-direct |
-| IoAssignDriveLetters | stdcall, routed through HalDispatchTable | fastcall, kernel-direct |
-| IoSetPartitionInformation | stdcall, routed through HalDispatchTable | fastcall, kernel-direct |
-| HalIo* defines | Present in headers | Removed |
-| IofCallDriver | stdcall | fastcall |
-| IofCompleteRequest | stdcall | fastcall |
-| KfAcquireSpinLock | stdcall | fastcall |
-| KfReleaseSpinLock | stdcall | fastcall |
-| Affinity calculation | Direct bitmask | NUMA-aware via HalpVectorToNode |
-| drivesup.c includes | halp.h (kernel code) | nt.h (user-mode style) |
+A: Yes. Each module in `nt_analyzer/` is standalone. Add new detection rules to `compat_analyzer.py`, extend the PDB parser in `struct_analyzer.py` to handle additional CodeView leaf types, or add new patch types to `pe_patcher.py`. The CLI and GUI will pick them up automatically.
 
 ---
 
@@ -1922,14 +2020,13 @@ This is a community project for Windows 2000 preservation and ReactOS compatibil
 3. Submit a pull request
 
 Areas that need help:
-- More structure layouts (KPRCB, KTHREAD, OBJECT_HEADER, etc.)
+- More CodeView leaf type support in the PDB parser (method types, vtables, etc.)
 - x86-64 decompiler support
 - More calling convention detection heuristics
 - Additional NT version difference rules
 - Testing on more Win2000 system binaries
 - Pre-built patch sets for common ReactOS DLLs
-- PDB symbol loading improvements (full type info extraction)
-- Binary diff generation between PE versions
+- PDB support for hal.pdb, ntdll.pdb, win32k.pdb structure extraction
 - Additional prologue patterns for deep function discovery
 - Graph visualization for cross-reference maps
 

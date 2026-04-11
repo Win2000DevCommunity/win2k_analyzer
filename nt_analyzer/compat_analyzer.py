@@ -36,88 +36,8 @@ from capstone import (
 )
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Known NT version differences knowledge base
+#  Bugcheck codes for diagnosis
 # ══════════════════════════════════════════════════════════════════════════
-
-# Functions that changed calling convention between NT 5.0 and 5.1
-CONVENTION_CHANGES_5_0_TO_5_1 = {
-    # HAL I/O functions: stdcall in 2000, fastcall in XP
-    "IoAssignDriveLetters":     {"from": "stdcall", "to": "fastcall"},
-    "IoReadPartitionTable":     {"from": "stdcall", "to": "fastcall"},
-    "IoSetPartitionInformation": {"from": "stdcall", "to": "fastcall"},
-    "IoWritePartitionTable":    {"from": "stdcall", "to": "fastcall"},
-    # I/O completion fastcall wrappers
-    "IofCallDriver":            {"from": "stdcall", "to": "fastcall"},
-    "IofCompleteRequest":       {"from": "stdcall", "to": "fastcall"},
-    # IRQL fastcall variants
-    "KfAcquireSpinLock":        {"from": "stdcall", "to": "fastcall"},
-    "KfReleaseSpinLock":        {"from": "stdcall", "to": "fastcall"},
-    "KfRaiseIrql":              {"from": "stdcall", "to": "fastcall"},
-    "KfLowerIrql":              {"from": "stdcall", "to": "fastcall"},
-}
-
-# HAL dispatch table entries: present in 2000 but defines removed in XP
-HAL_DISPATCH_REMOVED_DEFINES = {
-    "HalIoAssignDriveLetters":     "HALDISPATCH->HalIoAssignDriveLetters",
-    "HalIoReadPartitionTable":     "HALDISPATCH->HalIoReadPartitionTable",
-    "HalIoSetPartitionInformation": "HALDISPATCH->HalIoSetPartitionInformation",
-    "HalIoWritePartitionTable":    "HALDISPATCH->HalIoWritePartitionTable",
-}
-
-# Known macro differences between NT 5.0 and 5.1
-MACRO_DIFFERENCES = {
-    "HalpVector": {
-        "5.0": "vector << 4",  # left shift by 4
-        "5.1": "vector << 8",  # left shift by 8
-        "desc": "HalpVector macro: Win2000 uses <<4, XP uses <<8 for IDT vector calculation",
-        "pattern_50": ("shl", 4),  # instruction pattern on 5.0
-        "pattern_51": ("shl", 8),  # instruction pattern on 5.1
-    },
-}
-
-# Functions removed from HAL in XP (left in kernel only)
-HAL_FUNCTIONS_REMOVED_IN_XP = [
-    "IoAssignDriveLetters",
-    "IoReadPartitionTable",
-    "IoSetPartitionInformation",
-    "IoWritePartitionTable",
-]
-
-# Known IDT / interrupt dispatch changes
-IDT_DISPATCH_CHANGES = {
-    "5.0": {
-        "desc": "Win2000: Uses Vector directly for IDT entry calculation",
-        "pattern": "KiStartUnexpectedRange + (Vector - PRIMARY_VECTOR_BASE) * KiUnexpectedEntrySize",
-    },
-    "5.1": {
-        "desc": "XP: Uses HalVectorToIDTEntry() to translate vector first",
-        "pattern": "IDTEntry = HalVectorToIDTEntry(Vector); ... + (IDTEntry - PRIMARY_VECTOR_BASE) * ...",
-    },
-}
-
-# Affinity calculation differences
-AFFINITY_CHANGES = {
-    "5.0": "Direct affinity bitmask from processor number",
-    "5.1": "Uses HalpVectorToNode table for NUMA-aware affinity",
-    "fix": "Need HalpINTIToNode table instead of HalpVectorToNode for 2000 compat",
-}
-
-# Known structure layout changes between versions
-STRUCT_CHANGES = {
-    "KINTERRUPT": {
-        "5.0_size": 0x1E8,
-        "5.1_size": 0x1F0,
-        "changed_fields": ["DispatchCode at different offset"],
-    },
-    "EPROCESS": {
-        "5.0_size": 0x290,
-        "5.1_size": 0x258,
-        "changed_fields": ["Thread list offsets differ", "Quota fields reorganized"],
-    },
-    "KPRCB": {
-        "changed_fields": ["DpcData layout", "Vendor* fields added in XP"],
-    },
-}
 
 # Bugcheck codes relevant to HAL/kernel incompatibility
 COMPAT_BUGCHECKS = {
@@ -714,7 +634,12 @@ def _detect_hal_io_routing(pe, instructions, import_thunks):
     findings = []
     base = pe.OPTIONAL_HEADER.ImageBase
 
-    hal_io_funcs = set(HAL_FUNCTIONS_REMOVED_IN_XP)
+    hal_io_funcs = {
+        "IoAssignDriveLetters",
+        "IoReadPartitionTable",
+        "IoSetPartitionInformation",
+        "IoWritePartitionTable",
+    }
 
     for insn in instructions:
         if not insn.group(CS_GRP_CALL):
@@ -831,9 +756,6 @@ class NTCompatAnalyzer:
 
         # 7. Syscall mechanism detection
         self._compare_syscall_mechanism(pe_a, pe_b, report)
-
-        # 8. Apply known NT version difference knowledge
-        self._apply_knowledge_base(report)
 
         pe_a.close()
         pe_b.close()
@@ -994,26 +916,14 @@ class NTCompatAnalyzer:
             'only_b': only_b,
         }
 
-        # Check for known critical missing exports
+        # Report missing exports
         for name in only_a:
-            if name in HAL_FUNCTIONS_REMOVED_IN_XP:
-                report.issues.append(CompatIssue(
-                    severity="critical", category="export_missing",
-                    title=f"HAL I/O function '{name}' missing in B",
-                    description=f"{name} exists in {report.label_a} but not {report.label_b}. "
-                                f"XP removed this from HAL, routing through kernel instead.",
-                    func_name=name,
-                    fix_hint=f"Add {name} as wrapper calling HalDispatchTable entry, "
-                             f"or add to HAL with proper #define: "
-                             f"{HAL_DISPATCH_REMOVED_DEFINES.get(f'Hal{name}', '')}",
-                ))
-            elif name in CONVENTION_CHANGES_5_0_TO_5_1:
-                report.issues.append(CompatIssue(
-                    severity="warning", category="export_missing",
-                    title=f"'{name}' only in {report.label_a}",
-                    description=f"This function had calling convention changes between NT 5.0 and 5.1",
-                    func_name=name,
-                ))
+            report.issues.append(CompatIssue(
+                severity="warning", category="export_missing",
+                title=f"'{name}' only in {report.label_a}",
+                description=f"{name} exists in {report.label_a} but not {report.label_b}",
+                func_name=name,
+            ))
 
         if len(only_b) > 50:
             report.issues.append(CompatIssue(
@@ -1117,15 +1027,11 @@ class NTCompatAnalyzer:
                     'confidence_b': conv_b.confidence,
                 })
 
-                known = CONVENTION_CHANGES_5_0_TO_5_1.get(name)
-                severity = "critical" if known else "warning"
                 desc = f"Changed from {conv_a.convention}(cleanup={conv_a.stack_cleanup}) " \
                        f"to {conv_b.convention}(cleanup={conv_b.stack_cleanup})"
-                if known:
-                    desc += f" — KNOWN NT 5.0→5.1 change"
 
                 report.issues.append(CompatIssue(
-                    severity=severity,
+                    severity="warning",
                     category="calling_convention",
                     title=f"Convention change: {name}",
                     description=desc,
@@ -1165,7 +1071,7 @@ class NTCompatAnalyzer:
                 disp_refs = _scan_dispatch_table_refs(pe, instructions, thunks, strings)
                 dispatch_list.extend(disp_refs)
 
-        # Compare shift patterns for known differences
+        # Compare shift patterns dynamically
         shifts_a_by_amt = defaultdict(int)
         shifts_b_by_amt = defaultdict(int)
         for sp in report.shift_patterns_a:
@@ -1173,21 +1079,25 @@ class NTCompatAnalyzer:
         for sp in report.shift_patterns_b:
             shifts_b_by_amt[sp.shift_amount] += 1
 
-        # Check for known HalpVector difference (shl 4 vs shl 8)
-        for mname, minfo in MACRO_DIFFERENCES.items():
-            pat_a = minfo.get("pattern_50")
-            pat_b = minfo.get("pattern_51")
-            if pat_a and pat_b:
-                a_count = shifts_a_by_amt.get(pat_a[1], 0)
-                b_count = shifts_b_by_amt.get(pat_b[1], 0)
-                if a_count > 0 and b_count > 0:
-                    report.issues.append(CompatIssue(
-                        severity="critical", category="macro_difference",
-                        title=f"Possible {mname} macro difference detected",
-                        description=f"{minfo['desc']}. A has {a_count} shl-by-{pat_a[1]}, "
-                                    f"B has {b_count} shl-by-{pat_b[1]}",
-                        fix_hint=f"Change shift amount from {pat_b[1]} to {pat_a[1]} for Win2000 compat",
-                    ))
+        # Detect shift amount differences between the two binaries
+        all_amts = set(shifts_a_by_amt.keys()) | set(shifts_b_by_amt.keys())
+        for amt in sorted(all_amts):
+            a_count = shifts_a_by_amt.get(amt, 0)
+            b_count = shifts_b_by_amt.get(amt, 0)
+            if a_count > 0 and b_count == 0:
+                report.issues.append(CompatIssue(
+                    severity="info", category="shift_pattern",
+                    title=f"Shift pattern shl-by-{amt} only in {report.label_a}",
+                    description=f"{report.label_a} has {a_count} shl-by-{amt} instructions, "
+                                f"{report.label_b} has none",
+                ))
+            elif b_count > 0 and a_count == 0:
+                report.issues.append(CompatIssue(
+                    severity="info", category="shift_pattern",
+                    title=f"Shift pattern shl-by-{amt} only in {report.label_b}",
+                    description=f"{report.label_b} has {b_count} shl-by-{amt} instructions, "
+                                f"{report.label_a} has none",
+                ))
 
         # Detect HAL I/O dispatch routing differences
         hal_a = _detect_hal_io_routing(pe_a, [], _get_import_thunks(pe_a))
@@ -1228,54 +1138,6 @@ class NTCompatAnalyzer:
                 fix_hint="Patch syscall stubs to use int 0x2E for Win2000 compatibility",
             ))
 
-    # ── Knowledge base application ───────────────────────────────────────
-
-    def _apply_knowledge_base(self, report):
-        """Apply known NT version difference knowledge to existing findings."""
-
-        # Check if any HAL-specific patterns should trigger advice
-        has_hal_export_diff = False
-        for name in report.export_diff.get('only_a', []):
-            if name in HAL_FUNCTIONS_REMOVED_IN_XP:
-                has_hal_export_diff = True
-                break
-
-        if has_hal_export_diff:
-            # Check if drivesup.c includes are probably wrong
-            report.issues.append(CompatIssue(
-                severity="info", category="build_advice",
-                title="HAL drivesup.c build configuration",
-                description="For Win2000 HAL compatibility, drivesup.c must include "
-                            "halp.h (not nt.h) and define HalIo* macros. "
-                            "IoAssignDriveLetters/IoReadPartitionTable/IoSetPartitionInformation/"
-                            "IoWritePartitionTable must use stdcall (not fastcall) convention.",
-                fix_hint='Includes needed: halp.h, bugcodes.h, ntddft.h, ntdddisk.h, '
-                         'ntdskreg.h, stdio.h, string.h. '
-                         'Remove FASTCALL from io.h declarations.',
-            ))
-
-        # Structure access pattern warnings
-        if report.struct_access_diffs:
-            for diff in report.struct_access_diffs:
-                if diff.get('struct') in STRUCT_CHANGES:
-                    changes = STRUCT_CHANGES[diff['struct']]
-                    report.issues.append(CompatIssue(
-                        severity="warning", category="struct_layout",
-                        title=f"Structure {diff['struct']} layout differs between versions",
-                        description=f"Changed fields: {', '.join(changes.get('changed_fields', []))}",
-                    ))
-
-        # Affinity-related warnings if we detected processor topology patterns
-        for sp in report.shift_patterns_a + report.shift_patterns_b:
-            if 'affinity' in sp.context.lower() or 'node' in sp.context.lower():
-                report.issues.append(CompatIssue(
-                    severity="warning", category="affinity",
-                    title="Processor affinity calculation detected",
-                    description=AFFINITY_CHANGES.get("5.0", ""),
-                    fix_hint=AFFINITY_CHANGES.get("fix", ""),
-                ))
-                break
-
 
 # ══════════════════════════════════════════════════════════════════════════
 #  High-level API
@@ -1295,21 +1157,6 @@ def analyze_single_pe(pe_path, label="Unknown"):
     """Analyze a single PE for compatibility characteristics."""
     analyzer = NTCompatAnalyzer()
     return analyzer.analyze_single(pe_path, label)
-
-
-def get_known_differences(version_from="5.0", version_to="5.1"):
-    """Return known documented differences between NT versions."""
-    result = {
-        'calling_convention_changes': CONVENTION_CHANGES_5_0_TO_5_1,
-        'hal_dispatch_removed_defines': HAL_DISPATCH_REMOVED_DEFINES,
-        'macro_differences': MACRO_DIFFERENCES,
-        'hal_functions_removed': HAL_FUNCTIONS_REMOVED_IN_XP,
-        'idt_dispatch_changes': IDT_DISPATCH_CHANGES,
-        'affinity_changes': AFFINITY_CHANGES,
-        'struct_changes': STRUCT_CHANGES,
-        'compat_bugchecks': COMPAT_BUGCHECKS,
-    }
-    return result
 
 
 def diagnose_bugcheck(code, subcodes=None):
