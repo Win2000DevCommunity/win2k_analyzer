@@ -34,6 +34,17 @@ try:
 except ImportError:
     capstone = None
 
+try:
+    from elftools.elf.elffile import ELFFile
+    from elftools.elf.relocation import RelocationSection
+    from elftools.elf.sections import SymbolTableSection
+    HAS_ELFTOOLS = True
+except ImportError:
+    ELFFile = None
+    RelocationSection = None
+    SymbolTableSection = None
+    HAS_ELFTOOLS = False
+
 
 # ─── Enums ────────────────────────────────────────────────────────────────
 
@@ -57,6 +68,11 @@ class RefType(enum.Enum):
     TLS_CALLBACK    = "tls_callback"
     ENTRY_POINT     = "entry_point"
     DATA_POINTER    = "data_pointer"
+    GOT_ENTRY       = "got_entry"
+    PLT_STUB        = "plt_stub"
+    INIT_FINI_PTR   = "init_fini_ptr"
+    ELF_RELATIVE    = "elf_relative"
+    SYMBOL_REF      = "symbol_ref"
 
 
 class RefSource(enum.Enum):
@@ -65,6 +81,8 @@ class RefSource(enum.Enum):
     PE_TABLE      = "pe_table"
     HEURISTIC     = "heuristic"
     DYNAMIC_TRACE = "dynamic_trace"
+    ELF_RELOC     = "elf_reloc"
+    ELF_TABLE     = "elf_table"
 
 
 class ShiftOp(enum.Enum):
@@ -795,6 +813,930 @@ class PEReferenceFinder:
         return refs
 
 
+# ─── ELF Reference Finder ────────────────────────────────────────────────
+
+class ELFReferenceFinder:
+    """
+    Finds ALL address references in an ELF binary.
+
+    Six analysis passes:
+    1. ELF relocations (.rel/.rela sections) → confidence 1.0
+    2. Capstone disassembly → relative jumps/calls, RIP-relative → confidence 1.0
+    3. Symbol table (.symtab/.dynsym) → confidence 1.0
+    4. GOT/PLT entries → confidence 1.0
+    5. .init_array / .fini_array → confidence 1.0
+    6. Data pointer heuristic scan → confidence 0.6
+    """
+
+    def __init__(self, elf_path: str):
+        if not HAS_ELFTOOLS:
+            raise ImportError("pyelftools is required for ELF reference finding")
+        if capstone is None:
+            raise ImportError("capstone is required for disassembly")
+        self.elf_path = elf_path
+        self._fobj = open(elf_path, 'rb')
+        self.elf = ELFFile(self._fobj)
+        with open(elf_path, 'rb') as f:
+            self.data = bytearray(f.read())
+        self.is_64 = self.elf.elfclass == 64
+        self.ptr_size = 8 if self.is_64 else 4
+        self.is_pie = self.elf.header['e_type'] == 'ET_DYN'
+        self.image_base = self._compute_image_base()
+        self._section_cache = {}
+        for sec in self.elf.iter_sections():
+            self._section_cache[sec.name] = sec
+
+    def _compute_image_base(self) -> int:
+        min_vaddr = None
+        for seg in self.elf.iter_segments():
+            if seg.header['p_type'] == 'PT_LOAD':
+                vaddr = seg.header['p_vaddr']
+                if min_vaddr is None or vaddr < min_vaddr:
+                    min_vaddr = vaddr
+        return min_vaddr or 0
+
+    def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
+        for seg in self.elf.iter_segments():
+            if seg.header['p_type'] != 'PT_LOAD':
+                continue
+            va = seg.header['p_vaddr']
+            foff = seg.header['p_offset']
+            fsz = seg.header['p_filesz']
+            if va <= vaddr < va + fsz:
+                return vaddr - va + foff
+        return None
+
+    def _offset_to_vaddr(self, offset: int) -> Optional[int]:
+        for seg in self.elf.iter_segments():
+            if seg.header['p_type'] != 'PT_LOAD':
+                continue
+            foff = seg.header['p_offset']
+            fsz = seg.header['p_filesz']
+            va = seg.header['p_vaddr']
+            if foff <= offset < foff + fsz:
+                return offset - foff + va
+        return None
+
+    def _section_for_vaddr(self, vaddr: int) -> str:
+        for sec in self.elf.iter_sections():
+            sh_addr = sec.header['sh_addr']
+            sh_size = sec.header['sh_size']
+            if sh_addr and sh_addr <= vaddr < sh_addr + sh_size:
+                return sec.name
+        return "?"
+
+    def _is_executable_vaddr(self, vaddr: int) -> bool:
+        for seg in self.elf.iter_segments():
+            if seg.header['p_type'] != 'PT_LOAD':
+                continue
+            if not (seg.header['p_flags'] & 0x1):  # PF_X
+                continue
+            va = seg.header['p_vaddr']
+            msz = seg.header['p_memsz']
+            if va <= vaddr < va + msz:
+                return True
+        return False
+
+    def _get_code_range(self) -> Tuple[Optional[int], Optional[int]]:
+        lo, hi = None, None
+        for seg in self.elf.iter_segments():
+            if seg.header['p_type'] != 'PT_LOAD':
+                continue
+            if not (seg.header['p_flags'] & 0x1):
+                continue
+            va = seg.header['p_vaddr']
+            end = va + seg.header['p_memsz']
+            if lo is None or va < lo:
+                lo = va
+            if hi is None or end > hi:
+                hi = end
+        return lo, hi
+
+    def close(self):
+        if self._fobj and not self._fobj.closed:
+            self._fobj.close()
+
+    def find_all(self, callback=None) -> ReferenceDatabase:
+        db = ReferenceDatabase()
+        steps = [
+            ("ELF relocations", self._find_from_relocations),
+            ("Disassembly (code segments)", self._find_from_disassembly),
+            ("Symbol tables", self._find_from_symbols),
+            ("GOT / PLT", self._find_got_plt),
+            ("Init/Fini arrays", self._find_init_fini),
+            ("Data pointers (heuristic)", self._find_data_pointers),
+        ]
+        for i, (name, func) in enumerate(steps):
+            if callback:
+                callback(name, i, len(steps))
+            for ref in func():
+                db.add(ref)
+        if callback:
+            callback("Done", len(steps), len(steps))
+        self.close()
+        return db
+
+    # ── 1. ELF Relocations ────────────────────────────────────────────
+    def _find_from_relocations(self) -> List[Reference]:
+        refs = []
+        for sec in self.elf.iter_sections():
+            if not isinstance(sec, RelocationSection):
+                continue
+            symtab = self.elf.get_section(sec.header['sh_link'])
+            for reloc in sec.iter_relocations():
+                r_offset = reloc['r_offset']
+                r_type = reloc['r_info_type']
+                foff = self._vaddr_to_offset(r_offset)
+                if foff is None:
+                    continue
+
+                sym_name = ""
+                target_vaddr = 0
+                if reloc['r_info_sym'] != 0 and symtab:
+                    sym = symtab.get_symbol(reloc['r_info_sym'])
+                    if sym:
+                        sym_name = sym.name or ""
+                        target_vaddr = sym['st_value']
+
+                addend = reloc.get('r_addend', 0) if reloc.is_RELA() else 0
+                target_vaddr += addend
+
+                # Determine ref type from ELF relocation type
+                if self.is_64:
+                    # x86-64 relocation types
+                    if r_type == 1:   # R_X86_64_64
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 8
+                    elif r_type == 2:   # R_X86_64_PC32
+                        ref_type = RefType.REL_CALL
+                        size = 4
+                    elif r_type == 6:   # R_X86_64_GLOB_DAT
+                        ref_type = RefType.GOT_ENTRY
+                        size = 8
+                    elif r_type == 7:   # R_X86_64_JUMP_SLOT
+                        ref_type = RefType.PLT_STUB
+                        size = 8
+                    elif r_type == 8:   # R_X86_64_RELATIVE
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 8
+                        if addend:
+                            target_vaddr = self.image_base + addend
+                    else:
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 8
+                else:
+                    # x86-32 relocation types
+                    if r_type == 1:     # R_386_32
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                    elif r_type == 2:   # R_386_PC32
+                        ref_type = RefType.REL_CALL
+                        size = 4
+                    elif r_type == 6:   # R_386_GLOB_DAT
+                        ref_type = RefType.GOT_ENTRY
+                        size = 4
+                    elif r_type == 7:   # R_386_JMP_SLOT
+                        ref_type = RefType.PLT_STUB
+                        size = 4
+                    elif r_type == 8:   # R_386_RELATIVE
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+                        if foff + 4 <= len(self.data):
+                            stored = struct.unpack_from('<I', self.data, foff)[0]
+                            target_vaddr = stored
+                    else:
+                        ref_type = RefType.ELF_RELATIVE
+                        size = 4
+
+                is_rel = r_type == 2  # PC-relative
+                refs.append(Reference(
+                    file_offset=foff, ref_type=ref_type,
+                    target_rva=target_vaddr, ref_rva=r_offset,
+                    size_bytes=size, is_relative=is_rel,
+                    insn_size=size,
+                    section_name=self._section_for_vaddr(r_offset),
+                    confidence=1.0, source=RefSource.ELF_RELOC,
+                    symbol_name=sym_name,
+                ))
+        return refs
+
+    # ── 2. Disassembly ────────────────────────────────────────────────
+    def _find_from_disassembly(self) -> List[Reference]:
+        refs = []
+        arch = capstone.CS_ARCH_X86
+        mode = capstone.CS_MODE_64 if self.is_64 else capstone.CS_MODE_32
+        md = capstone.Cs(arch, mode)
+        md.detail = True
+        md.skipdata = True
+
+        for sec in self.elf.iter_sections():
+            if not (sec.header['sh_flags'] & 0x4):  # SHF_EXECINSTR
+                continue
+            sec_name = sec.name
+            code = sec.data()
+            base_va = sec.header['sh_addr']
+            sec_foff = sec.header['sh_offset']
+
+            for insn in md.disasm(code, base_va):
+                mnemonic = insn.mnemonic.lower()
+                insn_vaddr = insn.address
+                insn_foff = sec_foff + (insn_vaddr - base_va)
+
+                # ── Relative CALL (E8 rel32) ──
+                if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1:
+                    op = insn.operands[0]
+                    if op.type == cs_x86.X86_OP_IMM:
+                        target_va = op.imm
+                        disp_off = insn.size - 4
+                        refs.append(Reference(
+                            file_offset=insn_foff + disp_off,
+                            ref_type=RefType.REL_CALL,
+                            target_rva=target_va, ref_rva=insn_vaddr,
+                            size_bytes=4, is_relative=True,
+                            insn_size=insn.size, section_name=sec_name,
+                            confidence=1.0, source=RefSource.STATIC_DISASM,
+                        ))
+
+                # ── Relative JMP ──
+                elif insn.id == cs_x86.X86_INS_JMP and len(insn.operands) == 1:
+                    op = insn.operands[0]
+                    if op.type == cs_x86.X86_OP_IMM:
+                        target_va = op.imm
+                        if insn.size == 2:
+                            refs.append(Reference(
+                                file_offset=insn_foff + 1,
+                                ref_type=RefType.REL_JUMP_SHORT,
+                                target_rva=target_va, ref_rva=insn_vaddr,
+                                size_bytes=1, is_relative=True,
+                                insn_size=insn.size, section_name=sec_name,
+                                confidence=1.0, source=RefSource.STATIC_DISASM,
+                            ))
+                        else:
+                            disp_off = insn.size - 4
+                            refs.append(Reference(
+                                file_offset=insn_foff + disp_off,
+                                ref_type=RefType.REL_JUMP_NEAR,
+                                target_rva=target_va, ref_rva=insn_vaddr,
+                                size_bytes=4, is_relative=True,
+                                insn_size=insn.size, section_name=sec_name,
+                                confidence=1.0, source=RefSource.STATIC_DISASM,
+                            ))
+
+                # ── Conditional branches ──
+                elif mnemonic.startswith('j') and mnemonic != 'jmp':
+                    if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                        target_va = insn.operands[0].imm
+                        if insn.size == 2:
+                            refs.append(Reference(
+                                file_offset=insn_foff + 1,
+                                ref_type=RefType.REL_COND_SHORT,
+                                target_rva=target_va, ref_rva=insn_vaddr,
+                                size_bytes=1, is_relative=True,
+                                insn_size=insn.size, section_name=sec_name,
+                                confidence=1.0, source=RefSource.STATIC_DISASM,
+                            ))
+                        else:
+                            disp_off = insn.size - 4
+                            refs.append(Reference(
+                                file_offset=insn_foff + disp_off,
+                                ref_type=RefType.REL_COND_NEAR,
+                                target_rva=target_va, ref_rva=insn_vaddr,
+                                size_bytes=4, is_relative=True,
+                                insn_size=insn.size, section_name=sec_name,
+                                confidence=1.0, source=RefSource.STATIC_DISASM,
+                            ))
+
+                # ── RIP-relative addressing (x64) ──
+                elif self.is_64 and len(insn.operands) >= 2:
+                    for op in insn.operands:
+                        if (op.type == cs_x86.X86_OP_MEM and
+                                op.mem.base == cs_x86.X86_REG_RIP and
+                                op.mem.index == 0):
+                            disp = op.mem.disp
+                            target_va = insn_vaddr + insn.size + disp
+                            if hasattr(insn, 'disp_offset') and insn.disp_offset > 0:
+                                disp_foff = insn_foff + insn.disp_offset
+                            else:
+                                disp_foff = insn_foff + insn.size - 4
+                                for op2 in insn.operands:
+                                    if op2.type == cs_x86.X86_OP_IMM:
+                                        disp_foff -= op2.size
+                                        break
+                            refs.append(Reference(
+                                file_offset=disp_foff,
+                                ref_type=RefType.RIP_RELATIVE,
+                                target_rva=target_va, ref_rva=insn_vaddr,
+                                size_bytes=4, is_relative=True,
+                                insn_size=insn.size, section_name=sec_name,
+                                confidence=1.0, source=RefSource.STATIC_DISASM,
+                            ))
+                            break
+        return refs
+
+    # ── 3. Symbol Tables ──────────────────────────────────────────────
+    def _find_from_symbols(self) -> List[Reference]:
+        refs = []
+        for sec in self.elf.iter_sections():
+            if not isinstance(sec, SymbolTableSection):
+                continue
+            for sym in sec.iter_symbols():
+                if sym['st_value'] == 0 or sym['st_shndx'] == 'SHN_UNDEF':
+                    continue
+                st_type = sym['st_info']['type']
+                if st_type not in ('STT_FUNC', 'STT_OBJECT'):
+                    continue
+                vaddr = sym['st_value']
+                refs.append(Reference(
+                    file_offset=0,  # symbol table entry, not direct file ref
+                    ref_type=RefType.SYMBOL_REF,
+                    target_rva=vaddr, ref_rva=vaddr,
+                    size_bytes=self.ptr_size, is_relative=False,
+                    insn_size=self.ptr_size,
+                    section_name=self._section_for_vaddr(vaddr),
+                    confidence=1.0, source=RefSource.ELF_TABLE,
+                    symbol_name=sym.name or "",
+                ))
+        return refs
+
+    # ── 4. GOT / PLT ─────────────────────────────────────────────────
+    def _find_got_plt(self) -> List[Reference]:
+        refs = []
+        fmt = '<Q' if self.is_64 else '<I'
+        step = self.ptr_size
+
+        for sec_name in ('.got', '.got.plt'):
+            sec = self._section_cache.get(sec_name)
+            if sec is None:
+                continue
+            data = sec.data()
+            base_va = sec.header['sh_addr']
+            base_foff = sec.header['sh_offset']
+
+            for i in range(0, len(data) - step + 1, step):
+                val = struct.unpack_from(fmt, data, i)[0]
+                if val == 0:
+                    continue
+                # GOT entries point to code or PLT stubs
+                if self._is_executable_vaddr(val):
+                    refs.append(Reference(
+                        file_offset=base_foff + i,
+                        ref_type=RefType.GOT_ENTRY,
+                        target_rva=val, ref_rva=base_va + i,
+                        size_bytes=step, is_relative=False,
+                        insn_size=step, section_name=sec_name,
+                        confidence=0.95, source=RefSource.ELF_TABLE,
+                    ))
+        return refs
+
+    # ── 5. .init_array / .fini_array ──────────────────────────────────
+    def _find_init_fini(self) -> List[Reference]:
+        refs = []
+        fmt = '<Q' if self.is_64 else '<I'
+        step = self.ptr_size
+
+        for sec_name in ('.init_array', '.fini_array', '.preinit_array'):
+            sec = self._section_cache.get(sec_name)
+            if sec is None:
+                continue
+            data = sec.data()
+            base_va = sec.header['sh_addr']
+            base_foff = sec.header['sh_offset']
+
+            for i in range(0, len(data) - step + 1, step):
+                val = struct.unpack_from(fmt, data, i)[0]
+                if val == 0 or val == 0xFFFFFFFF or val == 0xFFFFFFFFFFFFFFFF:
+                    continue
+                refs.append(Reference(
+                    file_offset=base_foff + i,
+                    ref_type=RefType.INIT_FINI_PTR,
+                    target_rva=val, ref_rva=base_va + i,
+                    size_bytes=step, is_relative=False,
+                    insn_size=step, section_name=sec_name,
+                    confidence=1.0, source=RefSource.ELF_TABLE,
+                ))
+        return refs
+
+    # ── 6. Data Pointer Heuristic ─────────────────────────────────────
+    def _find_data_pointers(self) -> List[Reference]:
+        refs = []
+        code_lo, code_hi = self._get_code_range()
+        if code_lo is None:
+            return refs
+
+        fmt = '<Q' if self.is_64 else '<I'
+        step = self.ptr_size
+        align_mask = 7 if self.is_64 else 3
+
+        for sec in self.elf.iter_sections():
+            # Skip code, symbol tables, relocations, strings, etc.
+            if sec.header['sh_flags'] & 0x4:  # SHF_EXECINSTR
+                continue
+            if sec.header['sh_type'] in ('SHT_SYMTAB', 'SHT_DYNSYM', 'SHT_REL',
+                                          'SHT_RELA', 'SHT_STRTAB', 'SHT_NULL'):
+                continue
+            if sec.header['sh_size'] == 0 or sec.header['sh_addr'] == 0:
+                continue
+
+            sec_name = sec.name
+            data = sec.data()
+            base_va = sec.header['sh_addr']
+            base_foff = sec.header['sh_offset']
+
+            for i in range(0, len(data) - step + 1, step):
+                val = struct.unpack_from(fmt, data, i)[0]
+                if code_lo <= val < code_hi:
+                    if val & align_mask == 0:
+                        refs.append(Reference(
+                            file_offset=base_foff + i,
+                            ref_type=RefType.DATA_POINTER,
+                            target_rva=val, ref_rva=base_va + i,
+                            size_bytes=step, is_relative=False,
+                            insn_size=step, section_name=sec_name,
+                            confidence=0.6, source=RefSource.HEURISTIC,
+                        ))
+        return refs
+
+
+# ─── ELF Shift Engine ────────────────────────────────────────────────────
+
+class ELFShiftEngine:
+    """
+    Applies insert/delete/patch operations on ELF binaries with reference recalculation.
+
+    Similar to ShiftEngine for PE, but works with ELF segments/sections and uses
+    virtual addresses directly (no image_base subtraction for non-PIE).
+    """
+
+    def __init__(self, elf_path: str, ref_db: ReferenceDatabase):
+        if not HAS_ELFTOOLS:
+            raise ImportError("pyelftools is required")
+        self.elf_path = elf_path
+        with open(elf_path, 'rb') as f:
+            self.buffer = bytearray(f.read())
+        self._fobj = open(elf_path, 'rb')
+        self.elf = ELFFile(self._fobj)
+        self.ref_db = ref_db
+        self.is_64 = self.elf.elfclass == 64
+        self.ptr_size = 8 if self.is_64 else 4
+        self._undo_stack: List[Tuple[ShiftOp, int, int, bytes]] = []
+
+    def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
+        for seg in self.elf.iter_segments():
+            if seg.header['p_type'] != 'PT_LOAD':
+                continue
+            va = seg.header['p_vaddr']
+            foff = seg.header['p_offset']
+            fsz = seg.header['p_filesz']
+            if va <= vaddr < va + fsz:
+                return vaddr - va + foff
+        return None
+
+    def insert_bytes(self, vaddr: int, data: bytes) -> ShiftResult:
+        N = len(data)
+        if N == 0:
+            return ShiftResult(ShiftOp.INSERT, vaddr, 0, 0, [], 0,
+                               len(self.buffer), True, "Nothing to insert")
+
+        insert_foff = self._vaddr_to_offset(vaddr)
+        if insert_foff is None:
+            return ShiftResult(ShiftOp.INSERT, vaddr, N, 0, [],
+                               0, len(self.buffer), False,
+                               f"VA 0x{vaddr:X} does not map to any segment")
+
+        self._undo_stack.append((ShiftOp.INSERT, insert_foff, N, b''))
+        self.buffer[insert_foff:insert_foff] = data
+
+        sections_adjusted = self._update_elf_headers(vaddr, N, insert_foff)
+        refs_updated, warnings = self._recalculate_refs(vaddr, N)
+
+        return ShiftResult(
+            ShiftOp.INSERT, vaddr, N, refs_updated, warnings,
+            sections_adjusted, len(self.buffer), True,
+            f"Inserted {N} bytes at VA 0x{vaddr:X}, updated {refs_updated} references"
+        )
+
+    def delete_bytes(self, vaddr: int, count: int) -> ShiftResult:
+        if count == 0:
+            return ShiftResult(ShiftOp.DELETE, vaddr, 0, 0, [], 0,
+                               len(self.buffer), True, "Nothing to delete")
+
+        foff = self._vaddr_to_offset(vaddr)
+        if foff is None:
+            return ShiftResult(ShiftOp.DELETE, vaddr, -count, 0, [],
+                               0, len(self.buffer), False,
+                               f"VA 0x{vaddr:X} does not map to any segment")
+
+        deleted = bytes(self.buffer[foff:foff + count])
+        self._undo_stack.append((ShiftOp.DELETE, foff, count, deleted))
+        del self.buffer[foff:foff + count]
+
+        sections_adjusted = self._update_elf_headers(vaddr, -count, foff)
+        refs_updated, warnings = self._recalculate_refs(vaddr, -count)
+
+        return ShiftResult(
+            ShiftOp.DELETE, vaddr, -count, refs_updated, warnings,
+            sections_adjusted, len(self.buffer), True,
+            f"Deleted {count} bytes at VA 0x{vaddr:X}, updated {refs_updated} references"
+        )
+
+    def patch_bytes(self, vaddr: int, data: bytes) -> ShiftResult:
+        N = len(data)
+        foff = self._vaddr_to_offset(vaddr)
+        if foff is None:
+            return ShiftResult(ShiftOp.PATCH, vaddr, 0, 0, [],
+                               0, len(self.buffer), False,
+                               f"VA 0x{vaddr:X} not found")
+        old = bytes(self.buffer[foff:foff + N])
+        self._undo_stack.append((ShiftOp.PATCH, foff, N, old))
+        self.buffer[foff:foff + N] = data
+        return ShiftResult(ShiftOp.PATCH, vaddr, 0, 0, [], 0,
+                           len(self.buffer), True,
+                           f"Patched {N} bytes at VA 0x{vaddr:X} (no shift)")
+
+    def insert_nop_sled(self, vaddr: int, count: int) -> ShiftResult:
+        return self.insert_bytes(vaddr, b'\x90' * count)
+
+    def undo(self) -> Optional[str]:
+        if not self._undo_stack:
+            return None
+        op, foff, n, saved = self._undo_stack.pop()
+        if op == ShiftOp.INSERT:
+            del self.buffer[foff:foff + n]
+            return f"Undid INSERT of {n} bytes at offset 0x{foff:X}"
+        elif op == ShiftOp.DELETE:
+            self.buffer[foff:foff] = saved
+            return f"Undid DELETE of {n} bytes at offset 0x{foff:X}"
+        elif op == ShiftOp.PATCH:
+            self.buffer[foff:foff + n] = saved
+            return f"Undid PATCH of {n} bytes at offset 0x{foff:X}"
+        return None
+
+    def save(self, output_path: str):
+        with open(output_path, 'wb') as f:
+            f.write(bytes(self.buffer))
+
+    def preview_insert(self, vaddr: int, size: int) -> Dict:
+        changes = []
+        warnings = []
+        for ref in self.ref_db.get_all():
+            ref_moved = ref.ref_rva >= vaddr
+            target_moved = ref.target_rva >= vaddr
+            new_ref_va = ref.ref_rva + (size if ref_moved else 0)
+            new_target_va = ref.target_rva + (size if target_moved else 0)
+
+            if ref.is_relative:
+                old_val = ref.target_rva - (ref.ref_rva + ref.insn_size)
+                new_val = new_target_va - (new_ref_va + ref.insn_size)
+                if old_val != new_val:
+                    changes.append(
+                        f"REF @0x{ref.ref_rva:X} → 0x{ref.target_rva:X}: "
+                        f"rel {old_val:+d} → {new_val:+d}"
+                    )
+                    if ref.size_bytes == 1 and (new_val < -128 or new_val > 127):
+                        warnings.append(
+                            f"⚠ SHORT BRANCH OVERFLOW at 0x{ref.ref_rva:X}"
+                        )
+            else:
+                if target_moved:
+                    changes.append(
+                        f"REF @0x{ref.ref_rva:X}: abs 0x{ref.target_rva:X} → 0x{new_target_va:X}"
+                    )
+
+        return {
+            'operation': 'INSERT', 'vaddr': vaddr, 'size': size,
+            'total_refs': self.ref_db.count, 'refs_affected': len(changes),
+            'changes': changes, 'warnings': warnings,
+        }
+
+    def _recalculate_refs(self, insert_va: int, delta: int) -> Tuple[int, List[str]]:
+        updated = 0
+        warnings = []
+
+        for ref in self.ref_db.get_all():
+            ref_moved = ref.ref_rva >= insert_va
+            target_moved = ref.target_rva >= insert_va
+
+            new_ref_va = ref.ref_rva + (delta if ref_moved else 0)
+            new_target_va = ref.target_rva + (delta if target_moved else 0)
+            new_foff = ref.file_offset + (delta if ref_moved else 0)
+
+            if ref.is_relative:
+                old_val = ref.target_rva - (ref.ref_rva + ref.insn_size)
+                new_val = new_target_va - (new_ref_va + ref.insn_size)
+
+                if old_val != new_val:
+                    if ref.size_bytes == 1:
+                        if new_val < -128 or new_val > 127:
+                            warnings.append(
+                                f"SHORT BRANCH OVERFLOW @0x{ref.ref_rva:X}: "
+                                f"displacement {new_val:+d}"
+                            )
+                            ref.ref_rva = new_ref_va
+                            ref.target_rva = new_target_va
+                            ref.file_offset = new_foff
+                            continue
+                        self._write_int(new_foff, new_val, 1, signed=True)
+                    elif ref.size_bytes == 4:
+                        self._write_int(new_foff, new_val, 4, signed=True)
+                    updated += 1
+            else:
+                if target_moved and ref.file_offset > 0:
+                    if ref.size_bytes == 4:
+                        self._write_int(new_foff, new_target_va & 0xFFFFFFFF, 4)
+                    elif ref.size_bytes == 8:
+                        self._write_int(new_foff, new_target_va, 8)
+                    updated += 1
+
+            ref.ref_rva = new_ref_va
+            ref.target_rva = new_target_va
+            ref.file_offset = new_foff
+
+        self.ref_db.rebuild_indices()
+        return updated, warnings
+
+    def _write_int(self, offset: int, value: int, size: int, signed: bool = False):
+        if offset < 0 or offset + size > len(self.buffer):
+            return
+        if signed:
+            fmt = {1: '<b', 2: '<h', 4: '<i', 8: '<q'}[size]
+        else:
+            fmt = {1: '<B', 2: '<H', 4: '<I', 8: '<Q'}[size]
+        try:
+            struct.pack_into(fmt, self.buffer, offset, value)
+        except struct.error:
+            pass
+
+    def _update_elf_headers(self, vaddr: int, delta: int, foff: int) -> int:
+        """
+        Update ELF section headers and program headers after insert/delete.
+        Directly patches the binary buffer — ELF headers are at known offsets.
+        """
+        adjusted = 0
+        ehdr_size = 64 if self.is_64 else 52
+
+        # ── Update ELF header entry point ──
+        if self.is_64:
+            entry_off = 24  # e_entry offset in Elf64_Ehdr
+            entry = struct.unpack_from('<Q', self.buffer, entry_off)[0]
+            if entry >= vaddr:
+                struct.pack_into('<Q', self.buffer, entry_off, entry + delta)
+        else:
+            entry_off = 24
+            entry = struct.unpack_from('<I', self.buffer, entry_off)[0]
+            if entry >= vaddr:
+                struct.pack_into('<I', self.buffer, entry_off, entry + delta)
+
+        # ── Update program headers (PHDR) ──
+        if self.is_64:
+            e_phoff = struct.unpack_from('<Q', self.buffer, 32)[0]
+            e_phentsize = struct.unpack_from('<H', self.buffer, 54)[0]
+            e_phnum = struct.unpack_from('<H', self.buffer, 56)[0]
+        else:
+            e_phoff = struct.unpack_from('<I', self.buffer, 28)[0]
+            e_phentsize = struct.unpack_from('<H', self.buffer, 42)[0]
+            e_phnum = struct.unpack_from('<H', self.buffer, 44)[0]
+
+        for i in range(e_phnum):
+            ph_off = e_phoff + i * e_phentsize
+            if self.is_64:
+                p_type = struct.unpack_from('<I', self.buffer, ph_off)[0]
+                p_offset = struct.unpack_from('<Q', self.buffer, ph_off + 8)[0]
+                p_vaddr = struct.unpack_from('<Q', self.buffer, ph_off + 16)[0]
+                p_filesz = struct.unpack_from('<Q', self.buffer, ph_off + 32)[0]
+                p_memsz = struct.unpack_from('<Q', self.buffer, ph_off + 40)[0]
+
+                if p_vaddr <= vaddr < p_vaddr + p_filesz:
+                    # This segment contains the insertion point — grow it
+                    struct.pack_into('<Q', self.buffer, ph_off + 32, p_filesz + delta)
+                    struct.pack_into('<Q', self.buffer, ph_off + 40, p_memsz + delta)
+                    adjusted += 1
+                elif p_offset > foff:
+                    # Shift segment offset for segments after the insertion
+                    struct.pack_into('<Q', self.buffer, ph_off + 8, p_offset + delta)
+                    adjusted += 1
+            else:
+                p_type = struct.unpack_from('<I', self.buffer, ph_off)[0]
+                p_offset = struct.unpack_from('<I', self.buffer, ph_off + 4)[0]
+                p_vaddr = struct.unpack_from('<I', self.buffer, ph_off + 8)[0]
+                p_filesz = struct.unpack_from('<I', self.buffer, ph_off + 16)[0]
+                p_memsz = struct.unpack_from('<I', self.buffer, ph_off + 20)[0]
+
+                if p_vaddr <= vaddr < p_vaddr + p_filesz:
+                    struct.pack_into('<I', self.buffer, ph_off + 16, p_filesz + delta)
+                    struct.pack_into('<I', self.buffer, ph_off + 20, p_memsz + delta)
+                    adjusted += 1
+                elif p_offset > foff:
+                    struct.pack_into('<I', self.buffer, ph_off + 4, p_offset + delta)
+                    adjusted += 1
+
+        # ── Update section headers (SHDR) ──
+        if self.is_64:
+            e_shoff = struct.unpack_from('<Q', self.buffer, 40)[0]
+            e_shentsize = struct.unpack_from('<H', self.buffer, 58)[0]
+            e_shnum = struct.unpack_from('<H', self.buffer, 60)[0]
+            # If section header table is after insertion, shift it
+            if e_shoff > foff:
+                struct.pack_into('<Q', self.buffer, 40, e_shoff + delta)
+                e_shoff += delta
+        else:
+            e_shoff = struct.unpack_from('<I', self.buffer, 32)[0]
+            e_shentsize = struct.unpack_from('<H', self.buffer, 46)[0]
+            e_shnum = struct.unpack_from('<H', self.buffer, 48)[0]
+            if e_shoff > foff:
+                struct.pack_into('<I', self.buffer, 32, e_shoff + delta)
+                e_shoff += delta
+
+        for i in range(e_shnum):
+            sh_off = e_shoff + i * e_shentsize
+            if sh_off + e_shentsize > len(self.buffer):
+                break
+            if self.is_64:
+                sh_addr = struct.unpack_from('<Q', self.buffer, sh_off + 16)[0]
+                sh_offset = struct.unpack_from('<Q', self.buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from('<Q', self.buffer, sh_off + 32)[0]
+
+                if sh_addr and sh_addr <= vaddr < sh_addr + sh_size:
+                    struct.pack_into('<Q', self.buffer, sh_off + 32, sh_size + delta)
+                    adjusted += 1
+                elif sh_offset > foff:
+                    struct.pack_into('<Q', self.buffer, sh_off + 24, sh_offset + delta)
+                    if sh_addr and sh_addr >= vaddr:
+                        struct.pack_into('<Q', self.buffer, sh_off + 16, sh_addr + delta)
+                    adjusted += 1
+            else:
+                sh_addr = struct.unpack_from('<I', self.buffer, sh_off + 12)[0]
+                sh_offset = struct.unpack_from('<I', self.buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from('<I', self.buffer, sh_off + 20)[0]
+
+                if sh_addr and sh_addr <= vaddr < sh_addr + sh_size:
+                    struct.pack_into('<I', self.buffer, sh_off + 20, sh_size + delta)
+                    adjusted += 1
+                elif sh_offset > foff:
+                    struct.pack_into('<I', self.buffer, sh_off + 16, sh_offset + delta)
+                    if sh_addr and sh_addr >= vaddr:
+                        struct.pack_into('<I', self.buffer, sh_off + 12, sh_addr + delta)
+                    adjusted += 1
+
+        return adjusted
+
+
+# ─── Symbol Updater ──────────────────────────────────────────────────────
+
+class SymbolUpdater:
+    """
+    Updates symbol tables (ELF .symtab/.dynsym, PE export/import tables)
+    after a shift operation to keep debug info and linking consistent.
+
+    Works on the raw buffer — call after ShiftEngine/ELFShiftEngine operations.
+    """
+
+    @staticmethod
+    def update_elf_symbols(buffer: bytearray, is_64: bool, shift_va: int, delta: int) -> int:
+        """
+        Patch all symbol st_value entries in .symtab and .dynsym that are >= shift_va.
+        Returns the number of symbols updated.
+        """
+        if len(buffer) < (64 if is_64 else 52):
+            return 0
+
+        updated = 0
+        # Read ELF header to find section header table
+        if is_64:
+            e_shoff = struct.unpack_from('<Q', buffer, 40)[0]
+            e_shentsize = struct.unpack_from('<H', buffer, 58)[0]
+            e_shnum = struct.unpack_from('<H', buffer, 60)[0]
+        else:
+            e_shoff = struct.unpack_from('<I', buffer, 32)[0]
+            e_shentsize = struct.unpack_from('<H', buffer, 46)[0]
+            e_shnum = struct.unpack_from('<H', buffer, 48)[0]
+
+        sym_entry_size = 24 if is_64 else 16
+
+        for i in range(e_shnum):
+            sh_off = e_shoff + i * e_shentsize
+            if sh_off + e_shentsize > len(buffer):
+                break
+
+            if is_64:
+                sh_type = struct.unpack_from('<I', buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from('<Q', buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from('<Q', buffer, sh_off + 32)[0]
+                sh_entsize = struct.unpack_from('<Q', buffer, sh_off + 56)[0]
+            else:
+                sh_type = struct.unpack_from('<I', buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from('<I', buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from('<I', buffer, sh_off + 20)[0]
+                sh_entsize = struct.unpack_from('<I', buffer, sh_off + 36)[0]
+
+            # SHT_SYMTAB = 2, SHT_DYNSYM = 11
+            if sh_type not in (2, 11):
+                continue
+
+            if sh_entsize == 0:
+                sh_entsize = sym_entry_size
+            num_syms = sh_size // sh_entsize
+
+            for j in range(num_syms):
+                sym_off = sh_offset + j * sh_entsize
+                if sym_off + sh_entsize > len(buffer):
+                    break
+
+                if is_64:
+                    # Elf64_Sym: st_name(4), st_info(1), st_other(1), st_shndx(2), st_value(8), st_size(8)
+                    st_shndx = struct.unpack_from('<H', buffer, sym_off + 6)[0]
+                    st_value = struct.unpack_from('<Q', buffer, sym_off + 8)[0]
+                    st_size = struct.unpack_from('<Q', buffer, sym_off + 16)[0]
+                else:
+                    # Elf32_Sym: st_name(4), st_value(4), st_size(4), st_info(1), st_other(1), st_shndx(2)
+                    st_value = struct.unpack_from('<I', buffer, sym_off + 4)[0]
+                    st_size = struct.unpack_from('<I', buffer, sym_off + 8)[0]
+                    st_shndx = struct.unpack_from('<H', buffer, sym_off + 14)[0]
+
+                # SHN_UNDEF=0, SHN_ABS=0xFFF1 — don't shift these
+                if st_shndx == 0 or st_shndx == 0xFFF1:
+                    continue
+                if st_value == 0:
+                    continue
+
+                if st_value >= shift_va:
+                    new_value = st_value + delta
+                    if is_64:
+                        struct.pack_into('<Q', buffer, sym_off + 8, new_value)
+                    else:
+                        struct.pack_into('<I', buffer, sym_off + 4, new_value & 0xFFFFFFFF)
+                    updated += 1
+
+        return updated
+
+    @staticmethod
+    def update_pe_exports(buffer: bytearray, pe, shift_rva: int, delta: int) -> int:
+        """
+        Patch export table RVAs in a PE binary.
+        The pe object must be a pefile.PE parsed from the same buffer.
+        Returns the number of export entries updated.
+        """
+        if not hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            return 0
+
+        updated = 0
+        exp = pe.DIRECTORY_ENTRY_EXPORT
+        addr_of_funcs = exp.struct.AddressOfFunctions
+        num_funcs = exp.struct.NumberOfFunctions
+
+        for i in range(num_funcs):
+            entry_foff_rva = addr_of_funcs + i * 4
+            # Convert RVA to file offset
+            foff = None
+            for s in pe.sections:
+                if s.VirtualAddress <= entry_foff_rva < s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData):
+                    foff = entry_foff_rva - s.VirtualAddress + s.PointerToRawData
+                    break
+            if foff is None or foff + 4 > len(buffer):
+                continue
+
+            func_rva = struct.unpack_from('<I', buffer, foff)[0]
+            if func_rva >= shift_rva and func_rva != 0:
+                struct.pack_into('<I', buffer, foff, func_rva + delta)
+                updated += 1
+
+        return updated
+
+    @staticmethod
+    def update_pe_debug_dir(buffer: bytearray, pe, shift_rva: int, delta: int) -> int:
+        """
+        Patch debug directory pointers after shift.
+        Returns number of debug entries updated.
+        """
+        updated = 0
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 6:
+            return 0
+        dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[6]  # IMAGE_DIRECTORY_ENTRY_DEBUG
+        if dd.VirtualAddress == 0 or dd.Size == 0:
+            return 0
+
+        dbg_foff = None
+        for s in pe.sections:
+            if s.VirtualAddress <= dd.VirtualAddress < s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData):
+                dbg_foff = dd.VirtualAddress - s.VirtualAddress + s.PointerToRawData
+                break
+        if dbg_foff is None:
+            return 0
+
+        entry_size = 28  # sizeof(IMAGE_DEBUG_DIRECTORY)
+        num_entries = dd.Size // entry_size
+        for i in range(num_entries):
+            off = dbg_foff + i * entry_size
+            if off + entry_size > len(buffer):
+                break
+            # AddressOfRawData at offset 20 (RVA), PointerToRawData at offset 24 (file offset)
+            addr_rva = struct.unpack_from('<I', buffer, off + 20)[0]
+            if addr_rva >= shift_rva and addr_rva != 0:
+                struct.pack_into('<I', buffer, off + 20, addr_rva + delta)
+                updated += 1
+
+        return updated
+
+
 # ─── Shift Engine ─────────────────────────────────────────────────────────
 
 class ShiftEngine:
@@ -1432,32 +2374,59 @@ class UBRTEngine:
     Main engine coordinating all UBRT operations.
 
     Workflow:
-    1. Load PE binary
+    1. Load binary (auto-detects PE or ELF)
     2. Find all references (static analysis)
     3. [Optional] Run dynamic trace via QEMU
     4. Apply modifications (insert/delete/patch)
-    5. Save modified binary
+    5. Update symbols after shift
+    6. Save modified binary
     """
 
     def __init__(self):
         self.pe_path: Optional[str] = None
         self.ref_db: Optional[ReferenceDatabase] = None
-        self.shift_engine: Optional[ShiftEngine] = None
+        self.shift_engine = None  # ShiftEngine or ELFShiftEngine
         self.qemu: Optional[QEMUTracer] = None
         self.pe_info: Dict = {}
         self._history: List[ShiftResult] = []
+        self.binary_format: str = "unknown"  # "pe" or "elf"
+        self._symbol_updater = SymbolUpdater()
+
+    @staticmethod
+    def detect_format(path: str) -> str:
+        """Detect binary format from magic bytes."""
+        with open(path, 'rb') as f:
+            magic = f.read(4)
+        if magic[:2] == b'MZ':
+            return 'pe'
+        if magic[:4] == b'\x7fELF':
+            return 'elf'
+        return 'unknown'
 
     def load(self, pe_path: str, callback=None) -> Dict:
-        """Load a PE binary and analyze all references."""
+        """Load a binary (PE or ELF) and analyze all references."""
         if not os.path.isfile(pe_path):
             return {'success': False, 'error': f'File not found: {pe_path}'}
+
         self.pe_path = pe_path
+        self.binary_format = self.detect_format(pe_path)
+
+        if self.binary_format == 'elf':
+            return self._load_elf(pe_path, callback)
+        elif self.binary_format == 'pe':
+            return self._load_pe(pe_path, callback)
+        else:
+            return {'success': False, 'error': 'Unknown binary format (expected PE or ELF)'}
+
+    def _load_pe(self, pe_path: str, callback=None) -> Dict:
+        """Load a PE binary and analyze all references."""
         try:
             finder = PEReferenceFinder(pe_path)
             self.ref_db = finder.find_all(callback=callback)
             self.shift_engine = ShiftEngine(pe_path, self.ref_db)
             self.pe_info = {
                 'path': pe_path,
+                'format': 'pe',
                 'size': os.path.getsize(pe_path),
                 'image_base': finder.image_base,
                 'is_64': finder.is_64,
@@ -1485,6 +2454,45 @@ class UBRTEngine:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+    def _load_elf(self, elf_path: str, callback=None) -> Dict:
+        """Load an ELF binary and analyze all references."""
+        if not HAS_ELFTOOLS:
+            return {'success': False, 'error': 'pyelftools not installed (pip install pyelftools)'}
+        try:
+            finder = ELFReferenceFinder(elf_path)
+            self.ref_db = finder.find_all(callback=callback)
+            self.shift_engine = ELFShiftEngine(elf_path, self.ref_db)
+            self.pe_info = {
+                'path': elf_path,
+                'format': 'elf',
+                'size': os.path.getsize(elf_path),
+                'image_base': finder.image_base,
+                'is_64': finder.is_64,
+                'is_pie': finder.is_pie,
+                'sections': [],
+                'entry_point': finder.elf.header['e_entry'],
+            }
+            for sec in finder.elf.iter_sections():
+                self.pe_info['sections'].append({
+                    'name': sec.name,
+                    'rva': sec.header['sh_addr'],
+                    'vsize': sec.header['sh_size'],
+                    'raw_size': sec.header['sh_size'],
+                    'raw_offset': sec.header['sh_offset'],
+                    'is_code': bool(sec.header['sh_flags'] & 0x4),
+                    'is_data': bool(sec.header['sh_flags'] & 0x1),
+                    'is_writable': bool(sec.header['sh_flags'] & 0x1),
+                })
+            finder.close()
+            return {
+                'success': True,
+                'refs_found': self.ref_db.count,
+                'stats': self.ref_db.stats(),
+                'pe_info': self.pe_info,
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
     def preview(self, operation: str, rva: int, size_or_data) -> Dict:
         """Preview an operation without applying it."""
         if not self.shift_engine:
@@ -1497,6 +2505,8 @@ class UBRTEngine:
         if not self.shift_engine:
             raise RuntimeError("No binary loaded")
         result = self.shift_engine.insert_bytes(rva, data)
+        if result.success:
+            self._update_symbols_after_shift(rva, len(data))
         self._history.append(result)
         return result
 
@@ -1504,6 +2514,8 @@ class UBRTEngine:
         if not self.shift_engine:
             raise RuntimeError("No binary loaded")
         result = self.shift_engine.delete_bytes(rva, count)
+        if result.success:
+            self._update_symbols_after_shift(rva, -count)
         self._history.append(result)
         return result
 
@@ -1596,3 +2608,18 @@ class UBRTEngine:
             result['refs_added'] = added
             result['total_refs'] = self.ref_db.count
         return result
+
+    def _update_symbols_after_shift(self, shift_addr: int, delta: int):
+        """Update symbol tables after a shift operation."""
+        if not self.shift_engine:
+            return
+        buf = self.shift_engine.buffer
+        is_64 = self.pe_info.get('is_64', False)
+
+        if self.binary_format == 'elf':
+            count = SymbolUpdater.update_elf_symbols(buf, is_64, shift_addr, delta)
+        elif self.binary_format == 'pe' and isinstance(self.shift_engine, ShiftEngine):
+            count = SymbolUpdater.update_pe_exports(
+                buf, self.shift_engine.pe, shift_addr, delta)
+            count += SymbolUpdater.update_pe_debug_dir(
+                buf, self.shift_engine.pe, shift_addr, delta)
