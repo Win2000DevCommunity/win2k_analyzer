@@ -7517,19 +7517,30 @@ class KernelDebuggerTab(ttk.Frame):
 # ══════════════════════════════════════════════════════════════════════════
 
 class UBRTTab(ttk.Frame):
-    """Surgical binary modification with automatic reference recalculation."""
+    """Universal Binary Rewriting Tool — insert/delete/patch with automatic reference recalculation."""
 
     def __init__(self, parent, app):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(5, weight=1)
+        self.rowconfigure(6, weight=1)
         self._engine = None
 
-        # ── Row 0: File picker ──
-        _, self._get_pe, self.pe_var = make_file_picker(
-            self, "PE Binary:", row=0,
-            placeholder="C:\\WINNT\\system32\\ntdll.dll", app=app)
+        # ── Row 0: File picker (supports PE / ELF / Mach-O) ──
+        fp_frm = tk.Frame(self, bg=T["bg"])
+        fp_frm.grid(row=0, column=0, sticky="ew", padx=12, pady=5)
+        fp_frm.columnconfigure(1, weight=1)
+        ttk.Label(fp_frm, text="Binary:", width=16, anchor="e").grid(row=0, column=0, padx=(0, 8))
+        self._pe_var = tk.StringVar()
+        self._pe_ent = PlaceholderEntry(fp_frm,
+            placeholder="PE / ELF / Mach-O binary file",
+            textvariable=self._pe_var,
+            bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=5)
+        self._pe_ent.grid(row=0, column=1, sticky="ew")
+        app.register_placeholder(self._pe_ent)
+        ttk.Button(fp_frm, text="Browse \u2026",
+                   command=self._browse_binary).grid(row=0, column=2, padx=(8, 0))
 
         # ── Row 1: Main action buttons ──
         btn_frm = make_button_bar(self, row=1)
@@ -7538,37 +7549,42 @@ class UBRTTab(ttk.Frame):
                    command=self._analyze).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F4CA  Ref Stats",
                    command=self._show_stats).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4E6  Compact",
+                   command=self._compact).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F512  Strip Signature",
+                   command=self._strip_sig).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\U0001F4BE  Save Binary\u2026",
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u21A9  Undo",
                    command=self._undo).pack(side="left", padx=5)
 
-        # ── Row 2: Operation panel ──
+        # ── Row 2: Shift Engine Operations (professional layout) ──
         op_frm = tk.LabelFrame(self, text=" Shift Engine Operations ",
                                bg=T["bg"], fg=T["accent"], font=("Segoe UI", 10, "bold"),
                                padx=8, pady=6)
         op_frm.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
-        op_frm.columnconfigure(1, weight=1)
+        op_frm.columnconfigure(3, weight=1)
 
-        tk.Label(op_frm, text="Op:", bg=T["bg"], fg=T["fg"]).grid(
-            row=0, column=0, padx=(0, 4))
+        # Row 0: Operation + RVA
+        tk.Label(op_frm, text="Operation:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).grid(row=0, column=0, padx=(0, 4), sticky="e")
         self._op_var = tk.StringVar(value="INSERT")
-        op_menu = ttk.Combobox(op_frm, textvariable=self._op_var, width=10,
+        op_menu = ttk.Combobox(op_frm, textvariable=self._op_var, width=14,
                                values=["INSERT", "DELETE", "PATCH", "NOP SLED"],
                                state="readonly")
         op_menu.grid(row=0, column=1, sticky="w", padx=4)
 
-        tk.Label(op_frm, text="RVA:", bg=T["bg"], fg=T["fg"]).grid(
-            row=0, column=2, padx=(12, 4))
+        tk.Label(op_frm, text="RVA:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).grid(row=0, column=2, padx=(12, 4), sticky="e")
         self._rva_var = tk.StringVar()
         self._rva_ent = tk.Entry(op_frm, textvariable=self._rva_var, width=14,
                                  bg=T["entry_bg"], fg=T["fg"],
                                  insertbackground=T["fg"], font=("Consolas", 10),
                                  relief="flat", bd=4)
-        self._rva_ent.grid(row=0, column=3, padx=4)
+        self._rva_ent.grid(row=0, column=3, padx=4, sticky="w")
 
-        tk.Label(op_frm, text="Hex Data / Size:", bg=T["bg"], fg=T["fg"]).grid(
-            row=0, column=4, padx=(12, 4))
+        tk.Label(op_frm, text="Size / Hex data:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).grid(row=0, column=4, padx=(12, 4), sticky="e")
         self._data_var = tk.StringVar()
         self._data_ent = tk.Entry(op_frm, textvariable=self._data_var, width=30,
                                   bg=T["entry_bg"], fg=T["fg"],
@@ -7576,11 +7592,19 @@ class UBRTTab(ttk.Frame):
                                   relief="flat", bd=4)
         self._data_ent.grid(row=0, column=5, padx=4, sticky="ew")
 
-        ttk.Button(op_frm, text="\U0001F441  Preview",
-                   command=self._preview).grid(row=0, column=6, padx=4)
-        ttk.Button(op_frm, text="\u26A1  Apply",
+        # Row 1: hint + buttons
+        hint_text = ("INSERT/NOP SLED: size in bytes (e.g. 64 or 0x40)  |  "
+                     "DELETE: count in bytes  |  PATCH: hex bytes (e.g. 90 90 CC)")
+        tk.Label(op_frm, text=hint_text, bg=T["bg"], fg=T["fg_dim"],
+                 font=("Segoe UI", 8)).grid(row=1, column=0, columnspan=4,
+                                             sticky="w", padx=4, pady=(2, 0))
+        op_btn_frm = tk.Frame(op_frm, bg=T["bg"])
+        op_btn_frm.grid(row=1, column=4, columnspan=2, sticky="e", pady=(2, 0))
+        ttk.Button(op_btn_frm, text="\U0001F441  Preview",
+                   command=self._preview).pack(side="left", padx=4)
+        ttk.Button(op_btn_frm, text="\u26A1  Apply",
                    style="Accent.TButton",
-                   command=self._apply).grid(row=0, column=7, padx=4)
+                   command=self._apply).pack(side="left", padx=4)
 
         # ── Row 3: QEMU Tracer panel ──
         qemu_frm = tk.LabelFrame(self, text=" QEMU Dynamic Tracer ",
@@ -7626,20 +7650,45 @@ class UBRTTab(ttk.Frame):
                                      font=("Segoe UI", 9))
         self._qemu_status.pack(side="left", padx=12)
 
-        # ── Row 4: Status bar ──
-        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
-            self, "\u2022 Load a PE binary and click Analyze References", row=4)
+        # ── Row 4: Info bar (format + ref count + history) ──
+        self._info_frm = tk.Frame(self, bg=T["bg"])
+        self._info_frm.grid(row=4, column=0, sticky="ew", padx=12, pady=2)
+        self._info_lbl = tk.Label(self._info_frm, text="", bg=T["bg"],
+                                  fg=T["accent"], font=("Consolas", 9, "bold"),
+                                  anchor="w")
+        self._info_lbl.pack(side="left", fill="x", expand=True)
 
-        # ── Row 5: Output ──
+        # ── Row 5: Status bar ──
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Browse to a PE / ELF / Mach-O binary and click Analyze References", row=5)
+
+        # ── Row 6: Output ──
         self.output = TabbedOutput(self)
-        self.output.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.output.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    # ── File browser (PE + ELF + Mach-O) ─────────────────────────────
+
+    def _browse_binary(self):
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("All Binaries", "*.dll;*.sys;*.exe;*.cpl;*.drv;*.ocx;*.scr;*.so;*.o;*.dylib;*.a"),
+                ("PE Files", "*.dll;*.sys;*.exe;*.cpl;*.drv;*.ocx;*.scr"),
+                ("ELF Files", "*.so;*.o;*"),
+                ("Mach-O Files", "*.dylib;*.a;*"),
+                ("All Files", "*.*"),
+            ])
+        if path:
+            self._pe_ent.set_value(path)
+
+    def _get_pe(self):
+        return self._pe_ent.get_value()
 
     # ── Analysis ──────────────────────────────────────────────────────
 
     def _analyze(self):
         pe_path = self._get_pe()
         if not pe_path or not os.path.isfile(pe_path):
-            self.status_var.set("\u26A0 Select a valid PE file first")
+            self.status_var.set("\u26A0 Select a valid binary file first")
             return
 
         from nt_analyzer.ubrt_engine import UBRTEngine
@@ -7649,7 +7698,7 @@ class UBRTTab(ttk.Frame):
 
         def work(progress_cb):
             eng = UBRTEngine()
-            progress_cb("Analyzing references\u2026", 10)
+            progress_cb("Detecting format\u2026", 5)
             info = eng.load(pe_path)
             progress_cb("Done", 100)
             return eng, info
@@ -7667,53 +7716,72 @@ class UBRTTab(ttk.Frame):
             stats = info['stats']
             pe = info['pe_info']
 
+            # Update info bar
+            fmt_name = pe.get('format', 'PE').upper()
+            arch = 'x64' if pe.get('is_64') else 'x86'
+            self._info_lbl.config(
+                text=f"\u2588 {fmt_name} | {arch} | "
+                     f"ImageBase 0x{pe.get('image_base', 0):X} | "
+                     f"{stats['total']:,} references | "
+                     f"{len(pe.get('sections', []))} sections | "
+                     f"{pe.get('size', 0):,} bytes")
+
             tab = self.output.add_tab(f"Refs: {os.path.basename(pe_path)}")
             out = lambda t, tag="": output_write(tab, t, tag)
 
             out(f"\n{'='*72}\n", "title")
-            out(f"  UBRT Reference Analysis: {os.path.basename(pe_path)}\n", "title")
+            out(f"  UBRT Reference Analysis — {os.path.basename(pe_path)}\n", "title")
             out(f"{'='*72}\n\n", "title")
 
             out(f"  File:        {pe_path}\n")
-            out(f"  Size:        {pe['size']:,} bytes\n")
-            out(f"  ImageBase:   0x{pe['image_base']:X}\n")
-            out(f"  Arch:        {'x64' if pe['is_64'] else 'x86 (32-bit)'}\n")
-            out(f"  Entry Point: 0x{pe['entry_point']:X}\n\n")
+            out(f"  Format:      {fmt_name}\n")
+            out(f"  Size:        {pe.get('size', 0):,} bytes\n")
+            out(f"  ImageBase:   0x{pe.get('image_base', 0):X}\n")
+            out(f"  Arch:        {arch}\n")
+            out(f"  Entry Point: 0x{pe.get('entry_point', 0):X}\n")
+            if pe.get('is_fat'):
+                out(f"  Fat Binary:  Yes (Mach-O universal)\n", "peach")
+            if pe.get('is_pie'):
+                out(f"  PIE:         Yes\n")
+            out("\n")
 
-            out(f"  Sections:\n", "ok")
-            out(f"  {'Name':<12} {'RVA':>10} {'VSize':>10} {'RawSize':>10} {'Flags':<20}\n", "dim")
-            out(f"  {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*20}\n", "dim")
-            for s in pe['sections']:
+            out(f"  Sections:\n", "heading")
+            out(f"  {'Name':<12} {'Offset':>10} {'RVA':>10} {'VSize':>10} {'RawSize':>10} {'Flags'}\n", "dim")
+            out(f"  {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*20}\n", "dim")
+            for s in pe.get('sections', []):
                 flags = []
-                if s['is_code']:  flags.append('CODE')
-                if s['is_data']:  flags.append('DATA')
-                if s['is_writable']: flags.append('WRITE')
-                out(f"  {s['name']:<12} 0x{s['rva']:08X} 0x{s['vsize']:08X} "
-                    f"0x{s['raw_size']:08X} {','.join(flags)}\n")
+                if s.get('is_code'):  flags.append('CODE')
+                if s.get('is_data'):  flags.append('DATA')
+                if s.get('is_writable'): flags.append('WRITE')
+                out(f"  {s['name']:<12} 0x{s.get('raw_offset', 0):08X} 0x{s['rva']:08X} "
+                    f"0x{s['vsize']:08X} 0x{s['raw_size']:08X} {','.join(flags)}\n")
 
             out(f"\n  {'='*60}\n", "title")
-            out(f"  REFERENCES FOUND: {stats['total']}\n", "title")
+            out(f"  REFERENCES FOUND: {stats['total']:,}\n", "title")
             out(f"  {'='*60}\n\n", "title")
 
-            out(f"  By Type:\n", "ok")
+            out(f"  By Type:\n", "heading")
+            max_cnt = max(stats['by_type'].values()) if stats['by_type'] else 1
             for typ, cnt in sorted(stats['by_type'].items(), key=lambda x: -x[1]):
-                bar = '\u2588' * min(cnt // 20 + 1, 40)
-                out(f"    {typ:<25} {cnt:>6}  {bar}\n")
+                bar_len = int(cnt / max_cnt * 40) if max_cnt else 0
+                bar = '\u2588' * max(bar_len, 1)
+                pct = cnt / stats['total'] * 100 if stats['total'] else 0
+                out(f"    {typ:<28} {cnt:>7,}  ({pct:5.1f}%)  {bar}\n")
 
-            out(f"\n  By Source:\n", "ok")
+            out(f"\n  By Source:\n", "heading")
             for src, cnt in sorted(stats['by_source'].items(), key=lambda x: -x[1]):
-                out(f"    {src:<25} {cnt:>6}\n")
+                out(f"    {src:<28} {cnt:>7,}\n")
 
             conf = stats['by_confidence']
-            out(f"\n  By Confidence:\n", "ok")
-            out(f"    High (≥0.9):   {conf['high']:>6}\n", "ok")
-            out(f"    Medium (≥0.7): {conf['medium']:>6}\n", "peach")
-            out(f"    Low (<0.7):    {conf['low']:>6}\n", "error")
+            out(f"\n  By Confidence:\n", "heading")
+            out(f"    High (\u22650.9):   {conf['high']:>7,}\n", "ok")
+            out(f"    Medium (\u22650.7): {conf['medium']:>7,}\n", "peach")
+            out(f"    Low (<0.7):    {conf['low']:>7,}\n", "error")
 
-            out(f"\n  \u2714 Ready for shift operations. Use the operation panel above.\n", "ok")
+            out(f"\n  \u2714 Ready for operations. Use the Shift Engine panel or the action buttons above.\n", "ok")
 
             self.status_var.set(
-                f"\u2714 Found {stats['total']} references in "
+                f"\u2714 {fmt_name} | {stats['total']:,} references found in "
                 f"{os.path.basename(pe_path)}")
 
         run_with_progress_dialog(self.app,
@@ -7729,7 +7797,11 @@ class UBRTTab(ttk.Frame):
         tab = self.output.add_tab("Reference List")
         out = lambda t, tag="": output_write(tab, t, tag)
 
-        out(f"\n  {'Offset':<12} {'RVA':<12} {'Type':<22} {'Target RVA':<12} "
+        out(f"\n{'='*72}\n", "title")
+        out(f"  Reference Database — {len(refs):,} entries\n", "title")
+        out(f"{'='*72}\n\n", "title")
+
+        out(f"  {'Offset':<12} {'RVA':<12} {'Type':<22} {'Target RVA':<12} "
             f"{'Rel?':<6} {'Size':<6} {'Conf':<6} {'Section':<10} {'Symbol'}\n", "dim")
         out(f"  {'─'*12} {'─'*12} {'─'*22} {'─'*12} {'─'*6} {'─'*6} "
             f"{'─'*6} {'─'*10} {'─'*20}\n", "dim")
@@ -7744,17 +7816,79 @@ class UBRTTab(ttk.Frame):
             shown += 1
 
         if len(refs) > 2000:
-            out(f"\n  ... and {len(refs) - 2000} more references (showing first 2000)\n", "dim")
+            out(f"\n  \u2026 and {len(refs) - 2000:,} more references (showing first 2,000)\n", "dim")
 
-        self.status_var.set(f"\U0001F4CA Showing {shown} of {len(refs)} references")
+        self.status_var.set(f"\U0001F4CA Showing {shown:,} of {len(refs):,} references")
 
-    # ── Preview ───────────────────────────────────────────────────────
+    # ── Compact ───────────────────────────────────────────────────────
+
+    def _compact(self):
+        if not self._engine or not self._engine.shift_engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+
+        self.status_var.set("\u23F3 Compacting\u2026")
+        try:
+            result = self._engine.compact()
+        except Exception as e:
+            self.status_var.set(f"\u26A0 Compact failed: {e}")
+            return
+
+        tab = self.output.add_tab("Compact")
+        out = lambda t, tag="": output_write(tab, t, tag)
+        out(f"\n{'='*72}\n", "title")
+        out(f"  COMPACT — Reclaim Section Padding\n", "title")
+        out(f"{'='*72}\n\n", "title")
+
+        if result.get('success', result.get('reclaimed', 0) > 0):
+            out(f"  Bytes reclaimed: {result.get('reclaimed', 0):,}\n", "ok")
+            for sec in result.get('sections', []):
+                out(f"    {sec.get('name', '?')}: {sec.get('reclaimed', 0):,} bytes reclaimed\n")
+            out(f"\n  \u2714 Binary compacted successfully.\n", "ok")
+            self.status_var.set(f"\u2714 Compacted: {result.get('reclaimed', 0):,} bytes reclaimed")
+        else:
+            out(f"  No reclaimable padding found.\n", "dim")
+            self.status_var.set("\u2714 No padding to reclaim")
+
+    # ── Strip Signature ───────────────────────────────────────────────
+
+    def _strip_sig(self):
+        if not self._engine or not self._engine.shift_engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+
+        self.status_var.set("\u23F3 Stripping signature\u2026")
+        try:
+            result = self._engine.strip_signature()
+        except Exception as e:
+            self.status_var.set(f"\u26A0 Strip failed: {e}")
+            return
+
+        tab = self.output.add_tab("Strip Signature")
+        out = lambda t, tag="": output_write(tab, t, tag)
+        out(f"\n{'='*72}\n", "title")
+        out(f"  Strip Code Signature\n", "title")
+        out(f"{'='*72}\n\n", "title")
+
+        if result.get('success'):
+            out(f"  Signature type:  {result.get('type', 'unknown')}\n")
+            out(f"  Bytes removed:   {result.get('bytes_removed', 0):,}\n", "ok")
+            out(f"\n  \u2714 Signature stripped. Save the binary to write changes.\n", "ok")
+            self.status_var.set(f"\u2714 Signature stripped ({result.get('type', '')})")
+        elif result.get('not_found') or 'not found' in result.get('message', '').lower() or 'no ' in result.get('message', '').lower():
+            out(f"  {result.get('message', 'No signature found.')}\n", "dim")
+            self.status_var.set(f"\u2714 {result.get('message', 'No signature')}")
+        else:
+            out(f"  \u26A0 {result.get('error', result.get('message', 'Failed'))}\n", "error")
+            self.status_var.set(f"\u26A0 {result.get('error', 'Strip failed')}")
+
+    # ── Parse helpers ─────────────────────────────────────────────────
 
     def _parse_rva(self) -> int:
         raw = self._rva_var.get().strip()
         if not raw:
             raise ValueError("RVA is empty")
-        return int(raw, 16) if raw.startswith('0x') or raw.startswith('0X') else int(raw, 16)
+        return int(raw, 16) if raw.startswith(('0x', '0X')) else int(raw, 16)
 
     def _parse_hex_data(self) -> bytes:
         raw = self._data_var.get().strip()
@@ -7767,9 +7901,11 @@ class UBRTTab(ttk.Frame):
         raw = self._data_var.get().strip()
         if not raw:
             raise ValueError("Size is empty")
-        if raw.startswith('0x') or raw.startswith('0X'):
+        if raw.startswith(('0x', '0X')):
             return int(raw, 16)
         return int(raw)
+
+    # ── Preview ───────────────────────────────────────────────────────
 
     def _preview(self):
         if not self._engine or not self._engine.ref_db:
@@ -7783,10 +7919,7 @@ class UBRTTab(ttk.Frame):
 
         op = self._op_var.get()
         try:
-            if op == "INSERT":
-                data = self._parse_hex_data()
-                size = len(data)
-            elif op == "NOP SLED":
+            if op in ("INSERT", "NOP SLED"):
                 size = self._parse_size()
             elif op == "DELETE":
                 size = self._parse_size()
@@ -7807,8 +7940,8 @@ class UBRTTab(ttk.Frame):
         out(f"  SHIFT PREVIEW: {op} {size} bytes at RVA 0x{rva:X}\n", "title")
         out(f"{'='*72}\n\n", "title")
 
-        out(f"  Total references:  {preview.get('total_refs', 0)}\n")
-        out(f"  Refs affected:     {preview.get('refs_affected', 0)}\n")
+        out(f"  Total references:  {preview.get('total_refs', 0):,}\n")
+        out(f"  Refs affected:     {preview.get('refs_affected', 0):,}\n")
         out(f"  Warnings:          {len(preview.get('warnings', []))}\n\n")
 
         if preview.get('warnings'):
@@ -7819,14 +7952,14 @@ class UBRTTab(ttk.Frame):
 
         changes = preview.get('changes', [])
         if changes:
-            out(f"  Changes ({len(changes)}):\n", "ok")
+            out(f"  Changes ({len(changes):,}):\n", "heading")
             for ch in changes[:500]:
                 out(f"    {ch}\n")
             if len(changes) > 500:
-                out(f"\n    ... and {len(changes)-500} more\n", "dim")
+                out(f"\n    \u2026 and {len(changes)-500:,} more\n", "dim")
 
         self.status_var.set(
-            f"\U0001F441 Preview: {preview.get('refs_affected', 0)} refs affected, "
+            f"\U0001F441 Preview: {preview.get('refs_affected', 0):,} refs affected, "
             f"{len(preview.get('warnings', []))} warnings")
 
     # ── Apply ─────────────────────────────────────────────────────────
@@ -7874,7 +8007,7 @@ class UBRTTab(ttk.Frame):
         out(f"  Operation:       {result.operation.value}\n")
         out(f"  RVA:             0x{result.rva:X}\n")
         out(f"  Delta:           {result.delta:+d} bytes\n")
-        out(f"  Refs updated:    {result.refs_updated}\n")
+        out(f"  Refs updated:    {result.refs_updated:,}\n")
         out(f"  Sections adj:    {result.sections_adjusted}\n")
         out(f"  New file size:   {result.new_file_size:,} bytes\n")
 
@@ -7883,13 +8016,20 @@ class UBRTTab(ttk.Frame):
             for w in result.warnings:
                 out(f"    {w}\n", "error")
 
-        # Show history
         history = self._engine.get_history()
         if history:
-            out(f"\n  Operation History ({len(history)}):\n", "dim")
+            out(f"\n  Operation History ({len(history)}):\n", "heading")
             for i, h in enumerate(history):
                 out(f"    {i+1}. {h['op']} at {h['rva']}: "
                     f"delta={h['delta']:+d}, refs={h['refs_updated']}\n", "dim")
+
+        # Update info bar
+        if self._engine.pe_info:
+            refs_now = len(self._engine.ref_db.get_all()) if self._engine.ref_db else 0
+            hist_count = len(history) if history else 0
+            self._info_lbl.config(
+                text=f"\u2588 {self._engine.pe_info.get('format', 'PE').upper()} | "
+                     f"{refs_now:,} refs | {hist_count} operations applied")
 
         self.status_var.set(f"{status_icon} {result.message}")
 
@@ -7911,10 +8051,14 @@ class UBRTTab(ttk.Frame):
         if not self._engine or not self._engine.shift_engine:
             self.status_var.set("\u26A0 No binary loaded")
             return
+        basename = os.path.basename(self._engine.pe_path or "output.bin")
         out_path = filedialog.asksaveasfilename(
-            defaultextension=".exe",
-            filetypes=[("PE Files", "*.dll;*.sys;*.exe"), ("All", "*.*")],
-            initialfile=os.path.basename(self._engine.pe_path or "output.exe"))
+            defaultextension=os.path.splitext(basename)[1] or ".bin",
+            filetypes=[("PE Files", "*.dll;*.sys;*.exe"),
+                       ("ELF Files", "*.so;*.o"),
+                       ("Mach-O Files", "*.dylib"),
+                       ("All Files", "*.*")],
+            initialfile=basename)
         if not out_path:
             return
         try:
@@ -7932,7 +8076,7 @@ class UBRTTab(ttk.Frame):
             self._qemu_var.set(found)
             self._qemu_status.config(text=f"Found: {os.path.basename(found)}", fg=T["ok"])
         else:
-            self._qemu_status.config(text="QEMU not found — install or set path manually", fg=T["error"])
+            self._qemu_status.config(text="QEMU not found \u2014 install or set path manually", fg=T["error"])
 
     def _browse_disk(self):
         path = filedialog.askopenfilename(
@@ -7960,7 +8104,7 @@ class UBRTTab(ttk.Frame):
             self._qemu_status.config(
                 text=f"Running (PID {result['pid']}, GDB :{result['gdb_port']})",
                 fg=T["ok"])
-            self.status_var.set(f"\u25B6 QEMU started — trace log: {result['trace_log']}")
+            self.status_var.set(f"\u25B6 QEMU started \u2014 trace log: {result['trace_log']}")
         else:
             self._qemu_status.config(text=f"Error: {result['error']}", fg=T["error"])
             self.status_var.set(f"\u26A0 {result['error']}")
@@ -7988,9 +8132,9 @@ class UBRTTab(ttk.Frame):
         out(f"\n{'='*60}\n", "title")
         out(f"  QEMU Trace Log Coverage\n", "title")
         out(f"{'='*60}\n\n", "title")
-        out(f"  Basic blocks executed: {result['blocks']}\n")
-        out(f"  Unique blocks:         {result['unique_blocks']}\n")
-        out(f"  Instructions traced:   {result['instructions']}\n\n")
+        out(f"  Basic blocks executed: {result['blocks']:,}\n")
+        out(f"  Unique blocks:         {result['unique_blocks']:,}\n")
+        out(f"  Instructions traced:   {result['instructions']:,}\n\n")
 
         cov = self._engine.qemu.coverage
         out(f"  {'RVA':<14} {'Hit Count'}\n", "dim")
@@ -7999,11 +8143,11 @@ class UBRTTab(ttk.Frame):
             blk = cov[rva]
             out(f"  0x{rva:08X}    {blk.hit_count}\n")
         if len(cov) > 500:
-            out(f"\n  ... {len(cov)-500} more blocks\n", "dim")
+            out(f"\n  \u2026 {len(cov)-500:,} more blocks\n", "dim")
 
         self.status_var.set(
-            f"\U0001F4C8 Trace: {result['unique_blocks']} unique blocks, "
-            f"{result['instructions']} instructions")
+            f"\U0001F4C8 Trace: {result['unique_blocks']:,} unique blocks, "
+            f"{result['instructions']:,} instructions")
 
     def _merge_coverage(self):
         if not self._engine:
@@ -8012,8 +8156,8 @@ class UBRTTab(ttk.Frame):
         result = self._engine.merge_trace_coverage()
         if result.get('success'):
             self.status_var.set(
-                f"\U0001F517 Merged: {result.get('refs_added', 0)} new refs, "
-                f"total {result.get('total_refs', 0)}")
+                f"\U0001F517 Merged: {result.get('refs_added', 0):,} new refs, "
+                f"total {result.get('total_refs', 0):,}")
         else:
             self.status_var.set(f"\u26A0 {result.get('error')}")
 
