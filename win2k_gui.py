@@ -5547,6 +5547,177 @@ class DisassemblyView(tk.Frame):
 #  Tab 16: Kernel Debugger
 # ══════════════════════════════════════════════════════════════════════════
 
+
+class _DetachedTabWindow(tk.Toplevel):
+    """VS Code-style detached tab window.
+
+    Opens a separate OS window containing a copy of a tab's content.
+    Has a toolbar to pull additional tabs from the main window.
+    """
+
+    def __init__(self, debugger_tab, tab_title, src_widget):
+        super().__init__(debugger_tab.winfo_toplevel())
+        self._dtab = debugger_tab
+        self._tabs = {}  # title -> widget in our notebook
+
+        self.title(f"Win2K Analyzer \u2014 {tab_title}")
+        self.geometry("900x600")
+        self.configure(bg=T["bg"])
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Keep on top initially so user sees it
+        self.transient("")
+        self.lift()
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # ── Toolbar ──
+        toolbar = tk.Frame(self, bg=T["bg"], pady=4)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=6)
+
+        tk.Button(toolbar, text="\u2795 Pull Tab",
+                  bg=T["button"], fg=T["fg"],
+                  activebackground=T["accent"], activeforeground="#fff",
+                  relief="flat", bd=1, padx=8, pady=3,
+                  font=("Segoe UI", 9),
+                  command=self._pull_tab_menu).pack(side="left", padx=4)
+
+        tk.Button(toolbar, text="\u21A9 Return All to Main",
+                  bg=T["button"], fg=T["fg"],
+                  activebackground=T["accent"], activeforeground="#fff",
+                  relief="flat", bd=1, padx=8, pady=3,
+                  font=("Segoe UI", 9),
+                  command=self._return_all).pack(side="left", padx=4)
+
+        tk.Label(toolbar, text="\u2503", bg=T["bg"],
+                 fg=T["separator"]).pack(side="left", padx=6)
+
+        self._title_lbl = tk.Label(
+            toolbar, text="", bg=T["bg"], fg=T["fg_dim"],
+            font=("Segoe UI", 9))
+        self._title_lbl.pack(side="left", padx=4)
+
+        # ── Notebook for tabs in this window ──
+        self._nb = ttk.Notebook(self)
+        self._nb.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self._nb.bind("<Button-3>", self._tab_context)
+        self._ctx = tk.Menu(self._nb, tearoff=0)
+        self._ctx.add_command(label="Return to Main Window",
+                              command=self._return_ctx_tab)
+
+        # Add the initial tab
+        self._add_tab_from_source(tab_title, src_widget)
+        self._update_title()
+
+    def _add_tab_from_source(self, title, src_widget):
+        """Create a tab in this window with content copied from *src_widget*."""
+        frm = ttk.Frame(self._nb)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(0, weight=1)
+
+        is_disasm = isinstance(src_widget, DisassemblyView)
+
+        if is_disasm:
+            dv = DisassemblyView(frm, self._dtab)
+            dv.grid(row=0, column=0, sticky="nsew")
+            if src_widget._functions:
+                dv.load_functions(src_widget._functions)
+            if src_widget._eip_line is not None:
+                for addr, line in src_widget._addr_to_line.items():
+                    if line == src_widget._eip_line:
+                        dv.update_eip(addr)
+                        break
+            if src_widget._exec_lines:
+                exec_addrs = set()
+                for ln in src_widget._exec_lines:
+                    a = src_widget._line_to_addr.get(ln)
+                    if a is not None:
+                        exec_addrs.add(a)
+                if exec_addrs:
+                    dv.mark_executed(exec_addrs)
+            self._tabs[title] = dv
+        else:
+            txt = scrolledtext.ScrolledText(
+                frm, bg=T["bg_dark"], fg=T["fg"],
+                insertbackground=T["fg"],
+                font=("Consolas", 10), relief="flat", bd=8,
+                wrap="none", state="disabled")
+            txt.grid(row=0, column=0, sticky="nsew")
+            _configure_output_tags(txt)
+            if hasattr(src_widget, 'get'):
+                content = src_widget.get("1.0", "end-1c")
+                if content.strip():
+                    txt.configure(state="normal")
+                    txt.insert("1.0", content)
+                    txt.see("end")
+                    txt.configure(state="disabled")
+            self._tabs[title] = txt
+
+        self._nb.add(frm, text=f"  {title}  ")
+        self._nb.select(frm)
+        self._update_title()
+
+    def _pull_tab_menu(self):
+        """Show menu of main-window tabs that can be pulled here."""
+        available = self._dtab._get_available_tabs()
+        if not available:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        for title, _ in available:
+            menu.add_command(
+                label=title,
+                command=lambda t=title: self._pull_tab(t))
+        menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+
+    def _pull_tab(self, title):
+        """Pull a tab from the main window into this window."""
+        self._dtab._move_tab_to_window(title, self)
+        self._update_title()
+
+    def _tab_context(self, event):
+        """Right-click on tab → context menu."""
+        try:
+            self._ctx_idx = self._nb.index(f"@{event.x},{event.y}")
+            self._ctx.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            pass
+
+    def _return_ctx_tab(self):
+        """Return the right-clicked tab back to the main window."""
+        try:
+            tab_id = self._nb.tabs()[self._ctx_idx]
+            title = self._nb.tab(tab_id, "text").strip()
+            self._nb.forget(tab_id)
+            self._tabs.pop(title, None)
+            self._update_title()
+            if not self._nb.tabs():
+                self._on_close()
+        except Exception:
+            pass
+
+    def _return_all(self):
+        """Close this window — return focus to main."""
+        self._on_close()
+
+    def _update_title(self):
+        """Update window title and tab count label."""
+        count = len(self._nb.tabs())
+        self._title_lbl.configure(
+            text=f"{count} tab{'s' if count != 1 else ''} detached")
+        if count == 1:
+            for tab_id in self._nb.tabs():
+                t = self._nb.tab(tab_id, "text").strip()
+                self.title(f"Win2K Analyzer \u2014 {t}")
+        elif count > 1:
+            self.title(f"Win2K Analyzer \u2014 {count} tabs")
+
+    def _on_close(self):
+        """Close this detached window."""
+        self._dtab._on_detached_close(self)
+        self.destroy()
+
+
 class KernelDebuggerTab(ttk.Frame):
     """Live kernel‑state debugger — multi‑PE loader, breakpoints, stepping."""
 
@@ -5665,7 +5836,7 @@ class KernelDebuggerTab(ttk.Frame):
         ttk.Button(bf3, text="\U0001F50D Find Callers",
                    command=self._find_callers).pack(side="left", padx=2)
         ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
-        self._split_btn = ttk.Button(bf3, text="\u2B0C Split View",
+        self._split_btn = ttk.Button(bf3, text="\u2197 Detach Tab",
                    command=self._toggle_split_view)
         self._split_btn.pack(side="left", padx=2)
         ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
@@ -5676,9 +5847,9 @@ class KernelDebuggerTab(ttk.Frame):
         self.status_var, self._prog_start, self._prog_stop = \
             make_status_with_progress(self, "Kernel debugger ready", row=7)
 
-        # Row 8 — output (supports tabbed and split view modes)
+        # Row 8 — output (supports tabbed and detached window modes)
         self._split_mode = False
-        self._split_pane = None
+        self._detached_windows = []   # list of open _DetachedTabWindow
         self.output = TabbedOutput(self)
         self.output.grid(row=8, column=0, sticky="nsew", padx=10, pady=(4, 10))
 
@@ -6013,29 +6184,24 @@ class KernelDebuggerTab(ttk.Frame):
         else:
             self._args_var.set(args_str)
 
-    # ── split view ────────────────────────────────────────────────────────
+    # ── detached window (VS Code-style pop-out) ─────────────────────────
 
     def _toggle_split_view(self):
-        """Toggle between tabbed mode and side-by-side split."""
-        if self._split_mode:
-            self._restore_tabbed_view()
-        else:
-            self._show_split_picker()
+        """Show picker to pop a tab out into its own window."""
+        self._show_split_picker()
 
-    # ── split-view tab picker ─────────────────────────────────
     def _show_split_picker(self):
-        """Show a popup menu listing open tabs — user picks one to split out."""
+        """Popup menu listing open tabs — pick one to detach into a window."""
         tabs = self.output._nb.tabs()
         if not tabs:
-            self.status_var.set("\u26A0 No tabs open to split")
+            self.status_var.set("\u26A0 No tabs open to detach")
             return
         menu = tk.Menu(self, tearoff=0)
         for tab_id in tabs:
             title = self.output._nb.tab(tab_id, "text").strip()
             menu.add_command(
-                label=title,
-                command=lambda t=title: self._enter_split_view(t))
-        # Post menu under the split button
+                label=f"\u2197 {title}",
+                command=lambda t=title: self._detach_tab(t))
         try:
             x = self._split_btn.winfo_rootx()
             y = self._split_btn.winfo_rooty() + self._split_btn.winfo_height()
@@ -6044,120 +6210,40 @@ class KernelDebuggerTab(ttk.Frame):
             menu.tk_popup(
                 self.winfo_rootx() + 200, self.winfo_rooty() + 300)
 
-    def _enter_split_view(self, tab_title):
-        """Split *tab_title* out into a right pane; tabs stay on the left."""
-        # Look up the source widget for the chosen tab
+    def _detach_tab(self, tab_title):
+        """Pop *tab_title* out into a separate OS window."""
         src_tab_id, src_widget = self.output.find_tab(tab_title)
         if src_tab_id is None:
             self.status_var.set(f"\u26A0 Tab '{tab_title}' not found")
             return
 
-        # Hide the normal output notebook
-        self.output.grid_forget()
-
-        # Create a PanedWindow for side-by-side
-        pw = tk.PanedWindow(self, orient="horizontal", bg=T["separator"],
-                            sashwidth=4, sashrelief="flat",
-                            opaqueresize=True, bd=0)
-        pw.grid(row=8, column=0, sticky="nsew", padx=10, pady=(4, 10))
-
-        # ── Left pane: the TabbedOutput (all remaining tabs) ──
-        pw.add(self.output, stretch="always")
-        self.output.grid_forget()       # PanedWindow manages geometry now
-
-        # ── Right pane: a copy of the selected tab ──
-        right_frm = tk.Frame(pw, bg=T["bg_dark"])
-        right_frm.columnconfigure(0, weight=1)
-        right_frm.rowconfigure(1, weight=1)
-
-        # Header bar with tab title + close button
-        right_hdr = tk.Frame(right_frm, bg=T["bg"])
-        right_hdr.grid(row=0, column=0, sticky="ew")
-        tk.Label(right_hdr, text=f"  {tab_title}  ",
-                 bg=T["bg"], fg=T["accent"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=4, pady=2)
-        tk.Button(right_hdr, text="\u2716", bg=T["bg"], fg=T["fg_dim"],
-                  relief="flat", bd=0, font=("Segoe UI", 9),
-                  command=self._restore_tabbed_view).pack(
-                      side="right", padx=6, pady=2)
-
-        is_disasm = isinstance(src_widget, DisassemblyView)
-
-        if is_disasm:
-            # Create a NEW DisassemblyView and reload the same data
-            dv = DisassemblyView(right_frm, self)
-            dv.grid(row=1, column=0, sticky="nsew")
-            if src_widget._functions:
-                dv.load_functions(src_widget._functions)
-            # Sync breakpoints and EIP
-            if src_widget._eip_line is not None:
-                for addr, line in src_widget._addr_to_line.items():
-                    if line == src_widget._eip_line:
-                        dv.update_eip(addr)
-                        break
-            if src_widget._exec_lines:
-                exec_addrs = set()
-                for line in src_widget._exec_lines:
-                    a = src_widget._line_to_addr.get(line)
-                    if a is not None:
-                        exec_addrs.add(a)
-                if exec_addrs:
-                    dv.mark_executed(exec_addrs)
-            self._split_disasm_copy = dv
-        else:
-            # Text-based tab — copy content into a new ScrolledText
-            txt = scrolledtext.ScrolledText(
-                right_frm, bg=T["bg_dark"], fg=T["fg"],
-                insertbackground=T["fg"],
-                font=("Consolas", 10), relief="flat", bd=8,
-                wrap="none", state="disabled")
-            txt.grid(row=1, column=0, sticky="nsew")
-            _configure_output_tags(txt)
-            # Copy content
-            if hasattr(src_widget, 'get'):
-                content = src_widget.get("1.0", "end-1c")
-                if content.strip():
-                    txt.configure(state="normal")
-                    txt.insert("1.0", content)
-                    txt.see("end")
-                    txt.configure(state="disabled")
-            self._split_disasm_copy = None
-
-        pw.add(right_frm, stretch="always")
-
-        self._split_pane = pw
-        self._split_right_frm = right_frm
-        self._split_tab_title = tab_title
+        win = _DetachedTabWindow(self, tab_title, src_widget)
+        self._detached_windows.append(win)
         self._split_mode = True
-        self._split_btn.configure(text="\u2B0C Tabbed View")
-        self.status_var.set(
-            f"\u2B0C Split view \u2014 tabs | {tab_title}")
+        self.status_var.set(f"\u2197 Detached: {tab_title}")
 
-    def _restore_tabbed_view(self):
-        """Restore the normal tabbed output view."""
-        if not self._split_mode:
+    def _on_detached_close(self, win):
+        """Called when a detached window is closed — clean up."""
+        if win in self._detached_windows:
+            self._detached_windows.remove(win)
+        if not self._detached_windows:
+            self._split_mode = False
+
+    def _get_available_tabs(self):
+        """Return list of (title, tab_id) for tabs that can be sent to a
+        detached window."""
+        result = []
+        for tab_id in self.output._nb.tabs():
+            title = self.output._nb.tab(tab_id, "text").strip()
+            result.append((title, tab_id))
+        return result
+
+    def _move_tab_to_window(self, tab_title, target_win):
+        """Copy a tab from the main notebook into a detached window."""
+        src_tab_id, src_widget = self.output.find_tab(tab_title)
+        if src_tab_id is None:
             return
-
-        # Remove output from PanedWindow before destroying it
-        if self._split_pane:
-            try:
-                self._split_pane.forget(self.output)
-            except Exception:
-                pass
-            self._split_pane.grid_forget()
-            self._split_pane.destroy()
-            self._split_pane = None
-
-        self._split_disasm_copy = None
-        self._split_right_frm = None
-
-        # Re-grid the normal output
-        self.output.grid(row=8, column=0, sticky="nsew",
-                         padx=10, pady=(4, 10))
-
-        self._split_mode = False
-        self._split_btn.configure(text="\u2B0C Split View")
-        self.status_var.set("Kernel debugger ready")
+        target_win._add_tab_from_source(tab_title, src_widget)
 
     def _parse_args(self):
         """Parse the args entry into a list of ints."""
