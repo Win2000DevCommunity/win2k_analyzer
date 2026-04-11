@@ -5237,24 +5237,26 @@ class DisassemblyView(tk.Frame):
         self._hsb.grid(row=1, column=1, sticky="ew")
         self._text.configure(xscrollcommand=self._hsb.set)
 
-        # Configure tags
+        # Configure tags — high-contrast colors for reverse engineering
         self._text.tag_configure("func_header", foreground="#569CD6",
-                                  font=("Consolas", 10, "bold"))
-        self._text.tag_configure("address", foreground="#DCDCAA")
-        self._text.tag_configure("hexbytes", foreground="#666666")
+                                  font=("Consolas", 11, "bold"))
+        self._text.tag_configure("address", foreground="#B5CEA8")
+        self._text.tag_configure("hexbytes", foreground="#555555")
         self._text.tag_configure("mnemonic", foreground="#C586C0")
         self._text.tag_configure("mnemonic_call", foreground="#4EC9B0",
                                   font=("Consolas", 10, "bold"))
-        self._text.tag_configure("mnemonic_jmp", foreground="#CE9178")
-        self._text.tag_configure("mnemonic_ret", foreground="#D16969",
+        self._text.tag_configure("mnemonic_jmp", foreground="#D7BA7D",
+                                  font=("Consolas", 10, "bold"))
+        self._text.tag_configure("mnemonic_ret", foreground="#F44747",
                                   font=("Consolas", 10, "bold"))
         self._text.tag_configure("operand", foreground="#D4D4D4")
-        self._text.tag_configure("call_target", foreground="#4EC9B0")
+        self._text.tag_configure("call_target", foreground="#DCDCAA",
+                                  font=("Consolas", 10, "italic"))
         self._text.tag_configure("separator", foreground="#444444")
         self._text.tag_configure("eip_line", background="#3A3A00")
         self._text.tag_configure("bp_line", background="#3A1010")
         self._text.tag_configure("exec_line", background="#1A2A1A")
-        self._text.tag_configure("not_exec_line", foreground="#555555")
+        self._text.tag_configure("not_exec_line", foreground="#444444")
 
         self._gutter.tag_configure("bp_dot", foreground=self._BP_COLOR,
                                     font=("Consolas", 10, "bold"))
@@ -5596,47 +5598,10 @@ class _DetachedTabWindow(tk.Toplevel):
             font=("Segoe UI", 9))
         self._title_lbl.pack(side="left", padx=4)
 
-        # ── Row 1: Debugger control buttons ──
-        ctrl = tk.Frame(self, bg=T["bg_light"], pady=3)
-        ctrl.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 2))
-        d = self._dtab  # shortcut to KernelDebuggerTab
-
-        _btn_cfg = dict(bg=T["btn_bg"], fg=T["fg"],
-                        activebackground=T["btn_active"],
-                        activeforeground=T["fg"],
-                        relief="flat", bd=1, padx=6, pady=2,
-                        font=("Segoe UI", 9))
-
-        tk.Button(ctrl, text="\u25B6 Run",
-                  command=d._run, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="\u23F8 Run+Break",
-                  command=d._run_break, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="\u23ED Step",
-                  command=d._step, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="\u25B6\u25B6 Continue",
-                  command=d._continue, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="\u25B6 Run Until BP",
-                  command=d._run_until_bp, **_btn_cfg).pack(side="left", padx=2)
-
-        tk.Frame(ctrl, bg=T["separator"], width=2).pack(
-            side="left", padx=6, fill="y", pady=2)
-
-        tk.Button(ctrl, text="\U0001F6D1 Set BP",
-                  command=d._add_breakpoint, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="List BPs",
-                  command=d._list_breakpoints, **_btn_cfg).pack(side="left", padx=2)
-
-        tk.Frame(ctrl, bg=T["separator"], width=2).pack(
-            side="left", padx=6, fill="y", pady=2)
-
-        tk.Button(ctrl, text="Registers",
-                  command=d._show_regs, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="Call Stack",
-                  command=d._show_callstack, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="Stack",
-                  command=d._show_stack_mem, **_btn_cfg).pack(side="left", padx=2)
-        tk.Button(ctrl, text="Disassemble",
-                  command=d._disassemble, **_btn_cfg).pack(side="left", padx=2)
+        # ── Row 1: Context-aware control bar (built per tab type) ──
+        self._ctrl_frame = tk.Frame(self, bg=T["bg_light"])
+        self._ctrl_frame.grid(row=1, column=0, sticky="ew",
+                              padx=6, pady=(0, 2))
 
         # ── Row 2: Notebook for tabs in this window ──
         self._nb = ttk.Notebook(self)
@@ -5649,6 +5614,110 @@ class _DetachedTabWindow(tk.Toplevel):
         # Add the initial tab
         self._add_tab_from_source(tab_title, src_widget)
         self._update_title()
+
+    def _build_controls(self, is_disasm):
+        """Build the context-aware control bar (Row 1) based on tab type."""
+        for w in self._ctrl_frame.winfo_children():
+            w.destroy()
+
+        d = self._dtab
+        _btn = dict(bg=T["btn_bg"], fg=T["fg"],
+                    activebackground=T["btn_active"],
+                    activeforeground=T["fg"],
+                    relief="flat", bd=1, padx=6, pady=2,
+                    font=("Segoe UI", 9))
+
+        if is_disasm:
+            # Disassembly controls: step/continue, breakpoints, search
+            tk.Button(self._ctrl_frame, text="\u23ED Step",
+                      command=d._step, **_btn).pack(side="left", padx=2)
+            tk.Button(self._ctrl_frame, text="\u25B6\u25B6 Continue",
+                      command=d._continue, **_btn).pack(side="left", padx=2)
+            tk.Button(self._ctrl_frame, text="\u25B6 Run Until BP",
+                      command=d._run_until_bp, **_btn).pack(side="left", padx=2)
+
+            tk.Frame(self._ctrl_frame, bg=T["separator"], width=2).pack(
+                side="left", padx=6, fill="y", pady=2)
+
+            tk.Button(self._ctrl_frame, text="\U0001F6D1 Set BP",
+                      command=d._add_breakpoint, **_btn).pack(side="left", padx=2)
+            tk.Button(self._ctrl_frame, text="List BPs",
+                      command=d._list_breakpoints, **_btn).pack(side="left", padx=2)
+
+            tk.Frame(self._ctrl_frame, bg=T["separator"], width=2).pack(
+                side="left", padx=6, fill="y", pady=2)
+
+            # Search bar
+            tk.Label(self._ctrl_frame, text="\U0001F50D",
+                     bg=T["bg_light"], fg=T["fg_dim"],
+                     font=("Segoe UI", 9)).pack(side="left", padx=(4, 2))
+            self._search_var = tk.StringVar()
+            self._search_var.trace_add("write", self._on_search_changed)
+            self._search_ent = tk.Entry(
+                self._ctrl_frame, textvariable=self._search_var,
+                bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                font=("Consolas", 10), relief="flat", bd=2, width=28)
+            self._search_ent.pack(side="left", padx=2, fill="x", expand=True)
+            self._search_ent.bind("<Return>", lambda e: self._search_next())
+            self._search_ent.bind("<Shift-Return>",
+                                  lambda e: self._search_next(reverse=True))
+            self._search_ent.bind("<Escape>", lambda e: self._search_clear())
+
+            self._search_lbl = tk.Label(
+                self._ctrl_frame, text="", bg=T["bg_light"],
+                fg=T["fg_dim"], font=("Segoe UI", 8))
+            self._search_lbl.pack(side="left", padx=4)
+
+            tk.Button(self._ctrl_frame, text="\u25B2",
+                      command=lambda: self._search_next(reverse=True),
+                      **_btn).pack(side="left", padx=1)
+            tk.Button(self._ctrl_frame, text="\u25BC",
+                      command=self._search_next,
+                      **_btn).pack(side="left", padx=1)
+        else:
+            # Trace/text tab: run controls + search
+            tk.Button(self._ctrl_frame, text="\u25B6 Run",
+                      command=d._run, **_btn).pack(side="left", padx=2)
+            tk.Button(self._ctrl_frame, text="\u23F8 Run+Break",
+                      command=d._run_break, **_btn).pack(side="left", padx=2)
+            tk.Button(self._ctrl_frame, text="\u23ED Step",
+                      command=d._step, **_btn).pack(side="left", padx=2)
+            tk.Button(self._ctrl_frame, text="\u25B6\u25B6 Continue",
+                      command=d._continue, **_btn).pack(side="left", padx=2)
+
+            tk.Frame(self._ctrl_frame, bg=T["separator"], width=2).pack(
+                side="left", padx=6, fill="y", pady=2)
+
+            # Search bar for text
+            tk.Label(self._ctrl_frame, text="\U0001F50D",
+                     bg=T["bg_light"], fg=T["fg_dim"],
+                     font=("Segoe UI", 9)).pack(side="left", padx=(4, 2))
+            self._search_var = tk.StringVar()
+            self._search_var.trace_add("write", self._on_search_changed)
+            self._search_ent = tk.Entry(
+                self._ctrl_frame, textvariable=self._search_var,
+                bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                font=("Consolas", 10), relief="flat", bd=2, width=28)
+            self._search_ent.pack(side="left", padx=2, fill="x", expand=True)
+            self._search_ent.bind("<Return>", lambda e: self._search_next())
+            self._search_ent.bind("<Shift-Return>",
+                                  lambda e: self._search_next(reverse=True))
+            self._search_ent.bind("<Escape>", lambda e: self._search_clear())
+
+            self._search_lbl = tk.Label(
+                self._ctrl_frame, text="", bg=T["bg_light"],
+                fg=T["fg_dim"], font=("Segoe UI", 8))
+            self._search_lbl.pack(side="left", padx=4)
+
+            tk.Button(self._ctrl_frame, text="\u25B2",
+                      command=lambda: self._search_next(reverse=True),
+                      **_btn).pack(side="left", padx=1)
+            tk.Button(self._ctrl_frame, text="\u25BC",
+                      command=self._search_next,
+                      **_btn).pack(side="left", padx=1)
+
+        self._search_matches = []
+        self._search_idx = -1
 
     def _add_tab_from_source(self, title, src_widget):
         """Create a tab in this window with content copied from *src_widget*."""
@@ -5696,6 +5765,7 @@ class _DetachedTabWindow(tk.Toplevel):
 
         self._nb.add(frm, text=f"  {title}  ")
         self._nb.select(frm)
+        self._build_controls(is_disasm)
         self._update_title()
 
     def _pull_tab_menu(self):
@@ -5714,6 +5784,123 @@ class _DetachedTabWindow(tk.Toplevel):
         """Pull a tab from the main window into this window."""
         self._dtab._move_tab_to_window(title, self)
         self._update_title()
+
+    # ── search ────────────────────────────────────────────────
+    def _get_active_text(self):
+        """Return the text widget of the active tab (or DisassemblyView._text)."""
+        sel = self._nb.select()
+        if not sel:
+            return None
+        for title, widget in self._tabs.items():
+            tab_frm = str(widget.master) if hasattr(widget, 'master') else None
+            # widget is inside frm which is the notebook tab
+            if isinstance(widget, DisassemblyView):
+                return widget._text
+            if tab_frm and sel == tab_frm:
+                return widget
+        # Fallback: check each tab
+        for tab_id in self._nb.tabs():
+            if tab_id == sel:
+                t = self._nb.tab(tab_id, "text").strip()
+                w = self._tabs.get(t)
+                if isinstance(w, DisassemblyView):
+                    return w._text
+                return w
+        return None
+
+    def _on_search_changed(self, *_):
+        """Called when search text changes — highlight all matches."""
+        txt = self._get_active_text()
+        if not txt:
+            return
+        # Clear old highlights
+        try:
+            txt.tag_remove("search_hit", "1.0", "end")
+            txt.tag_remove("search_cur", "1.0", "end")
+        except Exception:
+            pass
+
+        query = self._search_var.get().strip()
+        self._search_matches.clear()
+        self._search_idx = -1
+
+        if not query:
+            self._search_lbl.configure(text="")
+            return
+
+        # Configure search highlight tags
+        try:
+            txt.tag_configure("search_hit", background="#664D00",
+                              foreground="#FFD700")
+            txt.tag_configure("search_cur", background="#B8860B",
+                              foreground="#FFFFFF",
+                              font=("Consolas", 10, "bold"))
+        except Exception:
+            pass
+
+        # Search: support hex address (0x...), mnemonic, function name, text
+        start = "1.0"
+        q_lower = query.lower()
+        while True:
+            pos = txt.search(query, start, nocase=True, stopindex="end")
+            if not pos:
+                break
+            end_pos = f"{pos}+{len(query)}c"
+            self._search_matches.append((pos, end_pos))
+            txt.tag_add("search_hit", pos, end_pos)
+            start = end_pos
+
+        count = len(self._search_matches)
+        if count:
+            self._search_lbl.configure(text=f"{count} matches")
+            # Jump to first match
+            self._search_idx = 0
+            self._highlight_current_match(txt)
+        else:
+            self._search_lbl.configure(text="no matches")
+
+    def _search_next(self, reverse=False):
+        """Jump to next (or previous) search match."""
+        if not self._search_matches:
+            return
+        txt = self._get_active_text()
+        if not txt:
+            return
+        if reverse:
+            self._search_idx = ((self._search_idx - 1)
+                                % len(self._search_matches))
+        else:
+            self._search_idx = ((self._search_idx + 1)
+                                % len(self._search_matches))
+        self._highlight_current_match(txt)
+
+    def _highlight_current_match(self, txt):
+        """Highlight the current match and scroll to it."""
+        try:
+            txt.tag_remove("search_cur", "1.0", "end")
+        except Exception:
+            pass
+        if 0 <= self._search_idx < len(self._search_matches):
+            pos, end_pos = self._search_matches[self._search_idx]
+            txt.tag_add("search_cur", pos, end_pos)
+            txt.see(pos)
+            total = len(self._search_matches)
+            self._search_lbl.configure(
+                text=f"{self._search_idx + 1}/{total}")
+
+    def _search_clear(self):
+        """Clear search highlights and text."""
+        self._search_var.set("")
+        txt = self._get_active_text()
+        if txt:
+            try:
+                txt.tag_remove("search_hit", "1.0", "end")
+                txt.tag_remove("search_cur", "1.0", "end")
+            except Exception:
+                pass
+        self._search_matches.clear()
+        self._search_idx = -1
+        self._search_lbl.configure(text="")
 
     def _tab_context(self, event):
         """Right-click on tab → context menu."""
