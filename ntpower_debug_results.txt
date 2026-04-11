@@ -1,16 +1,17 @@
 ================================================================================
   NtPowerInformation — LIVE KERNEL DEBUGGER TEST REPORT
-  Date: 2026-04-09 23:37:44
+  Date: 2026-04-11 03:20:37
   System32: C:\Users\win2000\Desktop\2kDEBUG\system32
 ================================================================================
 
 [1] LOADING KERNEL ENVIRONMENT
 ------------------------------------------------------------
-  Load time: 0.703s
-  Modules loaded: 2
+  Load time: 0.770s
+  Modules loaded: 3
   Available files: 2142
-    ntoskrnl.exe              base=0x00400000  exports= 1258  unresolved=10
+    ntoskrnl.exe              base=0x00400000  exports= 1258  unresolved=0
     hal.dll                   base=0x80010000  exports=   95  unresolved=0
+    bootvid.dll               base=0x80030000  exports=   11  unresolved=0
 
   NtPowerInformation resolved at: ntoskrnl.exe!0x004E1536
 
@@ -26,37 +27,37 @@
   3      SystemPowerPolicyCurrent                 0xC000000D      STATUS_INVALID_PARAMETER          201
   4      SystemPowerStateHandler                  0x00000000      STATUS_SUCCESS                    333
   5      ProcessorStateHandler                    0x00000000      STATUS_SUCCESS                    264
-  6      SystemPowerPolicyOld                     0x0000009F      STATUS_POWER_STATE_INVALID      47591
-  7      ProcessorInformation                     0x0000009F      STATUS_POWER_STATE_INVALID      47591
+  6      SystemPowerPolicyOld                     0xC000000D      STATUS_INVALID_PARAMETER           91
+  7      ProcessorInformation                     0xC000000D      STATUS_INVALID_PARAMETER           91
   8      SystemBatteryState                       0x00000000      STATUS_SUCCESS                    173
   9      SystemPowerStateNotifyHandler            0x00000000      STATUS_SUCCESS                    187
-  10     ProcessorPowerPolicyAc                   0x0000009F      STATUS_POWER_STATE_INVALID      47589
+  10     ProcessorPowerPolicyAc                   0xC000000D      STATUS_INVALID_PARAMETER           89
   11     ProcessorPowerPolicyDc                   0x00000000      STATUS_SUCCESS                   3612
   12     VerifyProcessorPowerPolicy               0x00000000      STATUS_SUCCESS                    196
-  13     ProcessorPowerPolicyCurrent              0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  14     SystemPowerStateLogging                  0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  15     SystemPowerLoggingEntry                  0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  16     SetPowerSettingValue                     0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  17     NotifyUserPowerSetting                   0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  18     PowerInformationLevelUnused0             0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  19     PowerInformationLevelUnused1             0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  20     SystemVideoState                         0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  21     TraceApplicationPowerMessage             0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  22     TraceApplicationPowerMessageEnd          0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  23     ProcessorPerfStates                      0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  24     ProcessorIdleStates                      0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  25     ProcessorCap                             0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  26     SystemWakeSource                         0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  27     SystemHiberFileInformation               0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  28     TraceServicePowerMessage                 0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  29     ProcessorLoad                            0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  30     PowerShutdownNotification                0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  31     MonitorInvocation                        0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  32     FirmwareTableInformationRegistered       0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  50     InvalidClass_50                          0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  99     InvalidClass_99                          0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  255    InvalidClass_0xFF                        0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  4294967295 InvalidClass_MAX                         0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  13     ProcessorPowerPolicyCurrent              0xC000000D      STATUS_INVALID_PARAMETER           86
+  14     SystemPowerStateLogging                  0xC000000D      STATUS_INVALID_PARAMETER           86
+  15     SystemPowerLoggingEntry                  0xC000000D      STATUS_INVALID_PARAMETER           86
+  16     SetPowerSettingValue                     0xC000000D      STATUS_INVALID_PARAMETER           86
+  17     NotifyUserPowerSetting                   0xC000000D      STATUS_INVALID_PARAMETER           86
+  18     PowerInformationLevelUnused0             0xC000000D      STATUS_INVALID_PARAMETER           86
+  19     PowerInformationLevelUnused1             0xC000000D      STATUS_INVALID_PARAMETER           86
+  20     SystemVideoState                         0xC000000D      STATUS_INVALID_PARAMETER           86
+  21     TraceApplicationPowerMessage             0xC000000D      STATUS_INVALID_PARAMETER           86
+  22     TraceApplicationPowerMessageEnd          0xC000000D      STATUS_INVALID_PARAMETER           86
+  23     ProcessorPerfStates                      0xC000000D      STATUS_INVALID_PARAMETER           86
+  24     ProcessorIdleStates                      0xC000000D      STATUS_INVALID_PARAMETER           86
+  25     ProcessorCap                             0xC000000D      STATUS_INVALID_PARAMETER           86
+  26     SystemWakeSource                         0xC000000D      STATUS_INVALID_PARAMETER           86
+  27     SystemHiberFileInformation               0xC000000D      STATUS_INVALID_PARAMETER           86
+  28     TraceServicePowerMessage                 0xC000000D      STATUS_INVALID_PARAMETER           86
+  29     ProcessorLoad                            0xC000000D      STATUS_INVALID_PARAMETER           86
+  30     PowerShutdownNotification                0xC000000D      STATUS_INVALID_PARAMETER           86
+  31     MonitorInvocation                        0xC000000D      STATUS_INVALID_PARAMETER           86
+  32     FirmwareTableInformationRegistered       0xC000000D      STATUS_INVALID_PARAMETER           86
+  50     InvalidClass_50                          0xC000000D      STATUS_INVALID_PARAMETER           86
+  99     InvalidClass_99                          0xC000000D      STATUS_INVALID_PARAMETER           86
+  255    InvalidClass_0xFF                        0xC000000D      STATUS_INVALID_PARAMETER           86
+  4294967295 InvalidClass_MAX                         0xC000000D      STATUS_INVALID_PARAMETER           86
 
 ================================================================================
 [3] SCENARIO: BUFFER SIZE VARIATIONS (Class=0 SystemPowerPolicyAc)
@@ -82,14 +83,14 @@
   Class  Name                                InBuf      Return           Status                        
   -----  ----------------------------------  ---------  ---------------  ----------------------------- 
   0      SystemPowerPolicyAc                 NULL, 0    0x00000000      STATUS_SUCCESS                
-  0      SystemPowerPolicyAc                 buf, 256   0x0000009F      STATUS_POWER_STATE_INVALID    
+  0      SystemPowerPolicyAc                 buf, 256   0x80000005      STATUS_BUFFER_OVERFLOW        
   2      VerifySystemPolicies                NULL, 0    0xC000000D      STATUS_INVALID_PARAMETER      
-  2      VerifySystemPolicies                buf, 256   0x0000009F      STATUS_POWER_STATE_INVALID    
-  7      ProcessorInformation                NULL, 0    0x0000009F      STATUS_POWER_STATE_INVALID    
-  7      ProcessorInformation                buf, 64    0x0000009F      STATUS_POWER_STATE_INVALID    
+  2      VerifySystemPolicies                buf, 256   0xC000000D      STATUS_INVALID_PARAMETER      
+  7      ProcessorInformation                NULL, 0    0xC000000D      STATUS_INVALID_PARAMETER      
+  7      ProcessorInformation                buf, 64    0xC000000D      STATUS_INVALID_PARAMETER      
   8      SystemBatteryState                  NULL, 0    0x00000000      STATUS_SUCCESS                
-  10     ProcessorPowerPolicyAc              NULL, 0    0x0000009F      STATUS_POWER_STATE_INVALID    
-  10     ProcessorPowerPolicyAc              buf, 128   0x0000009F      STATUS_POWER_STATE_INVALID    
+  10     ProcessorPowerPolicyAc              NULL, 0    0xC000000D      STATUS_INVALID_PARAMETER      
+  10     ProcessorPowerPolicyAc              buf, 128   0xC000000D      STATUS_INVALID_PARAMETER      
 
 ================================================================================
 [5] SCENARIO: NULL OUTPUT BUFFER
@@ -99,10 +100,10 @@
   -----  ---------------------------------------  ---------------  -----------------------------  ------
   0      SystemPowerPolicyAc                      0x00000000      STATUS_SUCCESS                    170
   3      SystemPowerPolicyCurrent                 0xC000000D      STATUS_INVALID_PARAMETER          165
-  7      ProcessorInformation                     0x0000009F      STATUS_POWER_STATE_INVALID      47593
+  7      ProcessorInformation                     0xC000000D      STATUS_INVALID_PARAMETER           93
   8      SystemBatteryState                       0x00000000      STATUS_SUCCESS                    170
-  23     ProcessorPerfStates                      0x0000009F      STATUS_POWER_STATE_INVALID      47586
-  29     ProcessorLoad                            0x0000009F      STATUS_POWER_STATE_INVALID      47586
+  23     ProcessorPerfStates                      0xC000000D      STATUS_INVALID_PARAMETER           86
+  29     ProcessorLoad                            0xC000000D      STATUS_INVALID_PARAMETER           86
 
 ================================================================================
 [6] SCENARIO: BREAKPOINT + STEPPING (Class=0)
@@ -456,7 +457,7 @@
   28     0x00415311    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x2B
   29     0x00415314    0x00000000    0x00486E34    0x8023FA70    0x8023FA7C    ntoskrnl.exe!ExAcquireResourceExclusiveLite+0x2E
 
-  Final: 0x0000009F (STATUS_POWER_STATE_INVALID) in 47592 insns
+  Final: 0xC000000D (STATUS_INVALID_PARAMETER) in 92 insns
 
 ================================================================================
 [11] SCENARIO: STACK MEMORY ANALYSIS
@@ -534,17 +535,17 @@
 
   Test: Invalid class 0xFF
     Args: ['0xFF', '0', '0', '0x1000', '0x1000']
-    Return: 0x0000009F (STATUS_POWER_STATE_INVALID)
-    Instructions: 47586
-    Events (1): spin_loop
-      [spin_loop] Spin loop at 0x0046CF4C (501 hits)
+    Return: 0xC000000D (STATUS_INVALID_PARAMETER)
+    Instructions: 86
+    Events (1): exception
+      [exception] ExRaiseStatus(0xC000000D) — STATUS_INVALID_PARAMETER — SEH unwind
 
   Test: Invalid class MAX
     Args: ['0xFFFFFFFF', '0', '0', '0x1000', '0x1000']
-    Return: 0x0000009F (STATUS_POWER_STATE_INVALID)
-    Instructions: 47586
-    Events (1): spin_loop
-      [spin_loop] Spin loop at 0x0046CF4C (501 hits)
+    Return: 0xC000000D (STATUS_INVALID_PARAMETER)
+    Instructions: 86
+    Events (1): exception
+      [exception] ExRaiseStatus(0xC000000D) — STATUS_INVALID_PARAMETER — SEH unwind
 
   Test: Zero output buffer+size
     Args: ['0', '0', '0', '0', '0']
@@ -560,10 +561,10 @@
 
   Test: Class 7 tiny buffer
     Args: ['7', '0', '0', '0x1000', '1']
-    Return: 0x0000009F (STATUS_POWER_STATE_INVALID)
-    Instructions: 47591
-    Events (1): spin_loop
-      [spin_loop] Spin loop at 0x0046CF4C (501 hits)
+    Return: 0xC000000D (STATUS_INVALID_PARAMETER)
+    Instructions: 91
+    Events (1): exception
+      [exception] ExRaiseStatus(0xC000000D) — STATUS_INVALID_PARAMETER — SEH unwind
 
   Test: Class 8 tiny buffer
     Args: ['8', '0', '0', '0x1000', '1']
@@ -575,7 +576,7 @@
 [SUMMARY]
 ================================================================================
   System32 path:     C:\Users\win2000\Desktop\2kDEBUG\system32
-  Modules loaded:    2
+  Modules loaded:    3
   Test scenarios:    13
   Function tested:   NtPowerInformation (ntoskrnl.exe!0x004E1536)
   Power classes:     37 tested

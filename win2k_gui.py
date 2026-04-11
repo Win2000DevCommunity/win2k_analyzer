@@ -5665,8 +5665,9 @@ class KernelDebuggerTab(ttk.Frame):
         ttk.Button(bf3, text="\U0001F50D Find Callers",
                    command=self._find_callers).pack(side="left", padx=2)
         ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
-        ttk.Button(bf3, text="\u2B0C Split View",
-                   command=self._toggle_split_view).pack(side="left", padx=2)
+        self._split_btn = ttk.Button(bf3, text="\u2B0C Split View",
+                   command=self._toggle_split_view)
+        self._split_btn.pack(side="left", padx=2)
         ttk.Separator(bf3, orient="vertical").pack(side="left", padx=6, fill="y")
         ttk.Button(bf3, text="\U0001F9F9 Clear",
                    command=self._clear_output).pack(side="left", padx=2)
@@ -5798,134 +5799,203 @@ class KernelDebuggerTab(ttk.Frame):
             except Exception:
                 pass
 
-    # ── arg presets ───────────────────────────────────────────────────────
+    # ── arg presets (dynamic) ─────────────────────────────────────────────
+    #
+    # Generates intelligent test arguments dynamically from function
+    # signatures.  No hardcoded enum values — works across all NT versions
+    # (2000, XP, Vista, 7, …) and all system modules (ntoskrnl, hal,
+    # win32k, ntdll, …).
+    #
+    # For each parameter the type name and context determine a sensible
+    # default:
+    #   HANDLE          → pseudo-handle (-1/-2) or 0x100
+    #   P* (pointer)    → distinct scratch buffer addresses
+    #   *Length/*Size   → 0x1000
+    #   *Class/*Level   → 0 (with sweep sub-menu to try other values)
+    #   everything else → 0
 
-    # Test argument presets for common NT kernel functions.
-    # Format: { "FuncName": [ ("Description", "arg_string"), ... ] }
-    _ARG_PRESETS = {
-        "NtPowerInformation": [
-            ("Level 0 \u2014 SystemPowerPolicyAc (default)", "0, 0, 0, 0x1000, 0x1000"),
-            ("Level 1 \u2014 SystemPowerPolicyDc",           "1, 0, 0, 0x1000, 0x1000"),
-            ("Level 2 \u2014 VerifySystemPolicies",          "2, 0, 0, 0x1000, 0x1000"),
-            ("Level 3 \u2014 VerifyProcessorPowerPolicy",    "3, 0, 0, 0x1000, 0x1000"),
-            ("Level 10 \u2014 SystemBatteryState",           "0xa, 0, 0, 0x1000, 0x1000"),
-            ("Level 11 \u2014 SystemPowerStateHandler",      "0xb, 0, 0, 0x1000, 0x1000"),
-            ("Level 12 \u2014 ProcessorStateHandler",        "0xc, 0, 0, 0x1000, 0x1000"),
-            ("Level 41 \u2014 SystemPowerInformation",       "0x29, 0, 0, 0x1000, 0x1000"),
-        ],
-        "NtClose": [
-            ("Valid handle",          "0x100"),
-            ("Null handle",           "0"),
-            ("Invalid handle (test)", "0xDEADBEEF"),
-        ],
-        "NtQuerySystemInformation": [
-            ("Class 0 \u2014 SystemBasicInformation",        "0, 0x80000, 0x1000, 0x80004"),
-            ("Class 2 \u2014 SystemPerformanceInformation",  "2, 0x80000, 0x1000, 0x80004"),
-            ("Class 5 \u2014 SystemProcessInformation",      "5, 0x80000, 0x4000, 0x80004"),
-            ("Class 8 \u2014 SystemProcessorInfo",           "8, 0x80000, 0x1000, 0x80004"),
-            ("Class 11 \u2014 SystemModuleInformation",      "0xb, 0x80000, 0x4000, 0x80004"),
-        ],
-        "NtQueryInformationProcess": [
-            ("Class 0 \u2014 ProcessBasicInformation",  "-1, 0, 0x80000, 0x18, 0x80018"),
-            ("Class 7 \u2014 ProcessDebugPort",         "-1, 7, 0x80000, 4, 0x80004"),
-            ("Class 30 \u2014 ProcessWow64Information", "-1, 30, 0x80000, 4, 0x80004"),
-        ],
-        "NtCreateFile": [
-            ("Open null (exercise validation)", "0x80000, 0x80100000, 0, 0x80200, 0, 0, 1, 0, 0, 0, 0, 0"),
-        ],
-        "NtOpenFile": [
-            ("Open null (exercise validation)", "0x80000, 0x80100000, 0, 0x80200, 0, 0"),
-        ],
-        "NtReadFile": [
-            ("Handle + null buffer", "0x100, 0, 0, 0, 0x80200, 0x80300, 0x1000, 0, 0"),
-        ],
-        "NtWriteFile": [
-            ("Handle + null buffer", "0x100, 0, 0, 0, 0x80200, 0x80300, 0x1000, 0, 0"),
-        ],
-        "NtAllocateVirtualMemory": [
-            ("Commit 4KB private",  "-1, 0x80000, 0, 0x80004, 0x1000, 4"),
-            ("Reserve 64KB",        "-1, 0x80000, 0, 0x80004, 0x2000, 4"),
-        ],
-        "NtFreeVirtualMemory": [
-            ("Release at address", "-1, 0x80000, 0x80004, 0x8000"),
-        ],
-        "NtDeviceIoControlFile": [
-            ("Null IOCTL", "0x100, 0, 0, 0, 0x80200, 0x80000, 0, 0, 0, 0"),
-        ],
-        "NtQueryInformationFile": [
-            ("FileBasicInformation",    "0x100, 0x80200, 0x80300, 0x28, 4"),
-            ("FileStandardInformation", "0x100, 0x80200, 0x80300, 0x18, 5"),
-        ],
-        "NtSetInformationFile": [
-            ("FileBasicInformation",       "0x100, 0x80200, 0x80300, 0x28, 4"),
-            ("FileDispositionInformation", "0x100, 0x80200, 0x80300, 1, 13"),
-        ],
-        "NtQueryInformationThread": [
-            ("ThreadBasicInformation", "-2, 0, 0x80000, 0x1C, 0x80020"),
-        ],
-        "NtOpenKey": [
-            ("Null attributes", "0x80000, 0x80100000, 0"),
-        ],
-        "NtQueryKey": [
-            ("KeyBasicInformation", "0x100, 0, 0x80000, 0x100, 0x80100"),
-            ("KeyFullInformation",  "0x100, 2, 0x80000, 0x200, 0x80200"),
-        ],
-        "NtQueryValueKey": [
-            ("KeyValueBasicInformation", "0x100, 0x80200, 0, 0x80300, 0x100, 0x80400"),
-        ],
-    }
+    _HANDLE_PSEUDO = {"PROCESS": 0xFFFFFFFF, "THREAD": 0xFFFFFFFE}
+
+    @staticmethod
+    def _is_pointer_type(ptype: str) -> bool:
+        """True if a WinAPI type string denotes a pointer."""
+        if "*" in ptype:
+            return True
+        if len(ptype) > 1 and ptype[0] == "P" and ptype[1].isupper():
+            return True
+        return ptype in ("PVOID", "PCVOID", "LPVOID", "LPCVOID",
+                         "PCSTR", "PCWSTR", "LPSTR", "LPCSTR",
+                         "LPWSTR", "LPCWSTR")
+
+    def _generate_smart_args(self, func_name, params):
+        """Build a list of int arg values using type-aware heuristics."""
+        buf_base = 0x80000
+        if self._env and hasattr(self._env, "_heap_base"):
+            buf_base = self._env._heap_base
+        buf_off = [0]  # mutable counter
+
+        def next_buf(sz=0x1000):
+            addr = buf_base + buf_off[0]
+            buf_off[0] += max((sz + 0xFFF) & ~0xFFF, 0x1000)
+            return addr
+
+        fn_upper = func_name.upper()
+        vals = []
+        for ptype, pname in params:
+            pt = ptype.upper().replace("*", "").strip()
+            pn = pname.upper()
+
+            # ── Handle (non-pointer) ──
+            if "HANDLE" in pt and not self._is_pointer_type(ptype):
+                matched = False
+                for kw, pseudo in self._HANDLE_PSEUDO.items():
+                    if kw in fn_upper or kw in pn:
+                        vals.append(pseudo)
+                        matched = True
+                        break
+                if not matched:
+                    vals.append(0x100)
+                continue
+
+            # ── Output handle pointer ──
+            if pt == "PHANDLE":
+                vals.append(next_buf(4))
+                continue
+
+            # ── Class / Level / Type enum ──
+            if any(k in pn for k in ("CLASS", "LEVEL")) or \
+               any(k in pt for k in ("_CLASS", "_LEVEL", "INFOCLASS",
+                                      "INFORMATION_LEVEL")):
+                vals.append(0)
+                continue
+
+            # ── Pointer types → scratch buffers ──
+            if self._is_pointer_type(ptype):
+                if any(k in pn for k in ("LENGTH", "RETURN", "RESULT",
+                                          "WRITTEN", "NEEDED")):
+                    vals.append(next_buf(4))
+                else:
+                    vals.append(next_buf(0x200))
+                continue
+
+            # ── Size / length integers ──
+            if any(k in pn for k in ("LENGTH", "SIZE", "COUNT",
+                                      "NUMBYTES", "NUMBEROFBYTES")):
+                vals.append(0x1000)
+                continue
+
+            # ── Everything else → 0 ──
+            vals.append(0)
+
+        return vals
+
+    @staticmethod
+    def _detect_sweep_param(func_name, params):
+        """Find the index of a class/level/type enum param, if any."""
+        for idx, (ptype, pname) in enumerate(params):
+            pn = pname.upper()
+            pt = ptype.upper()
+            if any(k in pn for k in ("CLASS", "LEVEL", "INFORMATIONCLASS")):
+                return idx, pname
+            if any(k in pt for k in ("_CLASS", "_LEVEL", "INFOCLASS",
+                                      "INFORMATION_LEVEL")):
+                return idx, pname
+        # Heuristic for *Query* / *Set* / *Information* functions
+        fn = func_name.upper()
+        if any(k in fn for k in ("QUERY", "SET", "INFORMATION", "ENUMERATE")):
+            for idx, (ptype, pname) in enumerate(params):
+                if not _KDebugTab._is_pointer_type(ptype) and idx <= 2:
+                    pt = ptype.upper()
+                    if pt in ("ULONG", "LONG", "DWORD", "INT", "UINT"):
+                        return idx, pname
+        return None
+
+    @staticmethod
+    def _fmt_arg(v):
+        """Format one arg value for the args entry field."""
+        if v >= 0x10:
+            return hex(v)
+        return str(v)
 
     def _show_arg_presets(self):
-        """Show a dropdown menu of preset arguments for the current function."""
+        """Show a dynamic dropdown with intelligent arg suggestions."""
         func = self._get_func()
+        sig = None
+        if func:
+            try:
+                from nt_analyzer.decompiler import KERNEL_API_SIGNATURES
+                sig = KERNEL_API_SIGNATURES.get(func)
+            except Exception:
+                pass
 
         menu = tk.Menu(self.app, tearoff=0, bg=T["bg_light"], fg=T["fg"],
                        activebackground=T["accent"], activeforeground="#000000",
                        font=("Consolas", 9))
 
-        if func and func in self._ARG_PRESETS:
-            menu.add_command(label=f"\u2500\u2500 {func} \u2500\u2500",
-                             state="disabled")
-            for desc, args in self._ARG_PRESETS[func]:
-                menu.add_command(label=f"  {desc}",
-                    command=lambda a=args: self._apply_preset_args(a))
+        if func and sig:
+            ret_type, params = sig
+
+            # ── Signature display ──
+            menu.add_command(
+                label=f"{ret_type}  {func}(", state="disabled")
+            for i, (pt, pn) in enumerate(params):
+                tail = "," if i < len(params) - 1 else " )"
+                menu.add_command(
+                    label=f"   [{i}] {pt}  {pn}{tail}",
+                    state="disabled")
             menu.add_separator()
 
-        # Also try to get signature from KERNEL_API_SIGNATURES
-        if func:
-            try:
-                from nt_analyzer.decompiler import KERNEL_API_SIGNATURES
-                sig = KERNEL_API_SIGNATURES.get(func)
-                if sig:
-                    ret_type, params = sig
-                    param_str = ", ".join(f"{t} {n}" for t, n in params)
-                    menu.add_command(
-                        label=f"Sig: {ret_type} {func}({param_str})",
-                        state="disabled")
-                    # Generate zero-filled args from signature
-                    zero_args = ", ".join("0" for _ in params)
-                    menu.add_command(
-                        label=f"  All zeros ({len(params)} args)",
-                        command=lambda a=zero_args: self._apply_preset_args(a))
-            except Exception:
-                pass
+            # ── Smart defaults ──
+            smart = self._generate_smart_args(func, params)
+            smart_str = ", ".join(self._fmt_arg(v) for v in smart)
+            menu.add_command(
+                label=f"  \u25CF Smart defaults ({len(params)} args)",
+                command=lambda a=smart_str: self._apply_preset_args(a))
 
-        # Show other functions that have presets
-        others = [f for f in sorted(self._ARG_PRESETS) if f != func]
-        if others:
-            menu.add_separator()
-            menu.add_command(label="\u2500\u2500 Other functions \u2500\u2500",
-                             state="disabled")
-            for fn in others:
-                sub = tk.Menu(menu, tearoff=0, bg=T["bg_light"], fg=T["fg"],
-                              activebackground=T["accent"],
-                              activeforeground="#000000",
-                              font=("Consolas", 9))
-                for desc, args in self._ARG_PRESETS[fn]:
-                    sub.add_command(label=f"  {desc}",
-                        command=lambda f=fn, a=args:
-                            self._apply_preset(f, a))
-                menu.add_cascade(label=f"  {fn}", menu=sub)
+            # ── All zeros ──
+            zero_str = ", ".join("0" for _ in params)
+            menu.add_command(
+                label=f"  \u25CF All zeros ({len(params)} args)",
+                command=lambda a=zero_str: self._apply_preset_args(a))
+
+            # ── Sweep submenu for class/level params ──
+            sweep = self._detect_sweep_param(func, params)
+            if sweep:
+                s_idx, s_name = sweep
+                menu.add_separator()
+                for lo in range(0, 64, 16):
+                    hi = lo + 15
+                    sub = tk.Menu(menu, tearoff=0, bg=T["bg_light"],
+                                  fg=T["fg"],
+                                  activebackground=T["accent"],
+                                  activeforeground="#000000",
+                                  font=("Consolas", 9))
+                    for val in range(lo, hi + 1):
+                        args = list(smart)
+                        args[s_idx] = val
+                        arg_str = ", ".join(self._fmt_arg(v) for v in args)
+                        sub.add_command(
+                            label=f"  {s_name} = {val}  (0x{val:02X})",
+                            command=lambda a=arg_str:
+                                self._apply_preset_args(a))
+                    menu.add_cascade(
+                        label=f"  \u25B8 Sweep {s_name}  [{lo}\u2013{hi}]",
+                        menu=sub)
+
+        elif func:
+            # ── No signature — generic arg-count options ──
+            menu.add_command(
+                label=f"\u2500\u2500 {func}  (signature unknown) \u2500\u2500",
+                state="disabled")
+            for n in (1, 2, 3, 4, 5, 6, 8, 10, 12):
+                zero_str = ", ".join("0" for _ in range(n))
+                menu.add_command(
+                    label=f"  {n} args \u2013 all zeros",
+                    command=lambda a=zero_str: self._apply_preset_args(a))
+        else:
+            menu.add_command(
+                label="\u2500\u2500 Enter a function name first \u2500\u2500",
+                state="disabled")
 
         # Position below the Presets button
         try:
@@ -5943,14 +6013,6 @@ class KernelDebuggerTab(ttk.Frame):
         else:
             self._args_var.set(args_str)
 
-    def _apply_preset(self, func_name, args_str):
-        """Apply a preset: set function name and args."""
-        if isinstance(self._func_ent, PlaceholderEntry):
-            self._func_ent.set_value(func_name)
-        else:
-            self._func_var.set(func_name)
-        self._apply_preset_args(args_str)
-
     # ── split view ────────────────────────────────────────────────────────
 
     def _toggle_split_view(self):
@@ -5961,7 +6023,7 @@ class KernelDebuggerTab(ttk.Frame):
             self._enter_split_view()
 
     def _enter_split_view(self):
-        """Switch to side-by-side: trace left, disasm right."""
+        """Switch to side-by-side: trace left, disasm right — same area."""
         # Find the trace tab
         trace_tab_title = self._trace_tab_title
         if not trace_tab_title:
@@ -6019,32 +6081,20 @@ class KernelDebuggerTab(ttk.Frame):
         # ── Right pane: disassembly ──
         right_frm = tk.Frame(pw, bg=T["bg_dark"])
         right_frm.columnconfigure(0, weight=1)
-        right_frm.rowconfigure(1, weight=1)
-
-        right_hdr = tk.Frame(right_frm, bg=T["bg"])
-        right_hdr.grid(row=0, column=0, sticky="ew")
-
-        func = self._get_func()
-        disasm_title = f"Disasm: {func}" if func else "Disassembly"
-        tk.Label(right_hdr, text=f"  {disasm_title}  ",
-                 bg=T["bg"], fg=T["accent"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=4, pady=2)
-        ttk.Button(right_hdr, text="\u2716 Restore Tabs",
-                   command=self._restore_tabbed_view).pack(
-                       side="right", padx=4, pady=2)
+        right_frm.rowconfigure(0, weight=1)
 
         if self._disasm_view:
             # Reparent disasm view into right pane
             self._disasm_view_original_parent = self._disasm_view.master
             self._disasm_view.grid_forget()
-            self._disasm_view.grid(in_=right_frm, row=1, column=0,
+            self._disasm_view.grid(in_=right_frm, row=0, column=0,
                                    sticky="nsew")
         else:
             tk.Label(right_frm,
                      text="No disassembly loaded.\nClick Disassemble first.",
                      bg=T["bg_dark"], fg=T["fg_dim"],
                      font=("Consolas", 10)).grid(
-                         row=1, column=0, sticky="nsew")
+                         row=0, column=0, sticky="nsew")
 
         pw.add(right_frm, stretch="always")
 
@@ -6052,8 +6102,9 @@ class KernelDebuggerTab(ttk.Frame):
         self._split_left_txt = left_txt
         self._split_left_title = trace_tab_title
         self._split_mode = True
+        self._split_btn.configure(text="\u2B0C Tabbed View")
         self.status_var.set(
-            "\u2B0C Split view \u2014 click \u2716 Restore Tabs to go back")
+            "\u2B0C Split view \u2014 trace | disassembly")
 
     def _restore_tabbed_view(self):
         """Restore the normal tabbed output view."""
@@ -6078,6 +6129,7 @@ class KernelDebuggerTab(ttk.Frame):
                          padx=10, pady=(4, 10))
 
         self._split_mode = False
+        self._split_btn.configure(text="\u2B0C Split View")
         self.status_var.set("Kernel debugger ready")
 
     def _parse_args(self):
