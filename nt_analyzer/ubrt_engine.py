@@ -3134,6 +3134,175 @@ class ELFShiftEngine(BaseShiftEngine):
         with open(output_path, 'wb') as f:
             f.write(bytes(self.buffer))
 
+    def compact(self) -> Dict:
+        """
+        v7.2: Reclaim wasted padding in the ELF binary.
+        Scans all sections for trailing zero-filled bytes beyond the section's
+        actual content size and removes them, updating section headers,
+        program headers, and file offsets accordingly.
+
+        WARNING: Destructive operation — clears undo stack.
+        Returns dict with compaction results.
+        """
+        e = self.endian
+        reclaimed = 0
+        sections_trimmed = 0
+
+        # Read section headers
+        if self.is_64:
+            e_shoff = struct.unpack_from(f'{e}Q', self.buffer, 40)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 58)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 60)[0]
+        else:
+            e_shoff = struct.unpack_from(f'{e}I', self.buffer, 32)[0]
+            e_shentsize = struct.unpack_from(f'{e}H', self.buffer, 46)[0]
+            e_shnum = struct.unpack_from(f'{e}H', self.buffer, 48)[0]
+
+        # Gather sections sorted by file offset, skip SHT_NOBITS (8) and SHT_NULL (0)
+        sections = []
+        for i in range(e_shnum):
+            sh_off = e_shoff + i * e_shentsize
+            if sh_off + e_shentsize > len(self.buffer):
+                break
+            if self.is_64:
+                sh_type = struct.unpack_from(f'{e}I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 24)[0]
+                sh_size = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 32)[0]
+                sh_addralign = struct.unpack_from(f'{e}Q', self.buffer, sh_off + 48)[0]
+            else:
+                sh_type = struct.unpack_from(f'{e}I', self.buffer, sh_off + 4)[0]
+                sh_offset = struct.unpack_from(f'{e}I', self.buffer, sh_off + 16)[0]
+                sh_size = struct.unpack_from(f'{e}I', self.buffer, sh_off + 20)[0]
+                sh_addralign = struct.unpack_from(f'{e}I', self.buffer, sh_off + 32)[0]
+            if sh_type in (0, 8):  # SHT_NULL, SHT_NOBITS
+                continue
+            if sh_offset == 0 or sh_size == 0:
+                continue
+            sections.append({
+                'index': i, 'sh_off_pos': sh_off, 'offset': sh_offset,
+                'size': sh_size, 'align': max(sh_addralign, 1), 'type': sh_type,
+            })
+
+        sections.sort(key=lambda s: s['offset'])
+
+        # Find reclaimable trailing zeros in each section
+        cumulative_delta = 0
+        for sec in sections:
+            raw_off = sec['offset']
+            raw_size = sec['size']
+            if raw_off + raw_size > len(self.buffer):
+                continue
+
+            # Scan backwards from end of section for trailing zeros
+            end = raw_off + raw_size
+            trim_start = end
+            while trim_start > raw_off and self.buffer[trim_start - 1] == 0:
+                trim_start -= 1
+
+            # Must keep at least alignment-worth of content
+            align = sec['align']
+            new_size = trim_start - raw_off
+            if new_size == 0:
+                new_size = 1  # Never fully empty a section
+            aligned_size = (new_size + align - 1) & ~(align - 1)
+            if aligned_size >= raw_size:
+                continue  # No savings after alignment
+
+            saved = raw_size - aligned_size
+            # Remove trailing bytes
+            del self.buffer[raw_off + aligned_size:raw_off + raw_size]
+
+            # Update this section's size in its header
+            sh_off = sec['sh_off_pos']
+            if self.is_64:
+                struct.pack_into(f'{e}Q', self.buffer, sh_off + 32, aligned_size)
+            else:
+                struct.pack_into(f'{e}I', self.buffer, sh_off + 20, aligned_size)
+
+            reclaimed += saved
+            sections_trimmed += 1
+            cumulative_delta += saved
+
+            # Shift all subsequent sections' file offsets
+            # Re-read section header table offset (it may have moved)
+            if self.is_64:
+                cur_shoff = struct.unpack_from(f'{e}Q', self.buffer, 40)[0]
+            else:
+                cur_shoff = struct.unpack_from(f'{e}I', self.buffer, 32)[0]
+            for j in range(e_shnum):
+                other_off = cur_shoff + j * e_shentsize
+                if other_off + e_shentsize > len(self.buffer):
+                    break
+                if self.is_64:
+                    o_offset = struct.unpack_from(f'{e}Q', self.buffer, other_off + 24)[0]
+                    if o_offset > raw_off:
+                        struct.pack_into(f'{e}Q', self.buffer, other_off + 24, o_offset - saved)
+                else:
+                    o_offset = struct.unpack_from(f'{e}I', self.buffer, other_off + 16)[0]
+                    if o_offset > raw_off:
+                        struct.pack_into(f'{e}I', self.buffer, other_off + 16, o_offset - saved)
+
+            # Shift program headers' p_offset for segments after this section
+            if self.is_64:
+                phoff = struct.unpack_from(f'{e}Q', self.buffer, 32)[0]
+                phentsize = struct.unpack_from(f'{e}H', self.buffer, 54)[0]
+                phnum = struct.unpack_from(f'{e}H', self.buffer, 56)[0]
+            else:
+                phoff = struct.unpack_from(f'{e}I', self.buffer, 28)[0]
+                phentsize = struct.unpack_from(f'{e}H', self.buffer, 42)[0]
+                phnum = struct.unpack_from(f'{e}H', self.buffer, 44)[0]
+
+            for pi in range(phnum):
+                ph_pos = phoff + pi * phentsize
+                if ph_pos + phentsize > len(self.buffer):
+                    break
+                if self.is_64:
+                    p_offset = struct.unpack_from(f'{e}Q', self.buffer, ph_pos + 8)[0]
+                    p_filesz = struct.unpack_from(f'{e}Q', self.buffer, ph_pos + 32)[0]
+                    p_memsz = struct.unpack_from(f'{e}Q', self.buffer, ph_pos + 40)[0]
+                    if p_offset <= raw_off < p_offset + p_filesz:
+                        # Segment contains this section — shrink it
+                        struct.pack_into(f'{e}Q', self.buffer, ph_pos + 32, p_filesz - saved)
+                        struct.pack_into(f'{e}Q', self.buffer, ph_pos + 40, p_memsz - saved)
+                    elif p_offset > raw_off:
+                        struct.pack_into(f'{e}Q', self.buffer, ph_pos + 8, p_offset - saved)
+                else:
+                    p_offset = struct.unpack_from(f'{e}I', self.buffer, ph_pos + 4)[0]
+                    p_filesz = struct.unpack_from(f'{e}I', self.buffer, ph_pos + 16)[0]
+                    p_memsz = struct.unpack_from(f'{e}I', self.buffer, ph_pos + 20)[0]
+                    if p_offset <= raw_off < p_offset + p_filesz:
+                        struct.pack_into(f'{e}I', self.buffer, ph_pos + 16, p_filesz - saved)
+                        struct.pack_into(f'{e}I', self.buffer, ph_pos + 20, p_memsz - saved)
+                    elif p_offset > raw_off:
+                        struct.pack_into(f'{e}I', self.buffer, ph_pos + 4, p_offset - saved)
+
+            # Update section header table offset if it was after the trimmed area
+            if self.is_64:
+                shoff = struct.unpack_from(f'{e}Q', self.buffer, 40)[0]
+                if shoff > raw_off:
+                    struct.pack_into(f'{e}Q', self.buffer, 40, shoff - saved)
+            else:
+                shoff = struct.unpack_from(f'{e}I', self.buffer, 32)[0]
+                if shoff > raw_off:
+                    struct.pack_into(f'{e}I', self.buffer, 32, shoff - saved)
+
+        if reclaimed == 0:
+            return {'compacted': False, 'message': 'No reclaimable padding found'}
+
+        # Re-parse ELF
+        self._fobj.close()
+        import io
+        self._fobj = io.BytesIO(bytes(self.buffer))
+        self.elf = ELFFile(self._fobj)
+        self._undo_stack.clear()
+
+        return {
+            'compacted': True,
+            'bytes_reclaimed': reclaimed,
+            'sections_trimmed': sections_trimmed,
+            'new_size': len(self.buffer),
+        }
+
     def preview_insert(self, vaddr: int, size: int) -> Dict:
         changes = []
         warnings = []
@@ -3563,6 +3732,71 @@ class MachOShiftEngine(BaseShiftEngine):
             'warning': 'Binary has Mach-O code signature (LC_CODE_SIGNATURE) — modifications will invalidate it',
         }
 
+    def strip_signature(self) -> Dict:
+        """
+        v7.2: Remove LC_CODE_SIGNATURE from Mach-O binary.
+        Removes the load command and zeroes/truncates the signature blob.
+        """
+        if not self._has_signature:
+            return {'stripped': False, 'message': 'No Mach-O code signature found'}
+
+        LC_CODE_SIGNATURE = 0x1D
+        base = self.arch_offset
+        if self.is_64:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            sizeofcmds_off = base + 20
+            cmd_offset = base + 32
+        else:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            sizeofcmds_off = base + 20
+            cmd_offset = base + 28
+
+        bytes_removed = 0
+        for i in range(ncmds):
+            if cmd_offset + 8 > len(self.buffer):
+                break
+            cmd = struct.unpack_from('<I', self.buffer, cmd_offset)[0]
+            cmdsize = struct.unpack_from('<I', self.buffer, cmd_offset + 4)[0]
+            if cmdsize < 8:
+                break
+
+            if cmd == LC_CODE_SIGNATURE:
+                # LC_CODE_SIGNATURE has: cmd, cmdsize, dataoff, datasize
+                if cmd_offset + 16 <= len(self.buffer):
+                    sig_offset = struct.unpack_from('<I', self.buffer, cmd_offset + 8)[0]
+                    sig_size = struct.unpack_from('<I', self.buffer, cmd_offset + 12)[0]
+
+                    # Remove the signature blob if it's at the end of the file
+                    if sig_offset > 0 and sig_size > 0:
+                        sig_end = sig_offset + sig_size
+                        if sig_end == len(self.buffer):
+                            del self.buffer[sig_offset:sig_end]
+                            bytes_removed += sig_size
+                        else:
+                            # Not at end — zero it out
+                            self.buffer[sig_offset:sig_offset + sig_size] = b'\x00' * sig_size
+
+                # Remove the load command itself from the header
+                del self.buffer[cmd_offset:cmd_offset + cmdsize]
+                bytes_removed += cmdsize
+
+                # Update ncmds and sizeofcmds in mach_header
+                struct.pack_into('<I', self.buffer, base + 16, ncmds - 1)
+                old_sizeofcmds = struct.unpack_from('<I', self.buffer, sizeofcmds_off)[0]
+                struct.pack_into('<I', self.buffer, sizeofcmds_off, old_sizeofcmds - cmdsize)
+
+                self._has_signature = False
+                return {
+                    'stripped': True,
+                    'bytes_removed': bytes_removed,
+                    'new_size': len(self.buffer),
+                    'message': 'LC_CODE_SIGNATURE removed',
+                }
+
+            cmd_offset += cmdsize
+
+        return {'stripped': False, 'message': 'LC_CODE_SIGNATURE not found in load commands'}
+
     def _vaddr_to_offset(self, vaddr: int) -> Optional[int]:
         for seg in self.segments:
             va = seg['vmaddr']
@@ -3687,27 +3921,48 @@ class MachOShiftEngine(BaseShiftEngine):
 
     def _update_fat_header(self):
         """
-        v7.1: Recalculate fat_arch sizes after modifying an architecture slice.
-        When one arch slice changes in size, the fat_arch entry must be updated.
+        v7.2: Recalculate fat_arch sizes AND offsets after modifying an architecture slice.
+        When one arch slice changes in size, the fat_arch entry for that arch must be
+        updated, and all subsequent architectures' offsets must be shifted by the delta.
         """
         if not self._fat_archs:
             return
 
         sorted_archs = sorted(self._fat_archs, key=lambda fa: fa['offset'])
 
-        # Find the modified arch and update its size
+        # Find the modified arch and compute the size delta
+        mod_idx = None
+        old_size = 0
         for i, fa in enumerate(sorted_archs):
             if fa['offset'] == self.arch_offset:
-                if i + 1 < len(sorted_archs):
-                    # Compute delta: original file size vs current buffer length
-                    original_total = sorted_archs[-1]['offset'] + sorted_archs[-1]['size']
-                    buf_delta = len(self.buffer) - original_total
-                    fa['size'] += buf_delta
-                else:
-                    fa['size'] = len(self.buffer) - fa['offset']
+                mod_idx = i
+                old_size = fa['size']
                 break
 
-        # Rewrite all fat_arch entries
+        if mod_idx is None:
+            return
+
+        # Compute new size for the modified arch
+        if mod_idx + 1 < len(sorted_archs):
+            # Size = gap between this arch offset and next arch's ORIGINAL offset,
+            # but the buffer has changed. We know the total buffer delta.
+            original_total = sum(fa['size'] for fa in sorted_archs)
+            fat_header_size = 8 + len(sorted_archs) * 20
+            original_total_with_header = sorted_archs[-1]['offset'] + sorted_archs[-1]['size']
+            buf_delta = len(self.buffer) - original_total_with_header
+            new_size = old_size + buf_delta
+        else:
+            # Last arch — its size extends to end of file
+            new_size = len(self.buffer) - sorted_archs[mod_idx]['offset']
+
+        size_delta = new_size - old_size
+        sorted_archs[mod_idx]['size'] = new_size
+
+        # Shift offsets for all architectures AFTER the modified one
+        for i in range(mod_idx + 1, len(sorted_archs)):
+            sorted_archs[i]['offset'] += size_delta
+
+        # Rewrite all fat_arch entries in the buffer
         for i, fa in enumerate(sorted_archs):
             fa_off = 8 + i * 20
             if fa_off + 20 > len(self.buffer):
@@ -3719,6 +3974,140 @@ class MachOShiftEngine(BaseShiftEngine):
             struct.pack_into('>I', self.buffer, fa_off + 16, fa['align'])
 
         self._fat_archs = sorted_archs
+
+    def compact(self) -> Dict:
+        """
+        v7.2: Reclaim wasted padding in the Mach-O binary.
+        Scans all sections for trailing zero-filled bytes and removes them,
+        updating segment and section load commands accordingly.
+
+        WARNING: Destructive operation — clears undo stack.
+        Returns dict with compaction results.
+        """
+        reclaimed = 0
+        sections_trimmed = 0
+        base = self.arch_offset
+
+        # Walk load commands to find sections with trimmable padding
+        if self.is_64:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            cmd_offset = base + 32
+            LC_SEG = MachOReferenceFinder.LC_SEGMENT_64
+        else:
+            ncmds = struct.unpack_from('<I', self.buffer, base + 16)[0]
+            cmd_offset = base + 28
+            LC_SEG = MachOReferenceFinder.LC_SEGMENT
+
+        # Collect all sections with their file offsets
+        macho_sections = []
+        for _ in range(ncmds):
+            if cmd_offset + 8 > len(self.buffer):
+                break
+            cmd = struct.unpack_from('<I', self.buffer, cmd_offset)[0]
+            cmdsize = struct.unpack_from('<I', self.buffer, cmd_offset + 4)[0]
+            if cmdsize < 8:
+                break
+
+            if cmd == MachOReferenceFinder.LC_SEGMENT_64:
+                nsects = struct.unpack_from('<I', self.buffer, cmd_offset + 64)[0]
+                sec_off = cmd_offset + 72
+                seg_cmd_off = cmd_offset
+                for si in range(nsects):
+                    if sec_off + 80 > len(self.buffer):
+                        break
+                    s_size = struct.unpack_from('<Q', self.buffer, sec_off + 40)[0]
+                    s_offset = struct.unpack_from('<I', self.buffer, sec_off + 48)[0]
+                    s_align = struct.unpack_from('<I', self.buffer, sec_off + 52)[0]
+                    if s_offset > 0 and s_size > 0:
+                        macho_sections.append({
+                            'sec_hdr_off': sec_off, 'seg_cmd_off': seg_cmd_off,
+                            'offset': s_offset, 'size': s_size,
+                            'align': max(1 << s_align, 1) if s_align < 30 else 1,
+                            'is_64': True,
+                        })
+                    sec_off += 80
+            elif cmd == MachOReferenceFinder.LC_SEGMENT:
+                nsects = struct.unpack_from('<I', self.buffer, cmd_offset + 48)[0]
+                sec_off = cmd_offset + 56
+                seg_cmd_off = cmd_offset
+                for si in range(nsects):
+                    if sec_off + 68 > len(self.buffer):
+                        break
+                    s_size = struct.unpack_from('<I', self.buffer, sec_off + 36)[0]
+                    s_offset = struct.unpack_from('<I', self.buffer, sec_off + 40)[0]
+                    s_align = struct.unpack_from('<I', self.buffer, sec_off + 44)[0]
+                    if s_offset > 0 and s_size > 0:
+                        macho_sections.append({
+                            'sec_hdr_off': sec_off, 'seg_cmd_off': seg_cmd_off,
+                            'offset': s_offset, 'size': s_size,
+                            'align': max(1 << s_align, 1) if s_align < 30 else 1,
+                            'is_64': False,
+                        })
+                    sec_off += 68
+
+            cmd_offset += cmdsize
+
+        macho_sections.sort(key=lambda s: s['offset'])
+
+        for sec in macho_sections:
+            raw_off = sec['offset']
+            raw_size = sec['size']
+            if raw_off + raw_size > len(self.buffer):
+                continue
+
+            # Scan backwards for trailing zeros
+            end = raw_off + raw_size
+            trim_start = end
+            while trim_start > raw_off and self.buffer[trim_start - 1] == 0:
+                trim_start -= 1
+
+            new_size = trim_start - raw_off
+            if new_size == 0:
+                new_size = 1
+            align = sec['align']
+            aligned_size = (new_size + align - 1) & ~(align - 1)
+            if aligned_size >= raw_size:
+                continue
+
+            saved = raw_size - aligned_size
+            del self.buffer[raw_off + aligned_size:raw_off + raw_size]
+
+            # Update section header size
+            sec_off = sec['sec_hdr_off']
+            if sec['is_64']:
+                struct.pack_into('<Q', self.buffer, sec_off + 40, aligned_size)
+            else:
+                struct.pack_into('<I', self.buffer, sec_off + 36, aligned_size)
+
+            # Update parent segment's filesize
+            seg_off = sec['seg_cmd_off']
+            if sec['is_64']:
+                seg_filesize = struct.unpack_from('<Q', self.buffer, seg_off + 48)[0]
+                struct.pack_into('<Q', self.buffer, seg_off + 48, seg_filesize - saved)
+                seg_vmsize = struct.unpack_from('<Q', self.buffer, seg_off + 32)[0]
+                struct.pack_into('<Q', self.buffer, seg_off + 32, seg_vmsize - saved)
+            else:
+                seg_filesize = struct.unpack_from('<I', self.buffer, seg_off + 36)[0]
+                struct.pack_into('<I', self.buffer, seg_off + 36, seg_filesize - saved)
+                seg_vmsize = struct.unpack_from('<I', self.buffer, seg_off + 28)[0]
+                struct.pack_into('<I', self.buffer, seg_off + 28, seg_vmsize - saved)
+
+            reclaimed += saved
+            sections_trimmed += 1
+
+        if reclaimed == 0:
+            return {'compacted': False, 'message': 'No reclaimable padding found'}
+
+        # Re-parse Mach-O
+        self._reparse_macho()
+        self._undo_stack.clear()
+
+        return {
+            'compacted': True,
+            'bytes_reclaimed': reclaimed,
+            'sections_trimmed': sections_trimmed,
+            'new_size': len(self.buffer),
+        }
 
     @staticmethod
     def extract_thin_macho(fat_path: str, arch_index: int = 0, output_path: str = None) -> Dict:
@@ -4149,6 +4538,26 @@ class ShiftEngine(BaseShiftEngine):
             if cert_dir.VirtualAddress != 0 and cert_dir.Size != 0:
                 self._has_signature = True
 
+    def _check_rsrc_conflict(self, rva: int) -> Optional[str]:
+        """v7.2: Check if an RVA falls inside the .rsrc section and warn."""
+        if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 2:
+            return None
+        rsrc_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[2]
+        if rsrc_dir.VirtualAddress == 0 or rsrc_dir.Size == 0:
+            return None
+        rsrc_rva = rsrc_dir.VirtualAddress
+        for s in self.pe.sections:
+            if s.VirtualAddress == rsrc_rva:
+                rsrc_end = rsrc_rva + s.Misc_VirtualSize
+                if rsrc_rva < rva < rsrc_end:
+                    return (
+                        "⚠ Shift inside .rsrc section — resource directory tree "
+                        "internal offsets may be corrupted. Consider adding a new "
+                        "section for code modifications instead."
+                    )
+                break
+        return None
+
     def detect_code_signature(self) -> Optional[Dict]:
         if not self._has_signature:
             return None
@@ -4158,6 +4567,62 @@ class ShiftEngine(BaseShiftEngine):
             'offset': cert_dir.VirtualAddress,
             'size': cert_dir.Size,
             'warning': 'Binary has Authenticode signature — modifications will invalidate it',
+        }
+
+    def strip_signature(self) -> Dict:
+        """
+        v7.2: Remove Authenticode signature from PE binary.
+        Zeroes the security directory entry (DATA_DIRECTORY[4]) and removes
+        the certificate table data from the end of the file.
+        """
+        if not self._has_signature:
+            return {'stripped': False, 'message': 'No Authenticode signature found'}
+
+        cert_dir = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
+        cert_offset = cert_dir.VirtualAddress  # This is a file offset, not RVA
+        cert_size = cert_dir.Size
+
+        bytes_removed = 0
+        # Certificate table is typically at the very end of the file
+        if cert_offset > 0 and cert_size > 0:
+            end_of_cert = cert_offset + cert_size
+            if end_of_cert == len(self.buffer):
+                # Certificate is at the end — truncate
+                del self.buffer[cert_offset:end_of_cert]
+                bytes_removed = cert_size
+            else:
+                # Not at end — zero it out instead
+                self.buffer[cert_offset:cert_offset + cert_size] = b'\x00' * cert_size
+
+        # Zero the data directory entry
+        cert_dir.VirtualAddress = 0
+        cert_dir.Size = 0
+        self._has_signature = False
+
+        # Update the PE checksum field to 0 (invalidated anyway)
+        self.pe.OPTIONAL_HEADER.CheckSum = 0
+
+        # Write the updated directory entry to buffer
+        # DATA_DIRECTORY[4] is at optional header offset + 128 (32-bit) or +144 (64-bit)
+        dd_offset = self.pe.OPTIONAL_HEADER.get_file_offset()
+        if self.is_64:
+            dd4_offset = dd_offset + 144 + 4 * 8  # each DD entry is 8 bytes
+        else:
+            dd4_offset = dd_offset + 128 + 4 * 8
+        if dd4_offset + 8 <= len(self.buffer):
+            struct.pack_into('<I', self.buffer, dd4_offset, 0)      # VirtualAddress
+            struct.pack_into('<I', self.buffer, dd4_offset + 4, 0)  # Size
+
+        # Zero checksum in buffer
+        checksum_offset = dd_offset + (64 if self.is_64 else 64)
+        if checksum_offset + 4 <= len(self.buffer):
+            struct.pack_into('<I', self.buffer, checksum_offset, 0)
+
+        return {
+            'stripped': True,
+            'bytes_removed': bytes_removed,
+            'new_size': len(self.buffer),
+            'message': 'Authenticode signature removed',
         }
 
     def _encode_absolute(self, ref: Reference):
@@ -4245,6 +4710,10 @@ class ShiftEngine(BaseShiftEngine):
         sig_warn = self._check_signature_warning()
         if sig_warn:
             warnings_pre.append(sig_warn)
+        # v7.2: .rsrc conflict warning
+        rsrc_warn = self._check_rsrc_conflict(rva)
+        if rsrc_warn:
+            warnings_pre.append(rsrc_warn)
 
         # Find the file offset for this RVA
         insert_foff = self._rva_to_offset(rva)
@@ -4290,6 +4759,12 @@ class ShiftEngine(BaseShiftEngine):
                                0, len(self.buffer), False,
                                f"RVA 0x{rva:X} does not map to any section")
 
+        # v7.2: .rsrc conflict warning
+        warnings_pre = []
+        rsrc_warn = self._check_rsrc_conflict(rva)
+        if rsrc_warn:
+            warnings_pre.append(rsrc_warn)
+
         # Save undo data
         deleted = bytes(self.buffer[foff:foff + count])
         self._undo_stack.append((ShiftOp.DELETE, foff, count, deleted))
@@ -4302,6 +4777,7 @@ class ShiftEngine(BaseShiftEngine):
 
         # Phase 3: Recalculate refs (negative delta)
         refs_updated, warnings = self._recalculate_refs(rva, -count)
+        warnings = warnings_pre + warnings
 
         # Phase 4: Update PE headers
         self._update_pe_headers(rva, -count)
@@ -4717,8 +5193,13 @@ class ShiftEngine(BaseShiftEngine):
 
     def _update_resource_directory(self, shift_rva: int, delta: int):
         """
-        v7.1: Walk the PE resource directory tree and update all OffsetToData RVAs.
+        v7.2: Walk the PE resource directory tree and update all OffsetToData RVAs.
         Called automatically after insert/delete when .rsrc section is affected.
+
+        If the shift occurs INSIDE the .rsrc section, the internal offsets
+        (which are relative to section start) would become invalid. In that case,
+        we skip the update and log a warning — callers should avoid modifying
+        inside .rsrc or use a separate section for new code.
         """
         if len(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 2:
             return
@@ -4738,6 +5219,16 @@ class ShiftEngine(BaseShiftEngine):
                 break
         if rsrc_section is None:
             return
+
+        rsrc_end_rva = rsrc_rva + rsrc_section.Misc_VirtualSize
+
+        # v7.2: If shift is INSIDE .rsrc, the tree structure itself shifted and
+        # internal relative offsets are now broken. We cannot safely update.
+        if rsrc_rva < shift_rva < rsrc_end_rva:
+            # The shift is inside the resource section — skip update.
+            # The resource tree is now potentially corrupted.
+            return
+
         rsrc_end = rsrc_foff + rsrc_section.SizeOfRawData
 
         visited = set()
@@ -4983,12 +5474,16 @@ class QEMUTracer:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
-    def get_coverage_refs(self, image_base: int = 0) -> List[Reference]:
+    def get_coverage_refs(self, image_base: int = 0,
+                          addr_to_offset=None) -> List[Reference]:
         """
-        v7.1: Convert dynamic trace data into Reference entries.
-        Produces two types of references:
-        - Branch target refs (from indirect calls/jumps) with high confidence
-        - Block coverage refs for code discovery
+        v7.2: Convert dynamic trace data into Reference entries.
+        Produces branch target refs (from indirect calls/jumps) with high confidence.
+
+        Args:
+            image_base: Base address to subtract from virtual addresses to get RVAs.
+            addr_to_offset: Optional callable(rva) -> file_offset for computing
+                            valid file offsets so the shift engine can update them.
         """
         refs = []
         seen_targets = set()
@@ -5001,8 +5496,15 @@ class QEMUTracer:
                     continue
                 seen_targets.add(pair)
 
+                # v7.2: Compute actual file offset so shift engine can update this ref
+                foff = 0
+                if addr_to_offset is not None:
+                    resolved = addr_to_offset(rva)
+                    if resolved is not None:
+                        foff = resolved
+
                 refs.append(Reference(
-                    file_offset=0,
+                    file_offset=foff,
                     ref_type=RefType.INDIRECT_CALL,
                     target_rva=target_rva,
                     ref_rva=rva,
@@ -5297,7 +5799,15 @@ class UBRTEngine:
         ib = self.pe_info.get('image_base', 0)
         result = self.qemu.parse_trace_log(image_base=ib)
         if result.get('success'):
-            new_refs = self.qemu.get_coverage_refs(image_base=ib)
+            # v7.2: Provide address-to-offset converter so refs get valid file offsets
+            addr_to_offset = None
+            if self.shift_engine:
+                if hasattr(self.shift_engine, '_rva_to_offset'):
+                    addr_to_offset = self.shift_engine._rva_to_offset
+                elif hasattr(self.shift_engine, '_vaddr_to_offset'):
+                    addr_to_offset = self.shift_engine._vaddr_to_offset
+            new_refs = self.qemu.get_coverage_refs(
+                image_base=ib, addr_to_offset=addr_to_offset)
             added = 0
             for ref in new_refs:
                 self.ref_db.add(ref)
@@ -5372,6 +5882,14 @@ class UBRTEngine:
             return None
         return self.shift_engine.detect_code_signature()
 
+    def strip_signature(self) -> Dict:
+        """v7.2: Remove code signature (Authenticode / LC_CODE_SIGNATURE)."""
+        if not self.shift_engine:
+            return {'error': 'No binary loaded'}
+        if not hasattr(self.shift_engine, 'strip_signature'):
+            return {'error': 'Signature stripping not supported for this format'}
+        return self.shift_engine.strip_signature()
+
     # ── v7: Range Query Interface ─────────────────────────────────────
 
     def get_refs_in_range(self, lo: int, hi: int) -> List[Dict]:
@@ -5408,11 +5926,11 @@ class UBRTEngine:
     # ── v7.1: Compact / Padding Reclamation ───────────────────────────
 
     def compact(self) -> Dict:
-        """Reclaim wasted padding in the loaded PE binary."""
+        """Reclaim wasted padding in the loaded binary (PE, ELF, or Mach-O)."""
         if not self.shift_engine:
             return {'error': 'No binary loaded'}
         if not hasattr(self.shift_engine, 'compact'):
-            return {'error': 'Compact not supported for this format'}
+            return {'error': 'Compact not supported for this binary format'}
         return self.shift_engine.compact()
 
     # ── v7.1: Mach-O Fat Binary Extraction ────────────────────────────

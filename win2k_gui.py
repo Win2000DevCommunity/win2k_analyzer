@@ -603,6 +603,10 @@ class TabbedOutput(ttk.Frame):
         self._ctx.add_command(label="Close All", command=self.close_all)
 
     # ── public API ────────────────────────────────────────────
+    def add_tab(self, title="Result"):
+        """Alias for new_tab — creates tab and returns the ScrolledText widget."""
+        return self.new_tab(title)
+
     def new_tab(self, title="Result"):
         """Create a new output tab and make it active.  Returns the ScrolledText."""
         self._counter += 1
@@ -7643,12 +7647,18 @@ class UBRTTab(ttk.Frame):
         self.status_var.set("\u23F3 Analyzing references\u2026")
         self._prog_start()
 
-        def work():
+        def work(progress_cb):
             eng = UBRTEngine()
-            return eng, eng.load(pe_path)
+            progress_cb("Analyzing references\u2026", 10)
+            info = eng.load(pe_path)
+            progress_cb("Done", 100)
+            return eng, info
 
         def done(result):
             self._prog_stop()
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u26A0 Error: {result}")
+                return
             eng, info = result
             if not info.get('success'):
                 self.status_var.set(f"\u26A0 {info.get('error', 'Unknown error')}")
@@ -7660,9 +7670,9 @@ class UBRTTab(ttk.Frame):
             tab = self.output.add_tab(f"Refs: {os.path.basename(pe_path)}")
             out = lambda t, tag="": output_write(tab, t, tag)
 
-            out(f"\n{'='*72}\n", "accent")
-            out(f"  UBRT Reference Analysis: {os.path.basename(pe_path)}\n", "accent")
-            out(f"{'='*72}\n\n", "accent")
+            out(f"\n{'='*72}\n", "title")
+            out(f"  UBRT Reference Analysis: {os.path.basename(pe_path)}\n", "title")
+            out(f"{'='*72}\n\n", "title")
 
             out(f"  File:        {pe_path}\n")
             out(f"  Size:        {pe['size']:,} bytes\n")
@@ -7670,7 +7680,7 @@ class UBRTTab(ttk.Frame):
             out(f"  Arch:        {'x64' if pe['is_64'] else 'x86 (32-bit)'}\n")
             out(f"  Entry Point: 0x{pe['entry_point']:X}\n\n")
 
-            out(f"  Sections:\n", "green")
+            out(f"  Sections:\n", "ok")
             out(f"  {'Name':<12} {'RVA':>10} {'VSize':>10} {'RawSize':>10} {'Flags':<20}\n", "dim")
             out(f"  {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*20}\n", "dim")
             for s in pe['sections']:
@@ -7681,26 +7691,26 @@ class UBRTTab(ttk.Frame):
                 out(f"  {s['name']:<12} 0x{s['rva']:08X} 0x{s['vsize']:08X} "
                     f"0x{s['raw_size']:08X} {','.join(flags)}\n")
 
-            out(f"\n  {'='*60}\n", "accent")
-            out(f"  REFERENCES FOUND: {stats['total']}\n", "accent")
-            out(f"  {'='*60}\n\n", "accent")
+            out(f"\n  {'='*60}\n", "title")
+            out(f"  REFERENCES FOUND: {stats['total']}\n", "title")
+            out(f"  {'='*60}\n\n", "title")
 
-            out(f"  By Type:\n", "green")
+            out(f"  By Type:\n", "ok")
             for typ, cnt in sorted(stats['by_type'].items(), key=lambda x: -x[1]):
                 bar = '\u2588' * min(cnt // 20 + 1, 40)
                 out(f"    {typ:<25} {cnt:>6}  {bar}\n")
 
-            out(f"\n  By Source:\n", "green")
+            out(f"\n  By Source:\n", "ok")
             for src, cnt in sorted(stats['by_source'].items(), key=lambda x: -x[1]):
                 out(f"    {src:<25} {cnt:>6}\n")
 
             conf = stats['by_confidence']
-            out(f"\n  By Confidence:\n", "green")
-            out(f"    High (≥0.9):   {conf['high']:>6}\n", "green")
+            out(f"\n  By Confidence:\n", "ok")
+            out(f"    High (≥0.9):   {conf['high']:>6}\n", "ok")
             out(f"    Medium (≥0.7): {conf['medium']:>6}\n", "peach")
-            out(f"    Low (<0.7):    {conf['low']:>6}\n", "red")
+            out(f"    Low (<0.7):    {conf['low']:>6}\n", "error")
 
-            out(f"\n  \u2714 Ready for shift operations. Use the operation panel above.\n", "green")
+            out(f"\n  \u2714 Ready for shift operations. Use the operation panel above.\n", "ok")
 
             self.status_var.set(
                 f"\u2714 Found {stats['total']} references in "
@@ -7726,7 +7736,7 @@ class UBRTTab(ttk.Frame):
 
         shown = 0
         for ref in refs[:2000]:
-            tag = "green" if ref.confidence >= 0.9 else ("peach" if ref.confidence >= 0.7 else "dim")
+            tag = "ok" if ref.confidence >= 0.9 else ("peach" if ref.confidence >= 0.7 else "dim")
             rel = "REL" if ref.is_relative else "ABS"
             out(f"  0x{ref.file_offset:08X}  0x{ref.ref_rva:08X}  {ref.ref_type.value:<22} "
                 f"0x{ref.target_rva:08X}  {rel:<6} {ref.size_bytes:<6} "
@@ -7793,23 +7803,23 @@ class UBRTTab(ttk.Frame):
         tab = self.output.add_tab(f"Preview @0x{rva:X}")
         out = lambda t, tag="": output_write(tab, t, tag)
 
-        out(f"\n{'='*72}\n", "accent")
-        out(f"  SHIFT PREVIEW: {op} {size} bytes at RVA 0x{rva:X}\n", "accent")
-        out(f"{'='*72}\n\n", "accent")
+        out(f"\n{'='*72}\n", "title")
+        out(f"  SHIFT PREVIEW: {op} {size} bytes at RVA 0x{rva:X}\n", "title")
+        out(f"{'='*72}\n\n", "title")
 
         out(f"  Total references:  {preview.get('total_refs', 0)}\n")
         out(f"  Refs affected:     {preview.get('refs_affected', 0)}\n")
         out(f"  Warnings:          {len(preview.get('warnings', []))}\n\n")
 
         if preview.get('warnings'):
-            out("  \u26A0 WARNINGS:\n", "red")
+            out("  \u26A0 WARNINGS:\n", "error")
             for w in preview['warnings']:
-                out(f"    {w}\n", "red")
+                out(f"    {w}\n", "error")
             out("\n")
 
         changes = preview.get('changes', [])
         if changes:
-            out(f"  Changes ({len(changes)}):\n", "green")
+            out(f"  Changes ({len(changes)}):\n", "ok")
             for ch in changes[:500]:
                 out(f"    {ch}\n")
             if len(changes) > 500:
@@ -7856,10 +7866,10 @@ class UBRTTab(ttk.Frame):
         out = lambda t, tag="": output_write(tab, t, tag)
 
         status_icon = "\u2714" if result.success else "\u274C"
-        tag = "green" if result.success else "red"
-        out(f"\n{'='*72}\n", "accent")
+        tag = "ok" if result.success else "error"
+        out(f"\n{'='*72}\n", "title")
         out(f"  {status_icon} {result.message}\n", tag)
-        out(f"{'='*72}\n\n", "accent")
+        out(f"{'='*72}\n\n", "title")
 
         out(f"  Operation:       {result.operation.value}\n")
         out(f"  RVA:             0x{result.rva:X}\n")
@@ -7869,9 +7879,9 @@ class UBRTTab(ttk.Frame):
         out(f"  New file size:   {result.new_file_size:,} bytes\n")
 
         if result.warnings:
-            out(f"\n  \u26A0 WARNINGS ({len(result.warnings)}):\n", "red")
+            out(f"\n  \u26A0 WARNINGS ({len(result.warnings)}):\n", "error")
             for w in result.warnings:
-                out(f"    {w}\n", "red")
+                out(f"    {w}\n", "error")
 
         # Show history
         history = self._engine.get_history()
@@ -7920,9 +7930,9 @@ class UBRTTab(ttk.Frame):
         found = QEMUTracer.find_qemu()
         if found:
             self._qemu_var.set(found)
-            self._qemu_status.config(text=f"Found: {os.path.basename(found)}", fg=T["green"])
+            self._qemu_status.config(text=f"Found: {os.path.basename(found)}", fg=T["ok"])
         else:
-            self._qemu_status.config(text="QEMU not found — install or set path manually", fg=T["red"])
+            self._qemu_status.config(text="QEMU not found — install or set path manually", fg=T["error"])
 
     def _browse_disk(self):
         path = filedialog.askopenfilename(
@@ -7949,10 +7959,10 @@ class UBRTTab(ttk.Frame):
         if result.get('success'):
             self._qemu_status.config(
                 text=f"Running (PID {result['pid']}, GDB :{result['gdb_port']})",
-                fg=T["green"])
+                fg=T["ok"])
             self.status_var.set(f"\u25B6 QEMU started — trace log: {result['trace_log']}")
         else:
-            self._qemu_status.config(text=f"Error: {result['error']}", fg=T["red"])
+            self._qemu_status.config(text=f"Error: {result['error']}", fg=T["error"])
             self.status_var.set(f"\u26A0 {result['error']}")
 
     def _stop_trace(self):
@@ -7975,9 +7985,9 @@ class UBRTTab(ttk.Frame):
 
         tab = self.output.add_tab("Trace Coverage")
         out = lambda t, tag="": output_write(tab, t, tag)
-        out(f"\n{'='*60}\n", "accent")
-        out(f"  QEMU Trace Log Coverage\n", "accent")
-        out(f"{'='*60}\n\n", "accent")
+        out(f"\n{'='*60}\n", "title")
+        out(f"  QEMU Trace Log Coverage\n", "title")
+        out(f"{'='*60}\n\n", "title")
         out(f"  Basic blocks executed: {result['blocks']}\n")
         out(f"  Unique blocks:         {result['unique_blocks']}\n")
         out(f"  Instructions traced:   {result['instructions']}\n\n")
