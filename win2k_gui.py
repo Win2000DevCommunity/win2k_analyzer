@@ -8880,6 +8880,7 @@ class UBRTTab(ttk.Frame):
 
             # If user loaded symbols, export updated .map alongside the binary
             map_generated = False
+            patched_syms = []
             symbols = self._engine.get_symbols()
             if symbols:
                 map_path = out_base + '.map'
@@ -8887,11 +8888,47 @@ class UBRTTab(ttk.Frame):
                 map_generated = True
                 copied_syms.append(os.path.basename(map_path))
 
+            # Patch .pdb / .dbg files with shifted addresses
+            history = self._engine._history if hasattr(self._engine, '_history') else []
+            shift_ops = [h for h in history if h.success and h.delta != 0
+                         and h.operation.value in ('insert', 'delete')]
+            if shift_ops:
+                from nt_analyzer.ubrt_engine import SymbolUpdater
+                pe_for_pdb = out_path  # use the saved (shifted) binary
+
+                for ext in ('.pdb', '.dbg'):
+                    sym_file = out_base + ext
+                    if not os.path.isfile(sym_file):
+                        # Also check same dir as source when same_dir save
+                        if same_dir:
+                            sym_file = src_base + ext
+                        if not os.path.isfile(sym_file):
+                            continue
+
+                    total_patched = 0
+                    for op in shift_ops:
+                        if ext == '.pdb':
+                            r = SymbolUpdater.patch_pdb_file(
+                                sym_file, op.rva, op.delta,
+                                pe_path=pe_for_pdb,
+                                image_base=self._engine.shift_engine.image_base)
+                        else:
+                            r = SymbolUpdater.patch_dbg_file(
+                                sym_file, op.rva, op.delta,
+                                image_base=self._engine.shift_engine.image_base)
+                        total_patched += r.get('patched', 0)
+
+                    if total_patched > 0:
+                        patched_syms.append(
+                            f"{os.path.basename(sym_file)}({total_patched})")
+
             # Build status message
             parts = [f"\U0001F4BE Saved to {out_path}"]
             if copied_syms:
                 parts.append(f"Symbols: {', '.join(copied_syms)}")
-            if map_generated and self._engine.get_history():
+            if patched_syms:
+                parts.append(f"Patched: {', '.join(patched_syms)}")
+            elif map_generated and shift_ops:
                 parts.append(f"\u26A0 .pdb has original addresses \u2014 .map has updated ones")
             if backups:
                 bak_names = ', '.join(os.path.basename(b) for b in backups)

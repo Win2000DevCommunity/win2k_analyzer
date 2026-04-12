@@ -19,9 +19,10 @@ import json
 import time
 import copy
 import bisect
+import math
 import threading
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple, Set, Any
 from collections import defaultdict
 
 try:
@@ -4689,6 +4690,334 @@ class SymbolUpdater:
                 f.write(content)
 
         return content
+
+    # ------------------------------------------------------------------
+    #  Direct .dbg file patching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def patch_dbg_file(dbg_path: str, shift_rva: int, delta: int,
+                       image_base: int = 0) -> Dict[str, Any]:
+        """
+        Patch COFF symbol addresses inside a .dbg file in-place.
+
+        For every COFF symbol whose value (RVA) >= shift_rva, adds *delta*.
+        Also patches the ImageBase and SizeOfImage in the DBG header when
+        *delta* changes image layout.
+
+        Args:
+            dbg_path:   Path to the .dbg file (will be modified in-place).
+            shift_rva:  RVA threshold — symbols at or above this get shifted.
+            delta:      Signed byte count (positive = insert, negative = delete).
+            image_base: Image base of the PE (used only for logging).
+
+        Returns:
+            dict with 'patched' count, 'total' symbols seen, 'errors'.
+        """
+        result: Dict[str, Any] = {'patched': 0, 'total': 0, 'errors': []}
+
+        try:
+            with open(dbg_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            result['errors'].append(f'Cannot read {dbg_path}: {e}')
+            return result
+
+        if len(data) < 48:
+            result['errors'].append('File too small for DBG format')
+            return result
+
+        sig = struct.unpack_from('<H', data, 0)[0]
+        if sig != 0x4944:
+            result['errors'].append(f'Invalid DBG signature: 0x{sig:04X}')
+            return result
+
+        # Parse IMAGE_SEPARATE_DEBUG_HEADER
+        # Offsets: 0=Sig(H), 2=Flags(H), 4=Machine(H), 6=Characteristics(H),
+        #   8=Timestamp(I), 12=CheckSum(I), 16=ImageBase(I), 20=SizeOfImage(I),
+        #   24=NumSections(I), 28=ExportedNamesSize(I), 32=DebugDirSize(I),
+        #   36=SectionAlignment(I), 40=Reserved[2]
+        num_sections = struct.unpack_from('<I', data, 24)[0]
+        exported_names_size = struct.unpack_from('<I', data, 28)[0]
+        debug_dir_size = struct.unpack_from('<I', data, 32)[0]
+
+        # Update SizeOfImage in the header (offset 20, uint32)
+        old_size_of_image = struct.unpack_from('<I', data, 20)[0]
+        struct.pack_into('<I', data, 20, (old_size_of_image + delta) & 0xFFFFFFFF)
+
+        # Debug directories start after header + section headers + exported names
+        dd_start = 48 + num_sections * 40 + exported_names_size
+
+        for i in range(debug_dir_size // 28):
+            dd_offset = dd_start + i * 28
+            if dd_offset + 28 > len(data):
+                break
+            dd_type = struct.unpack_from('<I', data, dd_offset + 12)[0]
+            dd_size = struct.unpack_from('<I', data, dd_offset + 16)[0]
+            dd_ptr = struct.unpack_from('<I', data, dd_offset + 24)[0]
+
+            if dd_ptr + dd_size > len(data):
+                result['errors'].append(f'Debug data type {dd_type} out of bounds')
+                continue
+
+            if dd_type == 1:
+                # ── COFF symbol table ────────────────────────────
+                if dd_ptr + 8 > len(data):
+                    continue
+                num_symbols = struct.unpack_from('<I', data, dd_ptr)[0]
+
+                idx = 0
+                while idx < min(num_symbols, 50000):
+                    entry_off = dd_ptr + 8 + idx * 18
+                    if entry_off + 18 > len(data):
+                        break
+
+                    value = struct.unpack_from('<I', data, entry_off + 8)[0]
+                    section = struct.unpack_from('<h', data, entry_off + 12)[0]
+                    sclass = data[entry_off + 16]
+                    aux_count = data[entry_off + 17]
+
+                    result['total'] += 1
+
+                    if section > 0 and sclass in (2, 3, 6) and value >= shift_rva:
+                        new_value = value + delta
+                        if new_value >= 0:
+                            struct.pack_into('<I', data, entry_off + 8,
+                                             new_value & 0xFFFFFFFF)
+                            result['patched'] += 1
+
+                    idx += 1 + aux_count
+
+            elif dd_type == 3:
+                # ── FPO (Frame Pointer Omission) data ────────────
+                # Each FPO_DATA entry is 16 bytes:
+                #   ulOffStart(u32) + cbProcSize(u32) + cdwLocals(u32) +
+                #   cdwParams(u16) + flags(u16)
+                num_fpo = dd_size // 16
+                for fi in range(num_fpo):
+                    fpo_off = dd_ptr + fi * 16
+                    if fpo_off + 16 > len(data):
+                        break
+                    off_start = struct.unpack_from('<I', data, fpo_off)[0]
+                    result['total'] += 1
+                    if off_start >= shift_rva:
+                        struct.pack_into('<I', data, fpo_off,
+                                         (off_start + delta) & 0xFFFFFFFF)
+                        result['patched'] += 1
+
+        # Patch section headers (VirtualAddress field) inside the DBG file
+        for si in range(num_sections):
+            sh_off = 48 + si * 40
+            if sh_off + 40 > len(data):
+                break
+            # IMAGE_SECTION_HEADER: Name(8) + VirtualSize(4) + VirtualAddress(4)
+            sec_va = struct.unpack_from('<I', data, sh_off + 12)[0]
+            if sec_va >= shift_rva and sec_va != 0:
+                struct.pack_into('<I', data, sh_off + 12,
+                                 (sec_va + delta) & 0xFFFFFFFF)
+                result['patched'] += 1
+
+        # Write back
+        try:
+            with open(dbg_path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            result['errors'].append(f'Cannot write {dbg_path}: {e}')
+
+        return result
+
+    # ------------------------------------------------------------------
+    #  Direct .pdb 2.0 file patching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def patch_pdb_file(pdb_path: str, shift_rva: int, delta: int,
+                       pe_path: str = None,
+                       image_base: int = 0) -> Dict[str, Any]:
+        """
+        Patch symbol offsets inside a PDB 2.0 file in-place.
+
+        Walks the GSI stream, finds S_PUB32_16t records whose
+        section:offset resolves to an RVA >= *shift_rva*, and adds
+        *delta* to the offset field.  The modification is written back
+        to the correct MSF page in the file.
+
+        Args:
+            pdb_path:   Path to the .pdb file (will be modified in-place).
+            shift_rva:  RVA threshold.
+            delta:      Signed byte count.
+            pe_path:    PE file for section→RVA mapping (required for
+                        accurate segment:offset → RVA conversion).
+            image_base: PE ImageBase (auto-detected from pe_path if 0).
+
+        Returns:
+            dict with 'patched' count, 'total', 'format', 'errors'.
+        """
+        result: Dict[str, Any] = {
+            'patched': 0, 'total': 0, 'format': '', 'errors': []
+        }
+
+        try:
+            with open(pdb_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            result['errors'].append(f'Cannot read {pdb_path}: {e}')
+            return result
+
+        # ── Detect format ────────────────────────────────────────────
+        PDB20_SIG = b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00'
+        if len(data) >= 44 and bytes(data[:44]) == PDB20_SIG:
+            result['format'] = 'pdb20'
+        else:
+            result['errors'].append(
+                'Only PDB 2.0 format is supported for direct patching')
+            return result
+
+        # ── Parse MSF header ─────────────────────────────────────────
+        page_size = struct.unpack_from('<I', data, 44)[0]
+        file_pages = struct.unpack_from('<H', data, 50)[0]
+        root_size = struct.unpack_from('<I', data, 52)[0]
+
+        if page_size == 0 or page_size > 0x10000:
+            result['errors'].append(f'Invalid page size: {page_size}')
+            return result
+
+        num_root_pages = math.ceil(root_size / page_size)
+        root_page_nums = [
+            struct.unpack_from('<H', data, 60 + i * 2)[0]
+            for i in range(num_root_pages)
+        ]
+
+        # Read root stream
+        root_data = bytearray()
+        for pn in root_page_nums:
+            start = pn * page_size
+            root_data.extend(data[start:start + page_size])
+        root_data = bytes(root_data[:root_size])
+
+        # Parse stream directory
+        num_streams = struct.unpack_from('<H', root_data, 0)[0]
+        off = 4
+        stream_sizes: List[int] = []
+        for _ in range(num_streams):
+            stream_sizes.append(struct.unpack_from('<I', root_data, off)[0])
+            off += 8
+
+        stream_pages: List[List[int]] = []
+        for sz in stream_sizes:
+            pn_count = math.ceil(sz / page_size) if sz > 0 else 0
+            pages = [
+                struct.unpack_from('<H', root_data, off + j * 2)[0]
+                for j in range(pn_count)
+            ]
+            off += pn_count * 2
+            stream_pages.append(pages)
+
+        # ── Section VAs from PE ──────────────────────────────────────
+        section_vas: Dict[int, int] = {}
+        if pe_path:
+            try:
+                import pefile as _pefile
+                _pe = _pefile.PE(pe_path, fast_load=True)
+                for i, s in enumerate(_pe.sections):
+                    section_vas[i + 1] = s.VirtualAddress
+                if image_base == 0:
+                    image_base = _pe.OPTIONAL_HEADER.ImageBase
+                _pe.close()
+            except Exception:
+                pass
+
+        # ── Helper: map stream-relative offset → file offset ────────
+        def stream_offset_to_file_offset(stream_idx: int,
+                                         stream_off: int) -> int:
+            """Convert a byte offset within a stream to a file offset."""
+            page_idx = stream_off // page_size
+            in_page_off = stream_off % page_size
+            if page_idx >= len(stream_pages[stream_idx]):
+                return -1
+            file_page = stream_pages[stream_idx][page_idx]
+            return file_page * page_size + in_page_off
+
+        # ── Patch GSI stream ─────────────────────────────────────────
+        def read_stream(idx: int) -> bytes:
+            if idx >= num_streams or stream_sizes[idx] == 0:
+                return b''
+            sd = bytearray()
+            for pn in stream_pages[idx]:
+                start = pn * page_size
+                sd.extend(data[start:start + page_size])
+            return bytes(sd[:stream_sizes[idx]])
+
+        patched_stream_idx = -1
+        for stream_idx in (7, 6, 5):
+            if stream_idx >= num_streams:
+                continue
+            gsi = read_stream(stream_idx)
+            if len(gsi) < 4:
+                continue
+
+            sym_off = 0
+            found_any = False
+            while sym_off + 4 <= len(gsi):
+                reclen = struct.unpack_from('<H', gsi, sym_off)[0]
+                if reclen < 2 or sym_off + 2 + reclen > len(gsi):
+                    break
+                rectyp = struct.unpack_from('<H', gsi, sym_off + 2)[0]
+
+                if rectyp == 0x1009 and reclen >= 13:
+                    # S_PUB32_16t: flags(4) + offset(4) + segment(2) +
+                    #              name_len(1) + name(N)
+                    rec_data_off = sym_off + 4  # start of rec payload
+                    offset_val = struct.unpack_from('<I', gsi,
+                                                   rec_data_off + 4)[0]
+                    segment = struct.unpack_from('<H', gsi,
+                                                rec_data_off + 8)[0]
+
+                    result['total'] += 1
+                    found_any = True
+
+                    # Compute RVA
+                    if segment in section_vas:
+                        rva = section_vas[segment] + offset_val
+                    else:
+                        rva = offset_val
+
+                    if rva >= shift_rva:
+                        new_offset = offset_val + delta
+                        if new_offset >= 0:
+                            # Write directly to the file buffer via
+                            # page mapping
+                            # The offset field is at rec_data_off + 4
+                            # relative to stream start
+                            field_stream_off = rec_data_off + 4
+                            file_off = stream_offset_to_file_offset(
+                                stream_idx, field_stream_off)
+                            if file_off >= 0 and file_off + 4 <= len(data):
+                                struct.pack_into('<I', data, file_off,
+                                                 new_offset & 0xFFFFFFFF)
+                                result['patched'] += 1
+
+                # Advance with 4-byte alignment
+                sym_off += 2 + reclen
+                if sym_off % 4:
+                    sym_off += 4 - (sym_off % 4)
+
+            if found_any:
+                patched_stream_idx = stream_idx
+                break
+
+        if patched_stream_idx < 0 and not result['errors']:
+            result['errors'].append('No symbol stream found in PDB')
+
+        # ── Write back ───────────────────────────────────────────────
+        if result['patched'] > 0:
+            try:
+                with open(pdb_path, 'wb') as f:
+                    f.write(data)
+            except Exception as e:
+                result['errors'].append(f'Cannot write {pdb_path}: {e}')
+
+        return result
 
 
 # ─── Shift Engine ─────────────────────────────────────────────────────────
