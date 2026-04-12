@@ -503,7 +503,8 @@ class SymbolRecoveryEngine:
     #  New section symbol discovery
     # ------------------------------------------------------------------
 
-    def discover_new_section_symbols(self, patched_pe_path: str) -> List[RecoveredSymbol]:
+    def discover_new_section_symbols(self, patched_pe_path: str,
+                                     orig_pe_path: str = None) -> List[RecoveredSymbol]:
         """
         Discover symbols in NEW sections of the patched binary.
 
@@ -603,6 +604,42 @@ class SymbolRecoveryEngine:
                         ))
                         break
 
+            # 3b. Export name strings range in new sections
+            name_rvas = []
+            for exp in ed.symbols:
+                if exp.name_offset:
+                    name_rvas.append(exp.name_offset)
+            if name_rvas:
+                min_rva = min(name_rvas)
+                for sec in self._diff.new_sections:
+                    if sec.va <= min_rva < sec.va + sec.vsize:
+                        discovered.append(RecoveredSymbol(
+                            name='__ExportNameStrings',
+                            orig_va=0,
+                            recovered_va=ib + min_rva,
+                            section_name=sec.name,
+                            section_index=sec.index,
+                            confidence=1.0,
+                            status='discovered',
+                        ))
+                        break
+
+            # 3c. DLL name string in new sections
+            dll_name_rva = ed.struct.Name
+            if dll_name_rva:
+                for sec in self._diff.new_sections:
+                    if sec.va <= dll_name_rva < sec.va + sec.vsize:
+                        discovered.append(RecoveredSymbol(
+                            name='__ExportDllName',
+                            orig_va=0,
+                            recovered_va=ib + dll_name_rva,
+                            section_name=sec.name,
+                            section_index=sec.index,
+                            confidence=1.0,
+                            status='discovered',
+                        ))
+                        break
+
             # 4. Exports pointing into new sections
             for exp in ed.symbols:
                 if not exp.address:
@@ -650,6 +687,51 @@ class SymbolRecoveryEngine:
                     i += 3  # skip past this prologue
                 else:
                     i += 1
+
+        # 6. New exports: functions added to the patched binary
+        #    Compare export tables to find names not in original
+        if orig_pe_path and hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            try:
+                orig_pe = pefile.PE(orig_pe_path)
+                orig_export_names = set()
+                if hasattr(orig_pe, 'DIRECTORY_ENTRY_EXPORT'):
+                    for exp in orig_pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                        if exp.name:
+                            orig_export_names.add(
+                                exp.name.decode('ascii', 'replace'))
+                orig_pe.close()
+
+                # Map patched sections for labeling
+                p_sections = []
+                for s in pe.sections:
+                    nm = s.Name.rstrip(b'\x00').decode('ascii', 'replace')
+                    p_sections.append(
+                        (nm, s.VirtualAddress, s.Misc_VirtualSize,
+                         pe.sections.index(s)))
+
+                def rva_to_section_info(rva):
+                    for nm, sva, svs, si in p_sections:
+                        if sva <= rva < sva + svs:
+                            return nm, si
+                    return '???', -1
+
+                for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if not exp.name or not exp.address:
+                        continue
+                    name = exp.name.decode('ascii', 'replace')
+                    if name not in orig_export_names:
+                        sec_name, sec_idx = rva_to_section_info(exp.address)
+                        discovered.append(RecoveredSymbol(
+                            name=name,
+                            orig_va=0,
+                            recovered_va=ib + exp.address,
+                            section_name=sec_name,
+                            section_index=sec_idx,
+                            confidence=1.0,
+                            status='discovered',
+                        ))
+            except Exception:
+                pass  # original PE not available, skip
 
         pe.close()
 

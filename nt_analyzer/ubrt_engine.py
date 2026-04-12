@@ -5192,14 +5192,26 @@ class SymbolUpdater:
             result['errors'].append('No GSI symbol stream found in PDB')
             return result
 
-        # ── Check space ──────────────────────────────────────────────
+        # ── Allocate pages if needed ──────────────────────────────────
         allocated = len(stream_pages[gsi_idx]) * page_size
         new_stream_size = sym_end + len(new_records)
         if new_stream_size > allocated:
-            result['errors'].append(
-                f'Insufficient space in GSI stream ({allocated} allocated, '
-                f'{new_stream_size} needed). Use MAP export instead.')
-            return result
+            # Need more pages - append them to the file
+            extra_bytes = new_stream_size - allocated
+            extra_pages = math.ceil(extra_bytes / page_size)
+            total_file_pages = len(data) // page_size
+            new_page_nums = list(range(total_file_pages,
+                                       total_file_pages + extra_pages))
+            # Extend file with zero pages
+            data.extend(b'\x00' * (extra_pages * page_size))
+            # Add new pages to the stream's page list
+            stream_pages[gsi_idx].extend(new_page_nums)
+            # Update file_pages in MSF header (uint16 at offset 50)
+            new_total_pages = total_file_pages + extra_pages
+            if new_total_pages <= 0xFFFF:
+                struct.pack_into('<H', data, 50, new_total_pages)
+            # Rebuild root stream with updated page list
+            # (handled below when writing root back)
 
         # ── Write new records into stream pages ──────────────────────
         def stream_off_to_file_off(s_idx: int, s_off: int) -> int:
@@ -5216,15 +5228,57 @@ class SymbolUpdater:
 
         result['injected'] = inject_count
 
-        # ── Update stream size in root directory ─────────────────────
-        struct.pack_into('<I', root_data, stream_size_offsets[gsi_idx],
-                         new_stream_size)
-        # Write modified root stream back
+        # ── Rebuild root directory stream ────────────────────────────
+        # The root stream format (PDB 2.0):
+        #   uint16 num_streams
+        #   uint16 reserved (padding to 4 bytes)
+        #   for each stream: uint32 size, uint32 reserved
+        #   for each stream: uint16 pages[ceil(size/page_size)]
+        new_root = bytearray()
+        new_root += struct.pack('<HH', num_streams, 0)
+        # Stream sizes (update the GSI stream size)
+        for si in range(num_streams):
+            sz = new_stream_size if si == gsi_idx else stream_sizes[si]
+            new_root += struct.pack('<II', sz, 0)
+        # Stream page lists
+        for si in range(num_streams):
+            sz = new_stream_size if si == gsi_idx else stream_sizes[si]
+            pages = stream_pages[si]
+            pn_count = math.ceil(sz / page_size) if sz > 0 else 0
+            for pi in range(pn_count):
+                if pi < len(pages):
+                    new_root += struct.pack('<H', pages[pi])
+                else:
+                    new_root += struct.pack('<H', 0)
+
+        # Check if new root fits in current root pages
+        new_root_size = len(new_root)
+        new_root_pages_needed = math.ceil(new_root_size / page_size)
+        if new_root_pages_needed > len(root_page_nums):
+            # Allocate more root pages
+            total_file_pages = len(data) // page_size
+            for _ in range(new_root_pages_needed - len(root_page_nums)):
+                root_page_nums.append(total_file_pages)
+                data.extend(b'\x00' * page_size)
+                total_file_pages += 1
+            # Update root page list in MSF header
+            for rpi, rpn in enumerate(root_page_nums):
+                struct.pack_into('<H', data, 60 + rpi * 2, rpn)
+            # Update file_pages
+            if total_file_pages <= 0xFFFF:
+                struct.pack_into('<H', data, 50, total_file_pages)
+
+        # Update root_size in MSF header (uint32 at offset 52)
+        struct.pack_into('<I', data, 52, new_root_size)
+
+        # Write root stream to its pages
         for pi, pn in enumerate(root_page_nums):
             src_s = pi * page_size
-            src_e = min(src_s + page_size, len(root_data))
-            dst_s = pn * page_size
-            data[dst_s:dst_s + (src_e - src_s)] = root_data[src_s:src_e]
+            src_e = min(src_s + page_size, len(new_root))
+            if src_s < len(new_root):
+                dst_s = pn * page_size
+                chunk = new_root[src_s:src_e]
+                data[dst_s:dst_s + len(chunk)] = chunk
 
         # ── Write file ───────────────────────────────────────────────
         try:

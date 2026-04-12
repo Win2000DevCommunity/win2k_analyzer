@@ -9436,10 +9436,11 @@ class SymbolRecoveryTab(ttk.Frame):
 
         def work():
             recovered = self._engine.recover_symbols(orig_pe_path=orig_path)
-            # Discover symbols in new sections
+            # Discover symbols in new sections and new exports
             new_syms = []
             if patched_path and self._engine.diff and self._engine.diff.new_sections:
-                new_syms = self._engine.discover_new_section_symbols(patched_path)
+                new_syms = self._engine.discover_new_section_symbols(
+                    patched_path, orig_pe_path=orig_path)
             return recovered, new_syms
 
         def done(result):
