@@ -4499,6 +4499,197 @@ class SymbolUpdater:
 
         return updated
 
+    @staticmethod
+    def update_pe_imports(buffer: bytearray, pe, shift_rva: int, delta: int) -> int:
+        """
+        Patch import directory and IAT/ILT RVAs after shift.
+        Returns number of import entries updated.
+        """
+        updated = 0
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 1:
+            return 0
+        imp_dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1]  # IMAGE_DIRECTORY_ENTRY_IMPORT
+        if imp_dd.VirtualAddress == 0 or imp_dd.Size == 0:
+            return 0
+
+        # Update the directory entry RVA itself if needed
+        if imp_dd.VirtualAddress >= shift_rva:
+            pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].VirtualAddress += delta
+            updated += 1
+
+        # IAT directory entry (DATA_DIRECTORY[12])
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 12:
+            iat_dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[12]
+            if iat_dd.VirtualAddress >= shift_rva and iat_dd.VirtualAddress != 0:
+                pe.OPTIONAL_HEADER.DATA_DIRECTORY[12].VirtualAddress += delta
+                updated += 1
+
+        # Walk import descriptors in the buffer
+        imp_foff = None
+        for s in pe.sections:
+            if s.VirtualAddress <= imp_dd.VirtualAddress < s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData):
+                imp_foff = imp_dd.VirtualAddress - s.VirtualAddress + s.PointerToRawData
+                break
+        if imp_foff is None:
+            return updated
+
+        desc_size = 20  # sizeof(IMAGE_IMPORT_DESCRIPTOR)
+        i = 0
+        while True:
+            off = imp_foff + i * desc_size
+            if off + desc_size > len(buffer):
+                break
+            ilt_rva = struct.unpack_from('<I', buffer, off)[0]       # OriginalFirstThunk
+            name_rva = struct.unpack_from('<I', buffer, off + 12)[0]  # Name
+            iat_rva = struct.unpack_from('<I', buffer, off + 16)[0]   # FirstThunk
+
+            # Null terminator
+            if ilt_rva == 0 and name_rva == 0 and iat_rva == 0:
+                break
+
+            if ilt_rva >= shift_rva and ilt_rva != 0:
+                struct.pack_into('<I', buffer, off, ilt_rva + delta)
+                updated += 1
+            if name_rva >= shift_rva and name_rva != 0:
+                struct.pack_into('<I', buffer, off + 12, name_rva + delta)
+                updated += 1
+            if iat_rva >= shift_rva and iat_rva != 0:
+                struct.pack_into('<I', buffer, off + 16, iat_rva + delta)
+                updated += 1
+            i += 1
+
+        return updated
+
+    @staticmethod
+    def update_pe_exception_table(buffer: bytearray, pe, shift_rva: int, delta: int) -> int:
+        """
+        Patch .pdata (exception table) entries after shift.
+        Each entry is 12 bytes: BeginRVA(4), EndRVA(4), UnwindInfoRVA(4).
+        Returns number of entries updated.
+        """
+        updated = 0
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 3:
+            return 0
+        exc_dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+        if exc_dd.VirtualAddress == 0 or exc_dd.Size == 0:
+            return 0
+
+        exc_foff = None
+        for s in pe.sections:
+            if s.VirtualAddress <= exc_dd.VirtualAddress < s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData):
+                exc_foff = exc_dd.VirtualAddress - s.VirtualAddress + s.PointerToRawData
+                break
+        if exc_foff is None:
+            return 0
+
+        num_entries = exc_dd.Size // 12
+        for i in range(num_entries):
+            off = exc_foff + i * 12
+            if off + 12 > len(buffer):
+                break
+            begin_rva = struct.unpack_from('<I', buffer, off)[0]
+            end_rva = struct.unpack_from('<I', buffer, off + 4)[0]
+            unwind_rva = struct.unpack_from('<I', buffer, off + 8)[0]
+
+            if begin_rva >= shift_rva and begin_rva != 0:
+                struct.pack_into('<I', buffer, off, begin_rva + delta)
+                updated += 1
+            if end_rva >= shift_rva and end_rva != 0:
+                struct.pack_into('<I', buffer, off + 4, end_rva + delta)
+                updated += 1
+            if unwind_rva >= shift_rva and unwind_rva != 0:
+                struct.pack_into('<I', buffer, off + 8, unwind_rva + delta)
+                updated += 1
+
+        return updated
+
+    @staticmethod
+    def update_pe_base_reloc(buffer: bytearray, pe, shift_rva: int, delta: int) -> int:
+        """
+        Update base relocation directory RVA pointer after shift.
+        Individual reloc fixups are handled by _recalculate_refs, but the
+        directory entry itself needs updating.
+        """
+        updated = 0
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 5:
+            return 0
+        reloc_dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
+        if reloc_dd.VirtualAddress >= shift_rva and reloc_dd.VirtualAddress != 0:
+            pe.OPTIONAL_HEADER.DATA_DIRECTORY[5].VirtualAddress += delta
+            updated += 1
+        return updated
+
+    @staticmethod
+    def shift_symbols(symbols: Dict[int, str], shift_addr: int, delta: int,
+                      image_base: int = 0) -> Dict[int, str]:
+        """
+        Shift a loaded symbol table {VA: name} after an insert/delete.
+        Symbols at or above shift_addr+image_base get shifted by delta.
+        Returns the updated symbol dict.
+        """
+        shifted = {}
+        threshold = shift_addr + image_base
+        for va, name in symbols.items():
+            if va >= threshold:
+                shifted[va + delta] = name
+            else:
+                shifted[va] = name
+        return shifted
+
+    @staticmethod
+    def generate_map_file(symbols: Dict[int, str], image_base: int = 0,
+                          sections: list = None, output_path: str = None) -> str:
+        """
+        Generate a Microsoft-format .map file from a symbol dictionary.
+        Returns the map content as a string. Writes to file if output_path given.
+        """
+        lines = []
+        lines.append(f" UBRT Generated Symbol Map")
+        lines.append(f" Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"")
+        lines.append(f" Preferred load address is {image_base:016X}")
+        lines.append(f"")
+        lines.append(f" Start         Length     Name                   Class")
+
+        if sections:
+            for i, sec in enumerate(sections):
+                name = sec.get('name', f'.sec{i}')
+                rva = sec.get('rva', 0)
+                vsize = sec.get('vsize', 0)
+                cls = 'CODE' if sec.get('is_code') else 'DATA'
+                lines.append(f" {i+1:04X}:{rva:08X} {vsize:08X}H {name:<24s} {cls}")
+
+        lines.append(f"")
+        lines.append(f"  Address         Publics by Value              Rva+Base")
+        lines.append(f"")
+
+        # Sort symbols by address
+        for va in sorted(symbols.keys()):
+            name = symbols[va]
+            rva = va - image_base if va >= image_base else va
+            # Determine section index
+            sec_idx = 1
+            sec_off = rva
+            if sections:
+                for idx, sec in enumerate(sections):
+                    s_rva = sec.get('rva', 0)
+                    s_sz = sec.get('vsize', 0)
+                    if s_rva <= rva < s_rva + s_sz:
+                        sec_idx = idx + 1
+                        sec_off = rva - s_rva
+                        break
+            lines.append(f" {sec_idx:04X}:{sec_off:08X}       {name:<32s} {va:016X}")
+
+        lines.append(f"")
+        lines.append(f" Total symbols: {len(symbols)}")
+        content = '\n'.join(lines) + '\n'
+
+        if output_path:
+            with open(output_path, 'w') as f:
+                f.write(content)
+
+        return content
+
 
 # ─── Shift Engine ─────────────────────────────────────────────────────────
 
@@ -5542,6 +5733,9 @@ class UBRTEngine:
         self._history: List[ShiftResult] = []
         self.binary_format: str = "unknown"  # "pe" or "elf"
         self._symbol_updater = SymbolUpdater()
+        self._symbols: Dict[int, str] = {}    # VA -> symbol name
+        self._symbol_meta: Dict = {}           # metadata from symbol loader
+        self._symbol_source: Optional[str] = None  # path to loaded symbol file
 
     @staticmethod
     def detect_format(path: str) -> str:
@@ -5817,7 +6011,7 @@ class UBRTEngine:
         return result
 
     def _update_symbols_after_shift(self, shift_addr: int, delta: int):
-        """Update symbol tables after a shift operation."""
+        """Update all symbol/directory tables after a shift operation."""
         if not self.shift_engine:
             return
         buf = self.shift_engine.buffer
@@ -5831,6 +6025,18 @@ class UBRTEngine:
                 buf, self.shift_engine.pe, shift_addr, delta)
             count += SymbolUpdater.update_pe_debug_dir(
                 buf, self.shift_engine.pe, shift_addr, delta)
+            count += SymbolUpdater.update_pe_imports(
+                buf, self.shift_engine.pe, shift_addr, delta)
+            count += SymbolUpdater.update_pe_exception_table(
+                buf, self.shift_engine.pe, shift_addr, delta)
+            count += SymbolUpdater.update_pe_base_reloc(
+                buf, self.shift_engine.pe, shift_addr, delta)
+
+        # Update loaded external symbols if present
+        if hasattr(self, '_symbols') and self._symbols:
+            ib = self.pe_info.get('image_base', 0)
+            self._symbols = SymbolUpdater.shift_symbols(
+                self._symbols, shift_addr, delta, ib)
 
     # ── v7: Batch/Transaction Interface ───────────────────────────────
 
@@ -5955,4 +6161,157 @@ class UBRTEngine:
                 len(b.branch_targets) for b in self.qemu.coverage.values()
             ),
             'gdb_port': self.qemu.get_gdb_port(),
+        }
+
+    # ── Symbol Management ─────────────────────────────────────────────
+
+    def load_symbols(self, symbol_path: str, image_base: int = None) -> Dict:
+        """
+        Load symbols from a .map / .pdb / .dbg / .sym file.
+        Symbols are kept in memory and shifted automatically on insert/delete.
+        They annotate the hex editor and can be exported as a .map file.
+        """
+        from nt_analyzer.symbol_loader import load_symbols as _load_symbols
+        try:
+            ib = image_base or self.pe_info.get('image_base', 0)
+            symbols, meta = _load_symbols(symbol_path, image_base=ib,
+                                          pe_path=self.pe_path)
+            self._symbols = symbols
+            self._symbol_meta = meta
+            self._symbol_source = symbol_path
+            return {
+                'success': True,
+                'total_symbols': len(symbols),
+                'format': meta.get('format', 'unknown'),
+                'source': os.path.basename(symbol_path),
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def load_symbols_from_exports(self) -> Dict:
+        """
+        Build a symbol table from the loaded binary's own export table.
+        Useful when no external symbol file is available.
+        """
+        if not self.shift_engine or not self.ref_db:
+            return {'success': False, 'error': 'No binary loaded'}
+
+        ib = self.pe_info.get('image_base', 0)
+        symbols = {}
+
+        # Extract from references that have symbol names
+        for ref in self.ref_db.get_all():
+            if ref.symbol_name:
+                va = ref.target_rva + ib
+                if va not in symbols:
+                    symbols[va] = ref.symbol_name
+
+        # For PE: also read exports directly from pefile
+        if self.binary_format == 'pe' and isinstance(self.shift_engine, ShiftEngine):
+            pe = self.shift_engine.pe
+            if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                for sym in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if sym.forwarder is not None:
+                        continue
+                    name = sym.name.decode('ascii', errors='replace') if sym.name else f"ord_{sym.ordinal}"
+                    va = sym.address + ib
+                    symbols[va] = name
+
+        self._symbols = symbols
+        self._symbol_source = self.pe_path
+        return {
+            'success': True,
+            'total_symbols': len(symbols),
+            'format': 'exports',
+            'source': os.path.basename(self.pe_path or ''),
+        }
+
+    def get_symbols(self) -> Dict[int, str]:
+        """Return the currently loaded symbol table {VA: name}."""
+        return self._symbols
+
+    def get_symbol_at_rva(self, rva: int) -> Optional[str]:
+        """Look up a symbol by RVA (converts to VA internally)."""
+        ib = self.pe_info.get('image_base', 0)
+        va = rva + ib
+        return self._symbols.get(va)
+
+    def get_symbol_at_offset(self, offset: int) -> Optional[str]:
+        """Look up a symbol by file offset."""
+        if not self.shift_engine:
+            return None
+        rva = self.shift_engine._offset_to_rva(offset)
+        if rva is None:
+            return None
+        return self.get_symbol_at_rva(rva)
+
+    def get_nearest_symbol(self, rva: int) -> Optional[Tuple[str, int]]:
+        """Find the nearest symbol at or before the given RVA.
+        Returns (name, offset_from_symbol) or None."""
+        if not self._symbols:
+            return None
+        ib = self.pe_info.get('image_base', 0)
+        target_va = rva + ib
+        best_va = None
+        for va in self._symbols:
+            if va <= target_va:
+                if best_va is None or va > best_va:
+                    best_va = va
+        if best_va is not None:
+            return (self._symbols[best_va], target_va - best_va)
+        return None
+
+    def export_symbol_map(self, output_path: str = None) -> Dict:
+        """
+        Export the current symbol table as a Microsoft .map file.
+        If output_path is None, derives path from the binary filename.
+        """
+        if not self._symbols:
+            return {'success': False, 'error': 'No symbols loaded'}
+
+        if output_path is None:
+            base = os.path.splitext(self.pe_path or 'output')[0]
+            output_path = base + '_ubrt.map'
+
+        ib = self.pe_info.get('image_base', 0)
+        sections = self.pe_info.get('sections', [])
+        content = SymbolUpdater.generate_map_file(
+            self._symbols, ib, sections, output_path)
+        return {
+            'success': True,
+            'path': output_path,
+            'total_symbols': len(self._symbols),
+            'size': len(content),
+        }
+
+    def get_symbol_stats(self) -> Dict:
+        """Get statistics about loaded symbols."""
+        if not self._symbols:
+            return {
+                'loaded': False,
+                'total': 0,
+                'source': None,
+            }
+        ib = self.pe_info.get('image_base', 0)
+        sections = self.pe_info.get('sections', [])
+
+        # Count symbols per section
+        by_section = {}
+        for va in self._symbols:
+            rva = va - ib
+            sec_name = '(header)'
+            for sec in sections:
+                s_rva = sec.get('rva', 0)
+                s_sz = sec.get('vsize', 0)
+                if s_rva <= rva < s_rva + s_sz:
+                    sec_name = sec.get('name', '?')
+                    break
+            by_section[sec_name] = by_section.get(sec_name, 0) + 1
+
+        return {
+            'loaded': True,
+            'total': len(self._symbols),
+            'source': self._symbol_source,
+            'format': self._symbol_meta.get('format', 'unknown'),
+            'by_section': by_section,
         }

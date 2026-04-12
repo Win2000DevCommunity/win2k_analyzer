@@ -8193,6 +8193,13 @@ class UBRTTab(ttk.Frame):
                    command=self._delete_bytes_dialog).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="NOP Sled\u2026",
                    command=self._nop_sled_dialog).pack(side="left", padx=5)
+        ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
+        ttk.Button(btn_frm, text="\U0001F50E  Load Symbols\u2026",
+                   command=self._load_symbols_dialog).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\u2B06  From Exports",
+                   command=self._symbols_from_exports).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4BE  Export .map\u2026",
+                   command=self._export_symbol_map).pack(side="left", padx=5)
 
         # ── Row 2: Info bar (format + ref count + cursor info) ──
         self._info_frm = tk.Frame(self, bg=T["bg"])
@@ -8906,6 +8913,127 @@ class UBRTTab(ttk.Frame):
                 f"total {result.get('total_refs', 0):,}")
         else:
             self.status_var.set(f"\u26A0 {result.get('error')}")
+
+    # ── Symbol Management ─────────────────────────────────────────────
+
+    def _load_symbols_dialog(self):
+        """Browse for a .map / .pdb / .dbg / .sym file and load symbols."""
+        if not self._engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Load Symbol File",
+            filetypes=[
+                ("Symbol Files", "*.map;*.pdb;*.dbg;*.sym"),
+                ("MAP Files", "*.map"),
+                ("PDB Files", "*.pdb"),
+                ("DBG Files", "*.dbg"),
+                ("SYM Files", "*.sym"),
+                ("All Files", "*.*"),
+            ])
+        if not path:
+            return
+
+        self.status_var.set("\u23F3 Loading symbols\u2026")
+        result = self._engine.load_symbols(path)
+
+        tab = self.output.add_tab(f"Symbols: {os.path.basename(path)}")
+        out = lambda t, tag="": output_write(tab, t, tag)
+        out(f"\n{'='*72}\n", "title")
+        out(f"  Symbol Loader\n", "title")
+        out(f"{'='*72}\n\n", "title")
+
+        if result.get('success'):
+            out(f"  Source:     {path}\n")
+            out(f"  Format:    {result.get('format', '?')}\n")
+            out(f"  Loaded:    {result['total_symbols']:,} symbols\n\n", "ok")
+
+            stats = self._engine.get_symbol_stats()
+            if stats.get('by_section'):
+                out(f"  By Section:\n", "heading")
+                for sec, cnt in sorted(stats['by_section'].items(), key=lambda x: -x[1]):
+                    out(f"    {sec:<16} {cnt:>7,}\n")
+
+            # Show first 50 symbols as sample
+            symbols = self._engine.get_symbols()
+            out(f"\n  Sample (first 50):\n", "heading")
+            out(f"  {'VA':<18} {'Name'}\n", "dim")
+            out(f"  {'─'*18} {'─'*40}\n", "dim")
+            for i, (va, name) in enumerate(sorted(symbols.items())):
+                if i >= 50:
+                    out(f"\n  \u2026 and {len(symbols)-50:,} more symbols\n", "dim")
+                    break
+                out(f"  0x{va:016X}  {name}\n")
+
+            out(f"\n  \u2714 Symbols loaded. They will auto-update on insert/delete operations.\n", "ok")
+            out(f"  \u2022 Use 'Export .map' to save the updated symbol table.\n", "dim")
+            self.status_var.set(
+                f"\u2714 Loaded {result['total_symbols']:,} symbols from {os.path.basename(path)}")
+        else:
+            out(f"  \u26A0 Failed: {result.get('error', 'Unknown error')}\n", "error")
+            self.status_var.set(f"\u26A0 Symbol load failed: {result.get('error')}")
+
+    def _symbols_from_exports(self):
+        """Build symbol table from the binary's own export table."""
+        if not self._engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+
+        result = self._engine.load_symbols_from_exports()
+
+        tab = self.output.add_tab("Symbols from Exports")
+        out = lambda t, tag="": output_write(tab, t, tag)
+        out(f"\n{'='*72}\n", "title")
+        out(f"  Symbols from Export Table\n", "title")
+        out(f"{'='*72}\n\n", "title")
+
+        if result.get('success'):
+            out(f"  Extracted: {result['total_symbols']:,} symbols from exports\n\n", "ok")
+
+            symbols = self._engine.get_symbols()
+            out(f"  {'VA':<18} {'Name'}\n", "dim")
+            out(f"  {'─'*18} {'─'*40}\n", "dim")
+            for i, (va, name) in enumerate(sorted(symbols.items())):
+                if i >= 100:
+                    out(f"\n  \u2026 and {len(symbols)-100:,} more symbols\n", "dim")
+                    break
+                out(f"  0x{va:016X}  {name}\n")
+
+            out(f"\n  \u2714 Symbols will auto-update on insert/delete.\n", "ok")
+            self.status_var.set(
+                f"\u2714 {result['total_symbols']:,} symbols extracted from exports")
+        else:
+            out(f"  \u26A0 {result.get('error', 'Failed')}\n", "error")
+            self.status_var.set(f"\u26A0 {result.get('error')}")
+
+    def _export_symbol_map(self):
+        """Export current symbols as a Microsoft .map file."""
+        if not self._engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+
+        symbols = self._engine.get_symbols()
+        if not symbols:
+            self.status_var.set("\u26A0 No symbols loaded \u2014 load symbols or extract from exports first")
+            return
+
+        basename = os.path.splitext(
+            os.path.basename(self._engine.pe_path or "output"))[0]
+        out_path = filedialog.asksaveasfilename(
+            title="Export Symbol Map",
+            defaultextension=".map",
+            initialfile=f"{basename}_ubrt.map",
+            filetypes=[("MAP Files", "*.map"), ("All Files", "*.*")])
+        if not out_path:
+            return
+
+        result = self._engine.export_symbol_map(out_path)
+        if result.get('success'):
+            self.status_var.set(
+                f"\U0001F4BE Exported {result['total_symbols']:,} symbols to {os.path.basename(out_path)}")
+        else:
+            self.status_var.set(f"\u26A0 Export failed: {result.get('error')}")
 
 
 if __name__ == '__main__':
