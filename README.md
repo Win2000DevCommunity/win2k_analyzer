@@ -4,7 +4,12 @@
 
 Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (18 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.7 — Symbol Recovery for Patched Binaries:**
+**NEW in v3.8 — New-Section Symbol Discovery & PDB Injection:**
+- **Discover symbols in new sections:** When a patcher adds sections (like `.sec21`), the engine automatically discovers and labels structural elements — section boundary markers (`__sec21_start`/`__sec21_end`), PE data directory entries (`__PE_EXPORT_Directory`), and export table structures (`__ExportAddressTable`, `__ExportNameTable`, `__ExportOrdinalTable`). Executable new sections are also scanned for function prologues.
+- **PDB symbol injection:** The "Export PDB" button now injects discovered new-section symbols as S_PUB32_16t records directly into the PDB 2.0 GSI stream — WinDbg shows them immediately, no MAP file conversion needed. The MSF root directory stream size is updated automatically.
+- **Tested with real patched kernel:** 5 symbols injected into `.sec21` of ntkrnlpa.pdb, all verified readable by the symbol loader (7,690 total symbols in patched PDB).
+
+**Previously in v3.7 — Symbol Recovery for Patched Binaries:**
 - **Tab 18 — Symbol Recovery:** Load an original binary with its symbols (.pdb/.dbg/.map) and a patched binary that has different sections, sizes, or layout — the engine diffs the PE structures, matches sections by name+order, computes per-section VA deltas, and remaps every symbol to the patched address space. Sortable/filterable Treeview shows all recovered symbols with original VA, recovered VA, delta, section, confidence, and status. Double-click any symbol to manually edit its address, or select multiple symbols for bulk offset adjustment.
 - **Section-aware diff engine:** Handles duplicate section names (PAGE, PAGEVRFY, PAGEKD, PAGELK appear twice in ntoskrnl), new sections added by patchers, varying VA shifts per section (from +0 to +69,760), and VirtualSize changes.
 - **Export recovered symbols:** Save as Microsoft-format `.map` file or create a patched copy of the original PDB with section-specific address shifts applied.
