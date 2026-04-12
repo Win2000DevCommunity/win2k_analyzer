@@ -8827,27 +8827,41 @@ class UBRTTab(ttk.Frame):
         if not out_path:
             return
         try:
-            # Backup binary if overwriting an existing file
             backups = []
+            src_path = self._engine.pe_path or ''
+            src_base = os.path.splitext(src_path)[0]
+            out_base = os.path.splitext(out_path)[0]
+            already_backed = set()
+
+            # Backup the output file if it already exists (overwrite protection)
             bak = self._backup_file(out_path)
             if bak:
                 backups.append(bak)
+                already_backed.add(os.path.abspath(out_path))
 
-            # Backup .pdb / .dbg alongside the binary (same base name)
-            out_base = os.path.splitext(out_path)[0]
+            # Backup .pdb / .dbg next to the SOURCE binary
             for ext in ('.pdb', '.dbg'):
-                sym_path = out_base + ext
-                bak = self._backup_file(sym_path)
-                if bak:
-                    backups.append(bak)
+                sym_path = src_base + ext
+                if os.path.abspath(sym_path) not in already_backed:
+                    bak = self._backup_file(sym_path)
+                    if bak:
+                        backups.append(bak)
+                        already_backed.add(os.path.abspath(sym_path))
 
-            # Also backup symbol source if it's in the same directory
+            # Also backup .pdb / .dbg next to the OUTPUT path (if different dir)
+            if os.path.dirname(os.path.abspath(out_path)) != os.path.dirname(os.path.abspath(src_path)):
+                for ext in ('.pdb', '.dbg'):
+                    sym_path = out_base + ext
+                    if os.path.abspath(sym_path) not in already_backed:
+                        bak = self._backup_file(sym_path)
+                        if bak:
+                            backups.append(bak)
+                            already_backed.add(os.path.abspath(sym_path))
+
+            # Backup loaded symbol source if not already covered
             if self._engine._symbol_source:
                 sym_src = self._engine._symbol_source
-                if (os.path.dirname(os.path.abspath(sym_src))
-                        == os.path.dirname(os.path.abspath(out_path))
-                        and os.path.abspath(sym_src) not in
-                        [os.path.abspath(out_base + e) for e in ('.pdb', '.dbg')]):
+                if os.path.abspath(sym_src) not in already_backed:
                     bak = self._backup_file(sym_src)
                     if bak:
                         backups.append(bak)

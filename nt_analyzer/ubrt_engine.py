@@ -5028,10 +5028,23 @@ class ShiftEngine(BaseShiftEngine):
             pe_out = pefile.PE(data=bytes(self.buffer))
             pe_out.OPTIONAL_HEADER.CheckSum = pe_out.generate_checksum()
             final = pe_out.write()
+            pe_out.close()
         except Exception:
             final = bytes(self.buffer)
+
+        # Close our PE handle before writing — prevents Errno 22 on Windows
+        # when saving to the same path as the source binary.
+        same_file = (os.path.abspath(output_path) ==
+                     os.path.abspath(self.pe_path))
+        if same_file:
+            self.pe.close()
+
         with open(output_path, 'wb') as f:
             f.write(final)
+
+        # Re-open pefile from the new data so engine stays usable
+        if same_file:
+            self.pe = pefile.PE(data=bytes(self.buffer))
 
     # ── Internal: Reference Recalculation ─────────────────────────────
 
