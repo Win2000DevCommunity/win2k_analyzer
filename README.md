@@ -2,9 +2,15 @@
 
 **The ultimate reverse-engineering and binary compatibility toolkit for porting ReactOS components to Windows 2000 SP4.**
 
-Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (17 tabs)** and a **full CLI (27 commands)**.
+Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (18 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.6 — Symbol-Aware Binary Rewriting:**
+**NEW in v3.7 — Symbol Recovery for Patched Binaries:**
+- **Tab 18 — Symbol Recovery:** Load an original binary with its symbols (.pdb/.dbg/.map) and a patched binary that has different sections, sizes, or layout — the engine diffs the PE structures, matches sections by name+order, computes per-section VA deltas, and remaps every symbol to the patched address space. Sortable/filterable Treeview shows all recovered symbols with original VA, recovered VA, delta, section, confidence, and status. Double-click any symbol to manually edit its address, or select multiple symbols for bulk offset adjustment.
+- **Section-aware diff engine:** Handles duplicate section names (PAGE, PAGEVRFY, PAGEKD, PAGELK appear twice in ntoskrnl), new sections added by patchers, varying VA shifts per section (from +0 to +69,760), and VirtualSize changes.
+- **Export recovered symbols:** Save as Microsoft-format `.map` file or create a patched copy of the original PDB with section-specific address shifts applied.
+- **Tested with real Win2K kernel:** Original ntkrnlpa.exe (21 sections, 7,687 PDB symbols) vs patched (22 sections, +69KB, new `.sec21`): **7,686/7,687 symbols recovered (99.99%)** with correct per-section deltas.
+
+**Previously in v3.6 — Symbol-Aware Binary Rewriting:**
 - **Direct .pdb/.dbg patching:** When you save a modified binary, UBRT now patches the actual symbol files in-place — PDB 2.0 symbol offsets (S_PUB32_16t records in GSI stream) and DBG files (COFF symbol tables, FPO entries, section headers) are all shifted to match the new binary layout. No more stale symbol addresses.
 - **Full hex editor:** The UBRT tab now includes a proper hex editor widget (~480 lines) with offset display, hex+ASCII columns, keyboard navigation, and selection — replaces the old text-entry fields.
 - **Symbol lifecycle management:** Load Symbols / From Exports / Export .map buttons in the UBRT tab. Symbols are automatically shifted in memory after every insert/delete operation. On save, a Microsoft-format .map file with correct shifted addresses is generated alongside the binary.
@@ -75,7 +81,8 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 - [Patching NT System Internals (.sys / Kernel-Mode Binaries)](#patching-nt-system-internals-sys--kernel-mode-binaries)
 - [Kernel Debugger — Live Kernel State](#kernel-debugger--live-kernel-state)
 - [UBRT Engine — Universal Binary Rewriting](#ubrt-engine--universal-binary-rewriting)
-- [GUI Tab Reference (All 17 Tabs)](#gui-tab-reference-all-17-tabs)
+- [What's New in v3.7 — Symbol Recovery](#whats-new-in-v37--symbol-recovery-for-patched-binaries)
+- [GUI Tab Reference (All 18 Tabs)](#gui-tab-reference-all-18-tabs)
 - [Deep Analyzer — IDA Pro-Level Analysis Without Symbols](#deep-analyzer--ida-pro-level-analysis-without-symbols)
 - [Symbol Loader — Enrich Disassembly With Debug Info](#symbol-loader--enrich-disassembly-with-debug-info)
 - [Decompiler Modes — Pseudo-C, Assembly, Hex Dump](#decompiler-modes--pseudo-c-assembly-hex-dump)
@@ -103,6 +110,65 @@ This tool gives you everything in one place:
 7. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
 8. **Scan** — System-wide cross-reference scanning: find every PE in a directory that imports or calls a given function
 9. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+
+---
+
+## What's New in v3.7 — Symbol Recovery for Patched Binaries
+
+### The Problem
+
+Many patched Windows 2000 kernel binaries (ntoskrnl, ntkrnlpa, hal, etc.) lose their debug symbol mapping after modification — sections get moved, new sections are inserted, VirtualAddresses shift by varying amounts. The original .pdb/.dbg files still reference the old layout, making debugging impossible.
+
+### The Solution: Tab 18 — Symbol Recovery
+
+Load the **original binary + its symbols** and the **patched binary**, and the engine:
+
+1. **Diffs the PE section tables** — matches sections by name and order, handles duplicate names (PAGE appears twice in ntoskrnl), detects new/removed sections
+2. **Computes per-section VA deltas** — each section can shift by a different amount (e.g., .text: +0, PAGE: +256, PAGEVRFY: +1024, INIT: +1088)
+3. **Remaps every symbol** — for each symbol, finds its owning section in the original, applies that section's delta to compute the recovered address
+4. **Reports confidence** — symbols in sections with large VirtualSize changes get lower confidence scores
+
+### Python API
+
+```python
+from nt_analyzer.symbol_recovery import SymbolRecoveryEngine
+
+engine = SymbolRecoveryEngine()
+engine.diff_binaries("original/ntkrnlpa.exe", "patched/ntkrnlpa.exe")
+engine.load_symbols("original/ntkrnlpa.pdb", pe_path="original/ntkrnlpa.exe")
+engine.recover_symbols()
+
+stats = engine.get_stats()
+# {'total': 7687, 'ok': 7686, 'high_confidence': 7553, 'success_rate': 0.9999}
+
+# Export as .map file
+engine.export_map_file("patched/ntkrnlpa.map")
+
+# Or create a patched PDB
+engine.export_pdb("original/ntkrnlpa.pdb", "patched/ntkrnlpa.pdb",
+                  orig_pe_path="original/ntkrnlpa.exe")
+```
+
+### Real-World Test Results
+
+```
+Original: ntkrnlpa.exe — 21 sections, 1,713,280 bytes, ImageBase 0x400000
+Patched:  ntkrnlpa.exe — 22 sections, 1,783,104 bytes (+69,824), new .sec21 section
+Symbols:  ntkrnlpa.pdb — PDB 2.0, 7,687 public symbols
+
+Per-section recovery:
+  .text       : 3,211 symbols, VA delta     +0
+  POOLCODE    :     3 symbols, VA delta   +192
+  .data       : 1,576 symbols, VA delta   +192
+  PAGELK      :   134 symbols, VA delta   +192
+  PAGE        : 1,940 symbols, VA delta   +256
+  PAGEVRFY    :   130 symbols, VA delta +1,024
+  PAGEKD      :    79 symbols, VA delta +1,024
+  INIT        :   357 symbols, VA delta +1,088
+  (+ 13 more sections)
+
+Total: 7,686/7,687 recovered (99.99%), 7,553 high-confidence (98.3%)
+```
 
 ---
 
@@ -1439,7 +1505,7 @@ A full 13-scenario debug test is included in [`ntpower_debug_results.txt`](ntpow
 
 ---
 
-## GUI Tab Reference (All 17 Tabs)
+## GUI Tab Reference (All 18 Tabs)
 
 ### Tab 1: Exports / Imports
 - Browse to any PE file (.dll, .sys, .exe, .cpl)
@@ -1612,6 +1678,32 @@ Universal Binary Rewriting Tool — treat any binary like a text file. Insert, d
 - **Resource protection** — warns when a shift operation falls inside `.rsrc` to prevent corruption of the resource tree's internal relative offsets
 - **Progress dialogs** — all long-running operations show real-time progress with percentage and cancel button
 - **Tabbed output** — each analysis opens in a new closeable tab
+
+### Tab 18: 🔄 Symbol Recovery (NEW)
+Recover symbols for patched binaries that lost their debug info — the inverse of UBRT's symbol patching:
+
+- **File pickers** — Original Binary + Symbols (.pdb/.dbg/.map/.sym) + Patched Binary
+- **Analyze Diff** — compares PE section tables, matches sections by name+order (handles duplicate names like PAGE, PAGEVRFY, PAGEKD, PAGELK), computes per-section VA deltas, detects new/removed sections, and reports all PE header changes (ImageBase, EntryPoint, SizeOfImage, file size, section count)
+- **Recover Symbols** — remaps every symbol from original to patched address space using section-level VA deltas. Each symbol gets: original VA, recovered VA, delta, owning section, confidence percentage, and status (ok/unmapped/section_removed/outside)
+- **Sortable Treeview** — click any column header to sort by name, address, delta, section, confidence, or status
+- **Filter bar** — live text filter by symbol name + dropdown filter by status
+- **Edit symbols** — double-click any symbol to manually set its recovered VA, or select multiple symbols and apply a bulk offset
+- **Export .map** — save recovered symbols as a Microsoft-format symbol map file
+- **Export PDB** — create a patched copy of the original PDB with per-section address shifts applied (processes sections from highest VA to lowest to avoid double-shifting)
+- **Change log** — detailed output showing section mapping table, per-section symbol counts, recovery statistics, and confidence breakdown
+
+**Backend:** `nt_analyzer/symbol_recovery.py` — `SymbolRecoveryEngine` with `diff_binaries()`, `recover_symbols()`, `export_map_file()`, `export_pdb()`, `get_stats()`
+
+**Real-world test result:**
+```
+Original: ntkrnlpa.exe (21 sections, 1,713,280 bytes)
+Patched:  ntkrnlpa.exe (22 sections, 1,783,104 bytes, +69,824 bytes, new .sec21)
+Symbols:  ntkrnlpa.pdb (PDB 2.0, 7,687 symbols)
+
+Recovery: 7,686/7,687 symbols recovered (99.99%)
+High confidence: 7,553 symbols (98.3%)
+Per-section VA deltas: .text +0, POOLCODE +192, PAGE +256, PAGEVRFY +1024, INIT +1088, .rsrc +66560
+```
 
 ---
 
@@ -2080,11 +2172,11 @@ for name, code in functions.items():
 ```
 win2k_analyzer/
 ├── win2k_analyzer.py          # CLI frontend (27 commands)
-├── win2k_gui.py               # GUI frontend (17 tabs, dark theme, tabbed output)
+├── win2k_gui.py               # GUI frontend (18 tabs, dark theme, tabbed output)
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
 │
-├── nt_analyzer/               # Core analysis package (18 modules)
+├── nt_analyzer/               # Core analysis package (19 modules)
 │   ├── __init__.py            # Package init
 │   ├── pe_analyzer.py         # PE export/import/header analysis
 │   ├── syscall_extractor.py   # Syscall number extraction from ntdll stubs
@@ -2102,7 +2194,8 @@ win2k_analyzer/
 │   ├── symbol_loader.py       # Multi-format symbol loader (.map/.pdb/.dbg/.sym)
 │   ├── emulator.py            # Unicorn-based kernel function emulator with API mocking
 │   ├── kernel_debugger.py     # Live kernel-state debugger: multi-PE loader, breakpoints, stepping
-│   └── ubrt_engine.py         # Universal Binary Rewriting Tool: PE/ELF/Mach-O shift engine, 15-pass ref analysis, .pdb/.dbg symbol patching
+│   ├── ubrt_engine.py         # Universal Binary Rewriting Tool: PE/ELF/Mach-O shift engine, 15-pass ref analysis, .pdb/.dbg symbol patching
+│   └── symbol_recovery.py     # Symbol recovery engine: PE diff, section matching, per-section VA remapping for patched binaries
 │
 ├── generated_headers/         # Output: generated C header files
 │   ├── peb_win2k.h

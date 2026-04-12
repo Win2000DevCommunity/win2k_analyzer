@@ -353,6 +353,7 @@ class App(tk.Tk):
         self.tab_patcher    = PEPatcherTab(self.nb, self)
         self.tab_kdbg       = KernelDebuggerTab(self.nb, self)
         self.tab_ubrt       = UBRTTab(self.nb, self)
+        self.tab_symrecov   = SymbolRecoveryTab(self.nb, self)
 
         tabs = [
             (self.tab_exports,    " Exports "),
@@ -372,6 +373,7 @@ class App(tk.Tk):
             (self.tab_patcher,    " PE Patch "),
             (self.tab_kdbg,       " \U0001F41E KDebug "),
             (self.tab_ubrt,       " \u2699 UBRT "),
+            (self.tab_symrecov,   " \U0001F504 SymRecov "),
         ]
         for tab, text in tabs:
             self.nb.add(tab, text=text)
@@ -9151,6 +9153,618 @@ class UBRTTab(ttk.Frame):
                 f"\U0001F4BE Exported {result['total_symbols']:,} symbols to {os.path.basename(out_path)}")
         else:
             self.status_var.set(f"\u26A0 Export failed: {result.get('error')}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Tab 18: Symbol Recovery
+# ══════════════════════════════════════════════════════════════════════════
+
+class SymbolRecoveryTab(ttk.Frame):
+    """Recover symbols for a patched binary by diffing it against the original + its symbols."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, style="TFrame")
+        self.app = app
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(5, weight=1)   # symbol table
+        self.rowconfigure(7, weight=1)   # output log
+        self._engine = None
+        self._recovered = []
+        self._tree_items = {}  # iid -> RecoveredSymbol
+
+        # ── Row 0: Original Binary ──
+        fp0 = tk.Frame(self, bg=T["bg"])
+        fp0.grid(row=0, column=0, sticky="ew", padx=12, pady=(5, 2))
+        fp0.columnconfigure(1, weight=1)
+        ttk.Label(fp0, text="Original Binary:", width=16, anchor="e").grid(row=0, column=0, padx=(0, 8))
+        self._orig_var = tk.StringVar()
+        self._orig_ent = PlaceholderEntry(fp0,
+            placeholder="Original PE binary (e.g. ntkrnlpa.exe)",
+            textvariable=self._orig_var,
+            bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=5)
+        self._orig_ent.grid(row=0, column=1, sticky="ew")
+        app.register_placeholder(self._orig_ent)
+        ttk.Button(fp0, text="Browse \u2026",
+                   command=lambda: self._browse('orig')).grid(row=0, column=2, padx=(8, 0))
+
+        # Symbol file on same row
+        ttk.Label(fp0, text="Symbols:", width=10, anchor="e").grid(row=0, column=3, padx=(12, 8))
+        self._sym_var = tk.StringVar()
+        self._sym_ent = PlaceholderEntry(fp0,
+            placeholder=".pdb / .dbg / .map / .sym",
+            textvariable=self._sym_var,
+            bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=5)
+        self._sym_ent.grid(row=0, column=4, sticky="ew")
+        fp0.columnconfigure(4, weight=1)
+        app.register_placeholder(self._sym_ent)
+        ttk.Button(fp0, text="Browse \u2026",
+                   command=lambda: self._browse('sym')).grid(row=0, column=5, padx=(8, 0))
+
+        # ── Row 1: Patched Binary ──
+        fp1 = tk.Frame(self, bg=T["bg"])
+        fp1.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 5))
+        fp1.columnconfigure(1, weight=1)
+        ttk.Label(fp1, text="Patched Binary:", width=16, anchor="e").grid(row=0, column=0, padx=(0, 8))
+        self._patch_var = tk.StringVar()
+        self._patch_ent = PlaceholderEntry(fp1,
+            placeholder="Patched PE binary (modified version)",
+            textvariable=self._patch_var,
+            bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+            font=("Consolas", 10), relief="flat", bd=5)
+        self._patch_ent.grid(row=0, column=1, sticky="ew")
+        app.register_placeholder(self._patch_ent)
+        ttk.Button(fp1, text="Browse \u2026",
+                   command=lambda: self._browse('patch')).grid(row=0, column=2, padx=(8, 0))
+
+        # ── Row 2: Action buttons ──
+        btn_frm = make_button_bar(self, row=2)
+        ttk.Button(btn_frm, text="\U0001F50D  Analyze Diff",
+                   style="Accent.TButton",
+                   command=self._analyze_diff).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\u2699  Recover Symbols",
+                   command=self._recover_symbols).pack(side="left", padx=5)
+        ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
+        ttk.Button(btn_frm, text="\U0001F4BE  Export .map\u2026",
+                   command=self._export_map).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\U0001F4BE  Export PDB\u2026",
+                   command=self._export_pdb).pack(side="left", padx=5)
+        ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
+        ttk.Button(btn_frm, text="\u270F  Edit Selected",
+                   command=self._edit_selected).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\u2716  Clear",
+                   command=self._clear_all).pack(side="left", padx=5)
+
+        # ── Row 3: Section label for symbol table ──
+        make_section_label(self, "Recovered Symbol Table", row=3)
+
+        # ── Row 4: Filter bar ──
+        filt_frm = tk.Frame(self, bg=T["bg"])
+        filt_frm.grid(row=4, column=0, sticky="ew", padx=12, pady=2)
+        ttk.Label(filt_frm, text="Filter:").pack(side="left", padx=(0, 4))
+        self._filter_var = tk.StringVar()
+        self._filter_var.trace_add('write', lambda *_: self._apply_filter())
+        filt_ent = tk.Entry(filt_frm, textvariable=self._filter_var,
+                            bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                            font=("Consolas", 10), relief="flat", bd=5, width=30)
+        filt_ent.pack(side="left", padx=4)
+        ttk.Label(filt_frm, text="Status:").pack(side="left", padx=(12, 4))
+        self._status_filter = tk.StringVar(value="all")
+        status_cb = ttk.Combobox(filt_frm, textvariable=self._status_filter,
+                                 values=["all", "ok", "unmapped", "section_removed", "outside"],
+                                 width=16, state="readonly")
+        status_cb.pack(side="left", padx=4)
+        status_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filter())
+        self._count_lbl = tk.Label(filt_frm, text="", bg=T["bg"], fg=T["fg_dim"],
+                                   font=("Segoe UI", 9))
+        self._count_lbl.pack(side="right", padx=8)
+
+        # ── Row 5: Treeview for symbols ──
+        tree_frm = tk.Frame(self, bg=T["bg"])
+        tree_frm.grid(row=5, column=0, sticky="nsew", padx=12, pady=(0, 4))
+        tree_frm.columnconfigure(0, weight=1)
+        tree_frm.rowconfigure(0, weight=1)
+
+        cols = ("name", "orig_va", "recovered_va", "delta", "section", "confidence", "status")
+        self._tree = ttk.Treeview(tree_frm, columns=cols, show="headings",
+                                  selectmode="extended")
+        self._tree.heading("name", text="Symbol Name", command=lambda: self._sort_tree("name"))
+        self._tree.heading("orig_va", text="Original VA", command=lambda: self._sort_tree("orig_va"))
+        self._tree.heading("recovered_va", text="Recovered VA", command=lambda: self._sort_tree("recovered_va"))
+        self._tree.heading("delta", text="Delta", command=lambda: self._sort_tree("delta"))
+        self._tree.heading("section", text="Section", command=lambda: self._sort_tree("section"))
+        self._tree.heading("confidence", text="Conf%", command=lambda: self._sort_tree("confidence"))
+        self._tree.heading("status", text="Status", command=lambda: self._sort_tree("status"))
+
+        self._tree.column("name", width=250, minwidth=120)
+        self._tree.column("orig_va", width=110, minwidth=80, anchor="e")
+        self._tree.column("recovered_va", width=110, minwidth=80, anchor="e")
+        self._tree.column("delta", width=80, minwidth=60, anchor="e")
+        self._tree.column("section", width=100, minwidth=60)
+        self._tree.column("confidence", width=60, minwidth=40, anchor="center")
+        self._tree.column("status", width=90, minwidth=60, anchor="center")
+
+        vsb = ttk.Scrollbar(tree_frm, orient="vertical", command=self._tree.yview)
+        hsb = ttk.Scrollbar(tree_frm, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        # Double-click to edit
+        self._tree.bind("<Double-1>", lambda e: self._edit_selected())
+
+        # ── Row 6: Status bar ──
+        self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
+            self, "\u2022 Load original binary + symbols and patched binary, then Analyze Diff", row=6)
+
+        # ── Row 7: Output log ──
+        make_section_label(self, "Change Log / Output", row=7)
+        # Re-grid row 7 label and output at correct rows
+        self.rowconfigure(8, weight=1)
+        self.output = TabbedOutput(self)
+        self.output.grid(row=8, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        self._sort_col = None
+        self._sort_reverse = False
+
+    # ── File Browsers ─────────────────────────────────────────────────
+
+    def _browse(self, which):
+        if which == 'sym':
+            ft = [("Symbol Files", "*.pdb;*.dbg;*.map;*.sym"),
+                  ("PDB Files", "*.pdb"), ("DBG Files", "*.dbg"),
+                  ("MAP Files", "*.map"), ("All Files", "*.*")]
+        else:
+            ft = [("PE Files", "*.dll;*.sys;*.exe;*.cpl;*.drv;*.ocx;*.scr"),
+                  ("All Files", "*.*")]
+        path = filedialog.askopenfilename(filetypes=ft)
+        if not path:
+            return
+        ent = {'orig': self._orig_ent, 'sym': self._sym_ent, 'patch': self._patch_ent}[which]
+        ent.set_value(path)
+
+    def _get_paths(self):
+        """Return (orig_path, sym_path, patched_path) or show error and return None."""
+        orig = self._orig_ent.get_value()
+        sym = self._sym_ent.get_value()
+        patched = self._patch_ent.get_value()
+        if not orig or not patched:
+            messagebox.showwarning("Missing files",
+                "Select both the Original Binary and Patched Binary.")
+            return None
+        return orig, sym, patched
+
+    # ── Analyze Diff ──────────────────────────────────────────────────
+
+    def _analyze_diff(self):
+        paths = self._get_paths()
+        if not paths:
+            return
+        orig, sym, patched = paths
+        self.status_var.set("\u23F3 Analyzing differences...")
+        self.output.new_tab("Diff Analysis")
+
+        def work():
+            from nt_analyzer.symbol_recovery import SymbolRecoveryEngine
+            engine = SymbolRecoveryEngine()
+            diff = engine.diff_binaries(orig, patched)
+            sym_count = 0
+            sym_meta = {}
+            if sym:
+                sym_count, sym_meta = engine.load_symbols(sym, pe_path=orig)
+            return engine, diff, sym_count, sym_meta
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            engine, diff, sym_count, sym_meta = result
+            self._engine = engine
+            self._render_diff(diff, sym_count, sym_meta)
+            msg = f"\u2705 Diff complete: {len(diff.matches)} matched, {len(diff.new_sections)} new, {len(diff.removed_sections)} removed sections"
+            if sym_count:
+                msg += f" | {sym_count:,} symbols loaded"
+            self.status_var.set(msg)
+
+        run_with_progress(self, work, done)
+
+    def _render_diff(self, diff, sym_count, sym_meta):
+        out = self.output
+
+        output_write(out, "  BINARY DIFF ANALYSIS\n", "title")
+        output_write(out, "  " + "\u2500" * 60 + "\n\n", "dim")
+
+        # Header changes
+        if diff.header_changes:
+            output_write(out, "  \u2500\u2500 PE Header Changes \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n", "heading")
+            for ch in diff.header_changes:
+                output_write(out, f"    \u2022 {ch}\n", "warn")
+            output_write(out, "\n")
+
+        # Section comparison table
+        output_write(out, "  \u2500\u2500 Section Mapping \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n", "heading")
+        output_write(out, f"    {'Original':<12s} {'VA':>10s} {'VSize':>10s}  \u2192  {'Patched':<12s} {'VA':>10s} {'VSize':>10s} {'Delta':>8s}\n", "dim")
+        output_write(out, "    " + "\u2500" * 80 + "\n", "dim")
+
+        for m in diff.matches:
+            tag = "ok" if m.va_delta == 0 else "warn"
+            output_write(out,
+                f"    {m.orig.name:<12s} 0x{m.orig.va:08X} 0x{m.orig.vsize:08X}"
+                f"  \u2192  {m.patched.name:<12s} 0x{m.patched.va:08X} 0x{m.patched.vsize:08X}"
+                f" {m.va_delta:+8d}\n", tag)
+
+        if diff.new_sections:
+            output_write(out, "\n    NEW sections in patched binary:\n", "green")
+            for s in diff.new_sections:
+                output_write(out,
+                    f"      + {s.name:<12s} VA=0x{s.va:08X} VSize=0x{s.vsize:08X}\n", "green")
+
+        if diff.removed_sections:
+            output_write(out, "\n    REMOVED sections (in original only):\n", "error")
+            for s in diff.removed_sections:
+                output_write(out,
+                    f"      - {s.name:<12s} VA=0x{s.va:08X} VSize=0x{s.vsize:08X}\n", "error")
+
+        # Symbol info
+        if sym_count:
+            output_write(out, f"\n  \u2500\u2500 Symbols \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n", "heading")
+            fmt = sym_meta.get('format', 'unknown')
+            output_write(out, f"    Format: {fmt}\n")
+            output_write(out, f"    Total symbols: {sym_count:,}\n", "ok")
+            output_write(out, f"    Source: {sym_meta.get('source', '?')}\n", "dim")
+            output_write(out, "\n    \u2192 Click 'Recover Symbols' to remap addresses to the patched binary.\n", "accent")
+
+        output_write(out, "\n")
+
+    # ── Symbol Recovery ───────────────────────────────────────────────
+
+    def _recover_symbols(self):
+        if self._engine is None:
+            messagebox.showwarning("No diff", "Run 'Analyze Diff' first.")
+            return
+        if not self._engine.orig_symbols:
+            messagebox.showwarning("No symbols", "Load symbols in the Analyze Diff step first.\nMake sure a symbol file (.pdb/.dbg/.map) is selected.")
+            return
+
+        self.status_var.set("\u23F3 Recovering symbols...")
+        orig_path = self._orig_ent.get_value()
+        self.output.new_tab("Recovery")
+
+        def work():
+            return self._engine.recover_symbols(orig_pe_path=orig_path)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C Error: {result}")
+                output_write(self.output, f"ERROR: {result}\n", "error")
+                return
+            self._recovered = result
+            self._populate_tree(result)
+            self._render_recovery_stats(result)
+            stats = self._engine.get_stats()
+            self.status_var.set(
+                f"\u2705 Recovered {stats.get('ok',0):,}/{stats.get('total',0):,} symbols "
+                f"({stats.get('success_rate',0):.1%} success rate)")
+
+        run_with_progress(self, work, done)
+
+    def _populate_tree(self, symbols):
+        """Fill the Treeview with recovered symbols."""
+        self._tree.delete(*self._tree.get_children())
+        self._tree_items.clear()
+        for sym in symbols:
+            delta = sym.recovered_va - sym.orig_va
+            conf_pct = f"{sym.confidence * 100:.0f}%"
+            iid = self._tree.insert("", "end", values=(
+                sym.name,
+                f"0x{sym.orig_va:08X}",
+                f"0x{sym.recovered_va:08X}",
+                f"{delta:+d}",
+                sym.section_name,
+                conf_pct,
+                sym.status,
+            ))
+            self._tree_items[iid] = sym
+        self._count_lbl.config(text=f"{len(symbols):,} symbols")
+
+    def _render_recovery_stats(self, symbols):
+        out = self.output
+        stats = self._engine.get_stats()
+
+        output_write(out, "  SYMBOL RECOVERY RESULTS\n", "title")
+        output_write(out, "  " + "\u2500" * 60 + "\n\n", "dim")
+
+        total = stats.get('total', 0)
+        ok = stats.get('ok', 0)
+        output_write(out, f"    Total symbols:    {total:,}\n")
+        output_write(out, f"    Recovered (OK):   {ok:,}\n", "ok")
+        output_write(out, f"    High confidence:  {stats.get('high_confidence', 0):,}\n", "ok")
+
+        unmapped = stats.get('unmapped', 0)
+        if unmapped:
+            output_write(out, f"    Unmapped:         {unmapped:,}\n", "warn")
+        removed = stats.get('section_removed', 0)
+        if removed:
+            output_write(out, f"    Section removed:  {removed:,}\n", "error")
+        outside = stats.get('outside', 0)
+        if outside:
+            output_write(out, f"    Outside sections: {outside:,}\n", "warn")
+
+        rate = stats.get('success_rate', 0)
+        tag = "ok" if rate >= 0.9 else ("warn" if rate >= 0.5 else "error")
+        output_write(out, f"\n    Success rate: {rate:.1%}\n", tag)
+
+        # Per-section delta summary
+        diff = self._engine.diff
+        if diff and diff.matches:
+            output_write(out, f"\n  \u2500\u2500 Per-Section Deltas \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n", "heading")
+            for m in diff.matches:
+                tag = "ok" if m.va_delta == 0 else "warn"
+                syms_in_sec = sum(1 for s in symbols
+                                  if s.section_index == m.orig.index and s.status == 'ok')
+                output_write(out,
+                    f"    {m.orig.name:<12s}: VA delta {m.va_delta:+6d}, "
+                    f"VSize delta {m.vsize_delta:+6d}, "
+                    f"{syms_in_sec:,} symbols shifted\n", tag)
+
+        output_write(out, "\n    \u2192 Use 'Export .map' or 'Export PDB' to save recovered symbols.\n", "accent")
+        output_write(out, "\n")
+
+    # ── Filtering & Sorting ───────────────────────────────────────────
+
+    def _apply_filter(self):
+        """Filter treeview based on name filter and status filter."""
+        name_filter = self._filter_var.get().lower()
+        status_filter = self._status_filter.get()
+        visible = 0
+        for iid, sym in self._tree_items.items():
+            show = True
+            if name_filter and name_filter not in sym.name.lower():
+                show = False
+            if status_filter != "all" and sym.status != status_filter:
+                show = False
+            if show:
+                # Ensure item is visible (re-add if detached)
+                try:
+                    self._tree.reattach(iid, "", "end")
+                except Exception:
+                    pass
+                visible += 1
+            else:
+                try:
+                    self._tree.detach(iid)
+                except Exception:
+                    pass
+        self._count_lbl.config(text=f"{visible:,}/{len(self._tree_items):,} symbols")
+
+    def _sort_tree(self, col):
+        """Sort treeview by column."""
+        if self._sort_col == col:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col = col
+            self._sort_reverse = False
+
+        items = [(self._tree.set(iid, col), iid) for iid in self._tree.get_children("")]
+
+        # Numeric sort for VA/delta/confidence columns
+        if col in ("orig_va", "recovered_va"):
+            items.sort(key=lambda x: int(x[0], 16) if x[0].startswith("0x") else 0,
+                       reverse=self._sort_reverse)
+        elif col == "delta":
+            items.sort(key=lambda x: int(x[0].replace("+", "")) if x[0] else 0,
+                       reverse=self._sort_reverse)
+        elif col == "confidence":
+            items.sort(key=lambda x: int(x[0].rstrip("%")) if x[0].rstrip("%").isdigit() else 0,
+                       reverse=self._sort_reverse)
+        else:
+            items.sort(key=lambda x: x[0].lower(), reverse=self._sort_reverse)
+
+        for idx, (_, iid) in enumerate(items):
+            self._tree.move(iid, "", idx)
+
+    # ── Symbol Editing ────────────────────────────────────────────────
+
+    def _edit_selected(self):
+        """Edit the recovered VA of selected symbol(s)."""
+        sel = self._tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select one or more symbols in the table to edit.")
+            return
+
+        if len(sel) == 1:
+            iid = sel[0]
+            sym = self._tree_items.get(iid)
+            if not sym:
+                return
+            self._edit_single(iid, sym)
+        else:
+            # Bulk offset
+            self._edit_bulk(sel)
+
+    def _edit_single(self, iid, sym):
+        """Edit a single symbol's recovered VA."""
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Edit Symbol: {sym.name}")
+        dlg.geometry("450x200")
+        dlg.configure(bg=T["bg"])
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"Symbol: {sym.name}", bg=T["bg"], fg=T["accent"],
+                 font=("Consolas", 11, "bold")).pack(padx=10, pady=(10, 4))
+        tk.Label(dlg, text=f"Original VA: 0x{sym.orig_va:08X}", bg=T["bg"],
+                 fg=T["fg_dim"], font=("Consolas", 10)).pack(padx=10)
+
+        frm = tk.Frame(dlg, bg=T["bg"])
+        frm.pack(padx=10, pady=8)
+        tk.Label(frm, text="Recovered VA:", bg=T["bg"], fg=T["fg"],
+                 font=("Consolas", 10)).pack(side="left", padx=(0, 8))
+        va_var = tk.StringVar(value=f"0x{sym.recovered_va:08X}")
+        ent = tk.Entry(frm, textvariable=va_var, bg=T["entry_bg"], fg=T["fg"],
+                       insertbackground=T["fg"], font=("Consolas", 10),
+                       relief="flat", bd=5, width=20)
+        ent.pack(side="left")
+        ent.select_range(0, "end")
+        ent.focus_set()
+
+        def apply():
+            try:
+                new_va = int(va_var.get(), 0)
+            except ValueError:
+                messagebox.showerror("Invalid", "Enter a valid hex address (e.g. 0x401000)")
+                return
+            sym.recovered_va = new_va
+            sym.status = 'ok'
+            sym.confidence = 1.0
+            delta = new_va - sym.orig_va
+            self._tree.item(iid, values=(
+                sym.name,
+                f"0x{sym.orig_va:08X}",
+                f"0x{new_va:08X}",
+                f"{delta:+d}",
+                sym.section_name,
+                "100%",
+                "ok",
+            ))
+            dlg.destroy()
+
+        btn_frm = tk.Frame(dlg, bg=T["bg"])
+        btn_frm.pack(pady=10)
+        ttk.Button(btn_frm, text="Apply", command=apply).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="Cancel", command=dlg.destroy).pack(side="left", padx=5)
+        dlg.bind("<Return>", lambda e: apply())
+
+    def _edit_bulk(self, selection):
+        """Apply a fixed offset to all selected symbols."""
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Bulk Edit: {len(selection)} symbols")
+        dlg.geometry("400x160")
+        dlg.configure(bg=T["bg"])
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"Apply offset to {len(selection)} selected symbols",
+                 bg=T["bg"], fg=T["accent"],
+                 font=("Segoe UI", 11, "bold")).pack(padx=10, pady=(10, 8))
+
+        frm = tk.Frame(dlg, bg=T["bg"])
+        frm.pack(padx=10, pady=4)
+        tk.Label(frm, text="VA Offset:", bg=T["bg"], fg=T["fg"],
+                 font=("Consolas", 10)).pack(side="left", padx=(0, 8))
+        off_var = tk.StringVar(value="+0")
+        ent = tk.Entry(frm, textvariable=off_var, bg=T["entry_bg"], fg=T["fg"],
+                       insertbackground=T["fg"], font=("Consolas", 10),
+                       relief="flat", bd=5, width=20)
+        ent.pack(side="left")
+        ent.select_range(0, "end")
+        ent.focus_set()
+
+        def apply():
+            try:
+                offset = int(off_var.get(), 0)
+            except ValueError:
+                messagebox.showerror("Invalid", "Enter a signed integer offset (e.g. +512, -0x200)")
+                return
+            for iid in selection:
+                sym = self._tree_items.get(iid)
+                if not sym:
+                    continue
+                sym.recovered_va += offset
+                sym.confidence = 1.0
+                delta = sym.recovered_va - sym.orig_va
+                self._tree.item(iid, values=(
+                    sym.name,
+                    f"0x{sym.orig_va:08X}",
+                    f"0x{sym.recovered_va:08X}",
+                    f"{delta:+d}",
+                    sym.section_name,
+                    "100%",
+                    sym.status,
+                ))
+            dlg.destroy()
+
+        btn_frm = tk.Frame(dlg, bg=T["bg"])
+        btn_frm.pack(pady=10)
+        ttk.Button(btn_frm, text="Apply", command=apply).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="Cancel", command=dlg.destroy).pack(side="left", padx=5)
+        dlg.bind("<Return>", lambda e: apply())
+
+    # ── Export ────────────────────────────────────────────────────────
+
+    def _export_map(self):
+        if not self._recovered:
+            messagebox.showwarning("No data", "Recover symbols first.")
+            return
+        out_path = filedialog.asksaveasfilename(
+            title="Export Recovered Symbol Map",
+            defaultextension=".map",
+            filetypes=[("MAP Files", "*.map"), ("All Files", "*.*")])
+        if not out_path:
+            return
+        try:
+            self._engine.export_map_file(out_path)
+            count = sum(1 for r in self._recovered if r.status == 'ok')
+            self.status_var.set(f"\U0001F4BE Exported {count:,} symbols to {os.path.basename(out_path)}")
+            output_write(self.output, f"  \u2714 Exported MAP: {out_path}\n", "ok")
+        except Exception as e:
+            self.status_var.set(f"\u26A0 Export failed: {e}")
+            output_write(self.output, f"  \u2717 Export error: {e}\n", "error")
+
+    def _export_pdb(self):
+        if not self._recovered:
+            messagebox.showwarning("No data", "Recover symbols first.")
+            return
+        sym_path = self._sym_ent.get_value()
+        if not sym_path or not sym_path.lower().endswith('.pdb'):
+            messagebox.showwarning("No PDB",
+                "A .pdb symbol file must be loaded to export a patched PDB.")
+            return
+        out_path = filedialog.asksaveasfilename(
+            title="Export Patched PDB",
+            defaultextension=".pdb",
+            filetypes=[("PDB Files", "*.pdb"), ("All Files", "*.*")])
+        if not out_path:
+            return
+        self.status_var.set("\u23F3 Patching PDB...")
+
+        orig_pe = self._orig_ent.get_value()
+
+        def work():
+            return self._engine.export_pdb(sym_path, out_path, orig_pe_path=orig_pe)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.status_var.set(f"\u274C PDB export failed: {result}")
+                output_write(self.output, f"  \u2717 PDB error: {result}\n", "error")
+                return
+            shifted = result.get('total_sections_shifted', 0)
+            self.status_var.set(
+                f"\U0001F4BE PDB exported: {shifted} sections shifted \u2192 {os.path.basename(out_path)}")
+            output_write(self.output, f"\n  \u2714 PDB exported: {out_path}\n", "ok")
+            for sr in result.get('section_results', []):
+                output_write(self.output,
+                    f"    Section {sr['section']}: {sr['patched']}/{sr['total']} "
+                    f"symbols shifted by {sr['delta']:+d}\n",
+                    "ok" if sr['patched'] > 0 else "dim")
+                for err in sr.get('errors', []):
+                    output_write(self.output, f"      \u26A0 {err}\n", "warn")
+
+        run_with_progress(self, work, done)
+
+    # ── Clear ─────────────────────────────────────────────────────────
+
+    def _clear_all(self):
+        self._tree.delete(*self._tree.get_children())
+        self._tree_items.clear()
+        self._recovered = []
+        self._engine = None
+        self.output.close_all()
+        self._count_lbl.config(text="")
+        self.status_var.set("\u2022 Load original binary + symbols and patched binary, then Analyze Diff")
 
 
 if __name__ == '__main__':
