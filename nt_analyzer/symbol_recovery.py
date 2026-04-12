@@ -384,7 +384,7 @@ class SymbolRecoveryEngine:
     def get_recovered_dict(self) -> Dict[int, str]:
         """Return recovered symbols as {va: name} dict."""
         return {r.recovered_va: r.name for r in self._recovered
-                if r.status == 'ok'}
+                if r.status in ('ok', 'discovered')}
 
     def export_map_file(self, output_path: str,
                         image_base: int = None) -> str:
@@ -472,14 +472,182 @@ class SymbolRecoveryEngine:
         unmapped = sum(1 for r in self._recovered if r.status == 'unmapped')
         removed = sum(1 for r in self._recovered if r.status == 'section_removed')
         outside = sum(1 for r in self._recovered if r.status == 'outside')
+        discovered = sum(1 for r in self._recovered if r.status == 'discovered')
         high_conf = sum(1 for r in self._recovered
-                        if r.status == 'ok' and r.confidence >= 0.8)
+                        if r.status in ('ok', 'discovered') and r.confidence >= 0.8)
+        total_ok = ok + discovered
         return {
             'total': len(self._recovered),
             'ok': ok,
+            'discovered': discovered,
             'unmapped': unmapped,
             'section_removed': removed,
             'outside': outside,
             'high_confidence': high_conf,
-            'success_rate': ok / len(self._recovered) if self._recovered else 0,
+            'success_rate': total_ok / len(self._recovered) if self._recovered else 0,
         }
+
+    # ------------------------------------------------------------------
+    #  New section symbol discovery
+    # ------------------------------------------------------------------
+
+    def discover_new_section_symbols(self, patched_pe_path: str) -> List[RecoveredSymbol]:
+        """
+        Discover symbols in NEW sections of the patched binary.
+
+        Scans for:
+        1. Section boundary markers (__<name>_start / __<name>_end)
+        2. PE data directory entries that fall in new sections
+        3. Exports pointing into new sections
+        4. Function prologues (push ebp; mov ebp, esp) in executable sections
+
+        Returns list of newly discovered RecoveredSymbol objects.
+        These are also appended to self._recovered.
+        """
+        if self._diff is None:
+            raise RuntimeError("Call diff_binaries() first")
+        if not self._diff.new_sections:
+            return []
+        if pefile is None:
+            raise ImportError("pefile is required")
+
+        pe = pefile.PE(patched_pe_path)
+        ib = pe.OPTIONAL_HEADER.ImageBase
+        discovered = []
+
+        # Collect new section VA ranges
+        new_ranges = {}
+        for sec in self._diff.new_sections:
+            new_ranges[sec.index] = sec
+
+        # 1. Section boundary markers
+        for sec in self._diff.new_sections:
+            safe_name = sec.name.replace('.', '').replace('$', '')
+            discovered.append(RecoveredSymbol(
+                name=f'__{safe_name}_start',
+                orig_va=0,
+                recovered_va=ib + sec.va,
+                section_name=sec.name,
+                section_index=sec.index,
+                confidence=1.0,
+                status='discovered',
+            ))
+            discovered.append(RecoveredSymbol(
+                name=f'__{safe_name}_end',
+                orig_va=0,
+                recovered_va=ib + sec.va + sec.vsize,
+                section_name=sec.name,
+                section_index=sec.index,
+                confidence=1.0,
+                status='discovered',
+            ))
+
+        # 2. PE data directory entries pointing into new sections
+        dir_names = [
+            'EXPORT', 'IMPORT', 'RESOURCE', 'EXCEPTION',
+            'SECURITY', 'BASERELOC', 'DEBUG', 'ARCHITECTURE',
+            'GLOBALPTR', 'TLS', 'LOAD_CONFIG', 'BOUND_IMPORT',
+            'IAT', 'DELAY_IMPORT', 'COM_DESCRIPTOR',
+        ]
+        for i, d in enumerate(pe.OPTIONAL_HEADER.DATA_DIRECTORY):
+            if d.VirtualAddress == 0 or d.Size == 0:
+                continue
+            rva = d.VirtualAddress
+            for sec in self._diff.new_sections:
+                if sec.va <= rva < sec.va + sec.vsize:
+                    dname = dir_names[i] if i < len(dir_names) else f'DIR_{i}'
+                    discovered.append(RecoveredSymbol(
+                        name=f'__PE_{dname}_Directory',
+                        orig_va=0,
+                        recovered_va=ib + rva,
+                        section_name=sec.name,
+                        section_index=sec.index,
+                        confidence=1.0,
+                        status='discovered',
+                    ))
+                    break
+
+        # 3. Export-specific tables in new sections
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            ed = pe.DIRECTORY_ENTRY_EXPORT
+            export_tables = [
+                ('__ExportAddressTable', ed.struct.AddressOfFunctions),
+                ('__ExportNameTable', ed.struct.AddressOfNames),
+                ('__ExportOrdinalTable', ed.struct.AddressOfNameOrdinals),
+            ]
+            for label, rva in export_tables:
+                if rva == 0:
+                    continue
+                for sec in self._diff.new_sections:
+                    if sec.va <= rva < sec.va + sec.vsize:
+                        discovered.append(RecoveredSymbol(
+                            name=label,
+                            orig_va=0,
+                            recovered_va=ib + rva,
+                            section_name=sec.name,
+                            section_index=sec.index,
+                            confidence=1.0,
+                            status='discovered',
+                        ))
+                        break
+
+            # 4. Exports pointing into new sections
+            for exp in ed.symbols:
+                if not exp.address:
+                    continue
+                for sec in self._diff.new_sections:
+                    if sec.va <= exp.address < sec.va + sec.vsize:
+                        name = exp.name.decode('ascii', 'replace') if exp.name else f'ord_{exp.ordinal}'
+                        discovered.append(RecoveredSymbol(
+                            name=name,
+                            orig_va=0,
+                            recovered_va=ib + exp.address,
+                            section_name=sec.name,
+                            section_index=sec.index,
+                            confidence=1.0,
+                            status='discovered',
+                        ))
+                        break
+
+        # 5. Function prologues in executable new sections
+        for sec in self._diff.new_sections:
+            is_exec = bool(sec.chars & 0x20000000)  # IMAGE_SCN_MEM_EXECUTE
+            is_code = bool(sec.chars & 0x20)         # IMAGE_SCN_CNT_CODE
+            if not (is_exec or is_code):
+                continue
+            try:
+                data = pe.get_data(sec.va, sec.vsize)
+            except Exception:
+                continue
+            # Scan for push ebp; mov ebp, esp (55 8B EC)
+            func_num = 0
+            i = 0
+            while i < len(data) - 2:
+                if data[i] == 0x55 and data[i + 1] == 0x8B and data[i + 2] == 0xEC:
+                    func_num += 1
+                    safe_name = sec.name.replace('.', '').replace('$', '')
+                    discovered.append(RecoveredSymbol(
+                        name=f'{safe_name}_func_{func_num:04d}',
+                        orig_va=0,
+                        recovered_va=ib + sec.va + i,
+                        section_name=sec.name,
+                        section_index=sec.index,
+                        confidence=0.7,
+                        status='discovered',
+                    ))
+                    i += 3  # skip past this prologue
+                else:
+                    i += 1
+
+        pe.close()
+
+        # Deduplicate by VA
+        seen_vas = {r.recovered_va for r in self._recovered}
+        unique = []
+        for sym in discovered:
+            if sym.recovered_va not in seen_vas:
+                seen_vas.add(sym.recovered_va)
+                unique.append(sym)
+
+        self._recovered.extend(unique)
+        return unique

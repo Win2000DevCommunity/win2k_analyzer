@@ -9252,7 +9252,7 @@ class SymbolRecoveryTab(ttk.Frame):
         ttk.Label(filt_frm, text="Status:").pack(side="left", padx=(12, 4))
         self._status_filter = tk.StringVar(value="all")
         status_cb = ttk.Combobox(filt_frm, textvariable=self._status_filter,
-                                 values=["all", "ok", "unmapped", "section_removed", "outside"],
+                                 values=["all", "ok", "discovered", "unmapped", "section_removed", "outside"],
                                  width=16, state="readonly")
         status_cb.pack(side="left", padx=4)
         status_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filter())
@@ -9431,23 +9431,33 @@ class SymbolRecoveryTab(ttk.Frame):
 
         self.status_var.set("\u23F3 Recovering symbols...")
         orig_path = self._orig_ent.get_value()
+        patched_path = self._patch_ent.get_value()
         self.output.new_tab("Recovery")
 
         def work():
-            return self._engine.recover_symbols(orig_pe_path=orig_path)
+            recovered = self._engine.recover_symbols(orig_pe_path=orig_path)
+            # Discover symbols in new sections
+            new_syms = []
+            if patched_path and self._engine.diff and self._engine.diff.new_sections:
+                new_syms = self._engine.discover_new_section_symbols(patched_path)
+            return recovered, new_syms
 
         def done(result):
             if isinstance(result, Exception):
                 self.status_var.set(f"\u274C Error: {result}")
                 output_write(self.output, f"ERROR: {result}\n", "error")
                 return
-            self._recovered = result
-            self._populate_tree(result)
-            self._render_recovery_stats(result)
+            recovered, new_syms = result
+            self._recovered = self._engine.recovered_symbols  # includes discovered
+            self._populate_tree(self._recovered)
+            self._render_recovery_stats(self._recovered, new_syms)
             stats = self._engine.get_stats()
-            self.status_var.set(
-                f"\u2705 Recovered {stats.get('ok',0):,}/{stats.get('total',0):,} symbols "
-                f"({stats.get('success_rate',0):.1%} success rate)")
+            disc = stats.get('discovered', 0)
+            msg = (f"\u2705 Recovered {stats.get('ok',0):,}/{stats.get('total',0):,} symbols "
+                   f"({stats.get('success_rate',0):.1%} success rate)")
+            if disc:
+                msg += f" + {disc:,} discovered in new sections"
+            self.status_var.set(msg)
 
         run_with_progress(self, work, done)
 
@@ -9470,7 +9480,7 @@ class SymbolRecoveryTab(ttk.Frame):
             self._tree_items[iid] = sym
         self._count_lbl.config(text=f"{len(symbols):,} symbols")
 
-    def _render_recovery_stats(self, symbols):
+    def _render_recovery_stats(self, symbols, new_section_syms=None):
         out = self.output
         stats = self._engine.get_stats()
 
@@ -9483,6 +9493,9 @@ class SymbolRecoveryTab(ttk.Frame):
         output_write(out, f"    Recovered (OK):   {ok:,}\n", "ok")
         output_write(out, f"    High confidence:  {stats.get('high_confidence', 0):,}\n", "ok")
 
+        discovered = stats.get('discovered', 0)
+        if discovered:
+            output_write(out, f"    Discovered (new): {discovered:,}\n", "green")
         unmapped = stats.get('unmapped', 0)
         if unmapped:
             output_write(out, f"    Unmapped:         {unmapped:,}\n", "warn")
@@ -9509,6 +9522,19 @@ class SymbolRecoveryTab(ttk.Frame):
                     f"    {m.orig.name:<12s}: VA delta {m.va_delta:+6d}, "
                     f"VSize delta {m.vsize_delta:+6d}, "
                     f"{syms_in_sec:,} symbols shifted\n", tag)
+
+        # New section symbols
+        if new_section_syms:
+            output_write(out, f"\n  \u2500\u2500 New Section Symbols \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n", "heading")
+            # Group by section
+            by_sec = {}
+            for s in new_section_syms:
+                by_sec.setdefault(s.section_name, []).append(s)
+            for sec_name, syms_list in by_sec.items():
+                output_write(out, f"\n    Section {sec_name} ({len(syms_list)} symbols discovered):\n", "green")
+                for s in syms_list:
+                    output_write(out,
+                        f"      0x{s.recovered_va:08X}  {s.name}\n", "ok")
 
         output_write(out, "\n    \u2192 Use 'Export .map' or 'Export PDB' to save recovered symbols.\n", "accent")
         output_write(out, "\n")
