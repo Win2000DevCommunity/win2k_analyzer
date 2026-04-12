@@ -8827,11 +8827,15 @@ class UBRTTab(ttk.Frame):
         if not out_path:
             return
         try:
+            import shutil
             backups = []
+            copied_syms = []
             src_path = self._engine.pe_path or ''
             src_base = os.path.splitext(src_path)[0]
             out_base = os.path.splitext(out_path)[0]
             already_backed = set()
+            same_dir = (os.path.dirname(os.path.abspath(out_path))
+                        == os.path.dirname(os.path.abspath(src_path)))
 
             # Backup the output file if it already exists (overwrite protection)
             bak = self._backup_file(out_path)
@@ -8839,24 +8843,30 @@ class UBRTTab(ttk.Frame):
                 backups.append(bak)
                 already_backed.add(os.path.abspath(out_path))
 
-            # Backup .pdb / .dbg next to the SOURCE binary
+            # Backup & copy .pdb / .dbg from source to output location
             for ext in ('.pdb', '.dbg'):
-                sym_path = src_base + ext
-                if os.path.abspath(sym_path) not in already_backed:
-                    bak = self._backup_file(sym_path)
-                    if bak:
-                        backups.append(bak)
-                        already_backed.add(os.path.abspath(sym_path))
+                src_sym = src_base + ext
+                out_sym = out_base + ext
 
-            # Also backup .pdb / .dbg next to the OUTPUT path (if different dir)
-            if os.path.dirname(os.path.abspath(out_path)) != os.path.dirname(os.path.abspath(src_path)):
-                for ext in ('.pdb', '.dbg'):
-                    sym_path = out_base + ext
-                    if os.path.abspath(sym_path) not in already_backed:
-                        bak = self._backup_file(sym_path)
+                if not os.path.isfile(src_sym):
+                    continue
+
+                if same_dir:
+                    # Same directory: just backup, the original stays in place
+                    if os.path.abspath(src_sym) not in already_backed:
+                        bak = self._backup_file(src_sym)
                         if bak:
                             backups.append(bak)
-                            already_backed.add(os.path.abspath(sym_path))
+                            already_backed.add(os.path.abspath(src_sym))
+                else:
+                    # Different directory: backup existing at dest, then copy
+                    if os.path.abspath(out_sym) not in already_backed:
+                        bak = self._backup_file(out_sym)
+                        if bak:
+                            backups.append(bak)
+                            already_backed.add(os.path.abspath(out_sym))
+                    shutil.copy2(src_sym, out_sym)
+                    copied_syms.append(os.path.basename(out_sym))
 
             # Backup loaded symbol source if not already covered
             if self._engine._symbol_source:
@@ -8868,12 +8878,14 @@ class UBRTTab(ttk.Frame):
 
             self._engine.save(out_path)
 
+            # Build status message
+            parts = [f"\U0001F4BE Saved to {out_path}"]
+            if copied_syms:
+                parts.append(f"Copied: {', '.join(copied_syms)}")
             if backups:
                 bak_names = ', '.join(os.path.basename(b) for b in backups)
-                self.status_var.set(
-                    f"\U0001F4BE Saved to {out_path}  \u2502  Backups: {bak_names}")
-            else:
-                self.status_var.set(f"\U0001F4BE Saved to {out_path}")
+                parts.append(f"Backups: {bak_names}")
+            self.status_var.set('  \u2502  '.join(parts))
         except Exception as e:
             self.status_var.set(f"\u26A0 Save failed: {e}")
 

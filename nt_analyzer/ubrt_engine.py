@@ -5023,6 +5023,7 @@ class ShiftEngine(BaseShiftEngine):
 
     def save(self, output_path: str):
         """Write the modified binary to disk."""
+        import tempfile
         # Update PE checksum
         try:
             pe_out = pefile.PE(data=bytes(self.buffer))
@@ -5032,19 +5033,33 @@ class ShiftEngine(BaseShiftEngine):
         except Exception:
             final = bytes(self.buffer)
 
-        # Close our PE handle before writing — prevents Errno 22 on Windows
-        # when saving to the same path as the source binary.
-        same_file = (os.path.abspath(output_path) ==
-                     os.path.abspath(self.pe_path))
-        if same_file:
-            self.pe.close()
+        # Always close our PE handle before writing — prevents Errno 22
+        # on Windows when the source file is still held open by pefile.
+        self.pe.close()
 
-        with open(output_path, 'wb') as f:
-            f.write(final)
+        # Write to temp file first, then replace — atomic and safe even
+        # if the output path is the same as the source.
+        out_dir = os.path.dirname(os.path.abspath(output_path))
+        fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix='.tmp')
+        try:
+            os.write(fd, final)
+            os.close(fd)
+            # On Windows, os.replace needs the target to not be open
+            if os.path.exists(output_path):
+                os.replace(tmp_path, output_path)
+            else:
+                os.rename(tmp_path, output_path)
+        except Exception:
+            # Fallback: direct write if atomic replace fails
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            with open(output_path, 'wb') as f:
+                f.write(final)
 
-        # Re-open pefile from the new data so engine stays usable
-        if same_file:
-            self.pe = pefile.PE(data=bytes(self.buffer))
+        # Re-open pefile from buffer so engine stays usable
+        self.pe = pefile.PE(data=bytes(self.buffer))
 
     # ── Internal: Reference Recalculation ─────────────────────────────
 
