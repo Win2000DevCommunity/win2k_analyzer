@@ -7513,6 +7513,634 @@ class KernelDebuggerTab(ttk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  HexEditorWidget — Embedded hex editor for binary editing
+# ══════════════════════════════════════════════════════════════════════════
+
+class HexEditorWidget(tk.Frame):
+    """
+    A full hex editor widget that displays binary data in the classic format:
+        OFFSET  | XX XX XX XX  XX XX XX XX  XX XX XX XX  XX XX XX XX | ASCII...........
+    Supports:
+    - Cursor-based offset/RVA/VA auto-calculation
+    - Section indicator at cursor position
+    - Reference highlighting
+    - Go-to-offset / Go-to-RVA navigation
+    - Direct byte editing in hex view
+    - Selection, copy, paste
+    """
+
+    BYTES_PER_LINE = 16
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=T["bg"])
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        self._buffer = bytearray()     # binary data
+        self._image_base = 0
+        self._sections = []            # list of section dicts
+        self._rva_to_offset = None     # callable: rva -> offset
+        self._offset_to_rva = None     # callable: offset -> rva
+        self._section_for_offset = None # callable: offset -> section_name
+        self._refs_at_rva = None       # callable: rva, range -> list
+        self._on_cursor_change = None  # callback(offset, rva, va, section)
+        self._edit_callback = None     # callback(offset, old_byte, new_byte)
+
+        self._cursor_offset = 0       # current cursor file offset
+        self._selection_start = None
+        self._selection_end = None
+        self._editing_nibble = False   # True when editing high nibble done, waiting for low
+        self._pending_nibble = 0       # high nibble value
+        self._total_lines = 0
+        self._visible_start = 0       # first visible line index
+
+        # ── Top toolbar: navigation ──
+        nav_frm = tk.Frame(self, bg=T["bg"])
+        nav_frm.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+
+        tk.Label(nav_frm, text="Go to Offset:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._goto_offset_var = tk.StringVar()
+        self._goto_offset_ent = tk.Entry(nav_frm, textvariable=self._goto_offset_var,
+                                         width=12, bg=T["entry_bg"], fg=T["fg"],
+                                         insertbackground=T["fg"], font=("Consolas", 10),
+                                         relief="flat", bd=3)
+        self._goto_offset_ent.pack(side="left", padx=2)
+        self._goto_offset_ent.bind("<Return>", lambda e: self._goto_offset())
+        ttk.Button(nav_frm, text="Go", command=self._goto_offset).pack(side="left", padx=(2, 10))
+
+        tk.Label(nav_frm, text="Go to RVA:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._goto_rva_var = tk.StringVar()
+        self._goto_rva_ent = tk.Entry(nav_frm, textvariable=self._goto_rva_var,
+                                      width=12, bg=T["entry_bg"], fg=T["fg"],
+                                      insertbackground=T["fg"], font=("Consolas", 10),
+                                      relief="flat", bd=3)
+        self._goto_rva_ent.pack(side="left", padx=2)
+        self._goto_rva_ent.bind("<Return>", lambda e: self._goto_rva())
+        ttk.Button(nav_frm, text="Go", command=self._goto_rva).pack(side="left", padx=(2, 10))
+
+        # Section jump
+        tk.Label(nav_frm, text="Section:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._section_var = tk.StringVar()
+        self._section_combo = ttk.Combobox(nav_frm, textvariable=self._section_var,
+                                           width=12, state="readonly")
+        self._section_combo.pack(side="left", padx=2)
+        self._section_combo.bind("<<ComboboxSelected>>", lambda e: self._goto_section())
+
+        # ── Hex view (main editor area) ──
+        hex_frm = tk.Frame(self, bg=T["bg_dark"])
+        hex_frm.grid(row=1, column=0, sticky="nsew", padx=4, pady=2)
+        hex_frm.columnconfigure(0, weight=1)
+        hex_frm.rowconfigure(0, weight=1)
+
+        self._hex_text = tk.Text(hex_frm, bg=T["bg_dark"], fg=T["fg"],
+                                 insertbackground=T["accent"],
+                                 font=("Consolas", 10), relief="flat", bd=6,
+                                 wrap="none", state="disabled",
+                                 cursor="xterm",
+                                 selectbackground=T["accent"],
+                                 selectforeground=T["bg_dark"])
+        self._hex_text.grid(row=0, column=0, sticky="nsew")
+
+        # Scrollbar
+        self._scrollbar = ttk.Scrollbar(hex_frm, orient="vertical",
+                                        command=self._on_scroll)
+        self._scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # Horizontal scrollbar
+        self._hscroll = ttk.Scrollbar(hex_frm, orient="horizontal",
+                                      command=self._hex_text.xview)
+        self._hscroll.grid(row=1, column=0, sticky="ew")
+        self._hex_text.config(xscrollcommand=self._hscroll.set)
+
+        # Configure tags
+        self._hex_text.tag_configure("offset_col", foreground=T["accent"],
+                                     font=("Consolas", 10, "bold"))
+        self._hex_text.tag_configure("hex_col", foreground=T["fg"])
+        self._hex_text.tag_configure("ascii_col", foreground=T["fg_dim"])
+        self._hex_text.tag_configure("separator", foreground=T["separator"])
+        self._hex_text.tag_configure("cursor_byte", background=T["accent"],
+                                     foreground=T["bg_dark"])
+        self._hex_text.tag_configure("cursor_ascii", background=T["btn_bg"],
+                                     foreground=T["fg"])
+        self._hex_text.tag_configure("selection_hex", background=T["btn_active"],
+                                     foreground=T["fg"])
+        self._hex_text.tag_configure("ref_byte", foreground=T["yellow"])
+        self._hex_text.tag_configure("code_byte", foreground=T["green"])
+        self._hex_text.tag_configure("data_byte", foreground=T["peach"])
+        self._hex_text.tag_configure("zero_byte", foreground=T["fg_dim"])
+        self._hex_text.tag_configure("header_line", foreground=T["fg_dim"],
+                                     font=("Consolas", 10))
+        self._hex_text.tag_configure("modified_byte", foreground=T["red"],
+                                     font=("Consolas", 10, "bold"))
+
+        # Bind events
+        self._hex_text.bind("<Button-1>", self._on_click)
+        self._hex_text.bind("<Key>", self._on_key)
+        self._hex_text.bind("<MouseWheel>", self._on_mousewheel)
+        self._hex_text.bind("<Configure>", self._on_configure)
+
+        # ── Bottom: cursor info bar ──
+        info_frm = tk.Frame(self, bg=T["bg_light"])
+        info_frm.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 4))
+
+        self._cursor_lbl = tk.Label(info_frm,
+            text="Offset: -------- | RVA: -------- | VA: ---------------- | Section: ---- | Size: 0",
+            bg=T["bg_light"], fg=T["accent"],
+            font=("Consolas", 9, "bold"), anchor="w")
+        self._cursor_lbl.pack(side="left", fill="x", expand=True, padx=6, pady=2)
+
+        self._ref_lbl = tk.Label(info_frm, text="",
+                                 bg=T["bg_light"], fg=T["yellow"],
+                                 font=("Consolas", 9), anchor="e")
+        self._ref_lbl.pack(side="right", padx=6, pady=2)
+
+        self._modified_offsets = set()  # track modified byte offsets
+
+    # ── Public API ────────────────────────────────────────────
+
+    def load_buffer(self, buffer, image_base=0, sections=None,
+                    rva_to_offset=None, offset_to_rva=None,
+                    section_for_offset=None, refs_at_rva=None):
+        """Load binary data into the hex editor."""
+        self._buffer = buffer
+        self._image_base = image_base
+        self._sections = sections or []
+        self._rva_to_offset = rva_to_offset
+        self._offset_to_rva = offset_to_rva
+        self._section_for_offset = section_for_offset
+        self._refs_at_rva = refs_at_rva
+        self._cursor_offset = 0
+        self._selection_start = None
+        self._selection_end = None
+        self._modified_offsets.clear()
+        self._total_lines = (len(self._buffer) + self.BYTES_PER_LINE - 1) // self.BYTES_PER_LINE
+        self._visible_start = 0
+
+        # Populate section combo
+        sec_names = [s.get('name', '?') for s in self._sections if s.get('rva', 0) > 0]
+        self._section_combo['values'] = sec_names
+
+        self._render_view()
+        self._update_cursor_info()
+
+    def get_buffer(self):
+        """Return the current buffer."""
+        return self._buffer
+
+    def goto_offset(self, offset):
+        """Navigate to a specific file offset."""
+        if 0 <= offset < len(self._buffer):
+            self._cursor_offset = offset
+            line = offset // self.BYTES_PER_LINE
+            self._visible_start = max(0, line - 10)
+            self._render_view()
+            self._update_cursor_info()
+
+    def goto_rva(self, rva):
+        """Navigate to a specific RVA."""
+        if self._rva_to_offset:
+            offset = self._rva_to_offset(rva)
+            if offset is not None:
+                self.goto_offset(offset)
+
+    def set_cursor_callback(self, callback):
+        """Set callback for cursor movement: callback(offset, rva, va, section)."""
+        self._on_cursor_change = callback
+
+    def set_edit_callback(self, callback):
+        """Set callback for byte edits: callback(offset, old_byte, new_byte)."""
+        self._edit_callback = callback
+
+    def refresh(self):
+        """Re-render the current view (e.g. after external buffer modification)."""
+        self._modified_offsets.clear()
+        self._render_view()
+        self._update_cursor_info()
+
+    # ── Rendering ─────────────────────────────────────────────
+
+    def _get_visible_lines(self):
+        """Calculate how many lines fit in the visible area."""
+        try:
+            height = self._hex_text.winfo_height()
+            # Approximate line height with Consolas 10
+            line_height = 17
+            return max(10, height // line_height - 1)
+        except Exception:
+            return 40
+
+    def _render_view(self):
+        """Render the hex view for the current visible range."""
+        if not self._buffer:
+            self._hex_text.configure(state="normal")
+            self._hex_text.delete("1.0", "end")
+            self._hex_text.insert("1.0", "  No binary loaded. Click 'Analyze References' to load a binary.", "header_line")
+            self._hex_text.configure(state="disabled")
+            return
+
+        visible_lines = self._get_visible_lines()
+        start_line = self._visible_start
+        end_line = min(start_line + visible_lines, self._total_lines)
+
+        # Get references in visible range if available
+        ref_offsets = set()
+        if self._refs_at_rva and self._offset_to_rva:
+            start_off = start_line * self.BYTES_PER_LINE
+            end_off = min(end_line * self.BYTES_PER_LINE, len(self._buffer))
+            start_rva = self._offset_to_rva(start_off)
+            if start_rva is not None:
+                refs = self._refs_at_rva(start_rva, end_off - start_off + 0x100)
+                for r in refs:
+                    ref_rva = r.get('ref_rva', 0)
+                    ref_off = self._rva_to_offset(ref_rva) if self._rva_to_offset else None
+                    if ref_off is not None:
+                        for i in range(r.get('size_bytes', 4)):
+                            ref_offsets.add(ref_off + i)
+
+        # Build section offset map for visible range
+        sec_map = {}
+        for sec in self._sections:
+            raw_off = sec.get('raw_offset', 0)
+            raw_sz = sec.get('raw_size', 0)
+            is_code = sec.get('is_code', False)
+            if raw_off > 0 and raw_sz > 0:
+                for off in range(raw_off, raw_off + raw_sz):
+                    sec_map[off] = 'code' if is_code else 'data'
+
+        self._hex_text.configure(state="normal")
+        self._hex_text.delete("1.0", "end")
+
+        # Header line
+        hdr = "  Offset     00 01 02 03  04 05 06 07  08 09 0A 0B  0C 0D 0E 0F   ASCII\n"
+        self._hex_text.insert("end", hdr, "header_line")
+        self._hex_text.insert("end", "  " + "\u2500" * 88 + "\n", "header_line")
+
+        cursor_line = self._cursor_offset // self.BYTES_PER_LINE
+        cursor_col = self._cursor_offset % self.BYTES_PER_LINE
+
+        for line_idx in range(start_line, end_line):
+            offset = line_idx * self.BYTES_PER_LINE
+            line_bytes = self._buffer[offset:offset + self.BYTES_PER_LINE]
+            pad_count = self.BYTES_PER_LINE - len(line_bytes)
+
+            # Offset column
+            self._hex_text.insert("end", f"  {offset:08X}   ", "offset_col")
+
+            # Hex bytes (4 groups of 4)
+            for i in range(self.BYTES_PER_LINE):
+                byte_offset = offset + i
+                if i < len(line_bytes):
+                    b = line_bytes[i]
+                    hex_str = f"{b:02X}"
+
+                    # Determine tag
+                    if byte_offset == self._cursor_offset:
+                        tag = "cursor_byte"
+                    elif (self._selection_start is not None and
+                          self._selection_end is not None and
+                          self._selection_start <= byte_offset <= self._selection_end):
+                        tag = "selection_hex"
+                    elif byte_offset in self._modified_offsets:
+                        tag = "modified_byte"
+                    elif byte_offset in ref_offsets:
+                        tag = "ref_byte"
+                    elif b == 0:
+                        tag = "zero_byte"
+                    else:
+                        tag = "hex_col"
+
+                    self._hex_text.insert("end", hex_str, tag)
+                else:
+                    self._hex_text.insert("end", "  ", "hex_col")
+
+                # Spacing: group separator every 4 bytes
+                if i % 4 == 3 and i < self.BYTES_PER_LINE - 1:
+                    self._hex_text.insert("end", "  ", "separator")
+                else:
+                    self._hex_text.insert("end", " ", "hex_col")
+
+            # ASCII column
+            self._hex_text.insert("end", "  ", "separator")
+            for i in range(len(line_bytes)):
+                byte_offset = offset + i
+                b = line_bytes[i]
+                ch = chr(b) if 32 <= b < 127 else "\u00B7"
+                if byte_offset == self._cursor_offset:
+                    tag = "cursor_ascii"
+                elif byte_offset in self._modified_offsets:
+                    tag = "modified_byte"
+                else:
+                    tag = "ascii_col"
+                self._hex_text.insert("end", ch, tag)
+
+            self._hex_text.insert("end", "\n")
+
+        self._hex_text.configure(state="disabled")
+
+        # Update scrollbar position
+        if self._total_lines > 0:
+            top = self._visible_start / self._total_lines
+            bot = min(1.0, (self._visible_start + visible_lines) / self._total_lines)
+            self._scrollbar.set(top, bot)
+
+    def _update_cursor_info(self):
+        """Update the cursor info bar with current position details."""
+        if not self._buffer:
+            return
+
+        offset = self._cursor_offset
+        rva_val = None
+        va_val = None
+        sec_name = "----"
+
+        if self._offset_to_rva:
+            rva_val = self._offset_to_rva(offset)
+        if rva_val is not None:
+            va_val = rva_val + self._image_base
+
+        # Get section name
+        if self._section_for_offset:
+            sec = self._section_for_offset(offset)
+            if sec:
+                sec_name = sec
+
+        rva_str = f"0x{rva_val:08X}" if rva_val is not None else "--------"
+        va_str = f"0x{va_val:010X}" if va_val is not None else "----------"
+
+        byte_val = self._buffer[offset] if offset < len(self._buffer) else 0
+        self._cursor_lbl.config(
+            text=f"Offset: 0x{offset:08X} | RVA: {rva_str} | VA: {va_str} | "
+                 f"Section: {sec_name} | Byte: 0x{byte_val:02X} ({byte_val}) | "
+                 f"Size: {len(self._buffer):,}")
+
+        # Show references at cursor
+        if rva_val is not None and self._refs_at_rva:
+            refs = self._refs_at_rva(rva_val, 16)
+            if refs:
+                ref = refs[0]
+                self._ref_lbl.config(
+                    text=f"Ref: {ref.get('ref_type', '?')} \u2192 0x{ref.get('target_rva', 0):08X} "
+                         f"({ref.get('symbol_name', '')})")
+            else:
+                self._ref_lbl.config(text="")
+        else:
+            self._ref_lbl.config(text="")
+
+        # External callback
+        if self._on_cursor_change:
+            self._on_cursor_change(offset, rva_val, va_val, sec_name)
+
+    # ── Event handlers ────────────────────────────────────────
+
+    def _on_click(self, event):
+        """Handle click in hex view — compute which byte was clicked."""
+        if not self._buffer:
+            return
+        try:
+            idx = self._hex_text.index(f"@{event.x},{event.y}")
+            line_str, col_str = idx.split(".")
+            line_num = int(line_str)
+            col = int(col_str)
+        except Exception:
+            return
+
+        # Skip header lines (line 1 = header, line 2 = separator)
+        if line_num <= 2:
+            return
+
+        data_line = line_num - 3  # 0-based line in data
+        actual_line = self._visible_start + data_line
+
+        # Determine which byte column was clicked
+        # Layout: "  XXXXXXXX   XX XX XX XX  XX XX XX XX  XX XX XX XX  XX XX XX XX   ASCII"
+        # Offset col: 2 + 8 + 3 = 13 chars before first hex byte
+        hex_start = 13
+        # Each hex byte takes 3 chars (2 hex + 1 space), with extra space every 4 bytes
+        # Groups: [0..3] [4..7] [8..11] [12..15]
+        # Col 13: byte 0 (2 chars), col 16: byte 1, col 19: byte 2, col 22: byte 3
+        # Col 26: byte 4 (extra space), etc.
+
+        byte_idx = -1
+        if col >= hex_start:
+            # Calculate byte index from column position
+            adjusted = col - hex_start
+            # Account for group separators (extra space every 4 bytes)
+            # Group 0: cols 0-11 (4 bytes * 3 chars/byte)
+            # Separator: 1 extra char
+            # Group 1: cols 13-24
+            # etc.
+            group = 0
+            pos_in_group = adjusted
+            # Each group: 4 * 3 = 12 chars, then 1 extra separator space
+            while group < 4:
+                group_width = 12  # 4 bytes * 3 chars
+                if pos_in_group < group_width:
+                    byte_in_group = pos_in_group // 3
+                    byte_idx = group * 4 + byte_in_group
+                    break
+                pos_in_group -= group_width
+                if pos_in_group < 2:  # separator space(s)
+                    break
+                pos_in_group -= 2  # skip separator
+                group += 1
+
+        if byte_idx >= 0 and byte_idx < self.BYTES_PER_LINE:
+            new_offset = actual_line * self.BYTES_PER_LINE + byte_idx
+            if new_offset < len(self._buffer):
+                self._cursor_offset = new_offset
+                self._editing_nibble = False
+                self._render_view()
+                self._update_cursor_info()
+
+        # Allow the text widget to receive focus for key events
+        self._hex_text.focus_set()
+        return "break"
+
+    def _on_key(self, event):
+        """Handle keyboard input for hex editing and navigation."""
+        if not self._buffer:
+            return "break"
+
+        key = event.keysym
+        offset = self._cursor_offset
+
+        # Navigation keys
+        if key == "Right":
+            if offset < len(self._buffer) - 1:
+                self._cursor_offset += 1
+                self._editing_nibble = False
+                self._ensure_visible()
+                self._render_view()
+                self._update_cursor_info()
+            return "break"
+        elif key == "Left":
+            if offset > 0:
+                self._cursor_offset -= 1
+                self._editing_nibble = False
+                self._ensure_visible()
+                self._render_view()
+                self._update_cursor_info()
+            return "break"
+        elif key == "Down":
+            if offset + self.BYTES_PER_LINE < len(self._buffer):
+                self._cursor_offset += self.BYTES_PER_LINE
+                self._editing_nibble = False
+                self._ensure_visible()
+                self._render_view()
+                self._update_cursor_info()
+            return "break"
+        elif key == "Up":
+            if offset >= self.BYTES_PER_LINE:
+                self._cursor_offset -= self.BYTES_PER_LINE
+                self._editing_nibble = False
+                self._ensure_visible()
+                self._render_view()
+                self._update_cursor_info()
+            return "break"
+        elif key == "Next":  # Page Down
+            page = self._get_visible_lines() * self.BYTES_PER_LINE
+            self._cursor_offset = min(len(self._buffer) - 1, offset + page)
+            self._editing_nibble = False
+            self._ensure_visible()
+            self._render_view()
+            self._update_cursor_info()
+            return "break"
+        elif key == "Prior":  # Page Up
+            page = self._get_visible_lines() * self.BYTES_PER_LINE
+            self._cursor_offset = max(0, offset - page)
+            self._editing_nibble = False
+            self._ensure_visible()
+            self._render_view()
+            self._update_cursor_info()
+            return "break"
+        elif key == "Home":
+            self._cursor_offset = (offset // self.BYTES_PER_LINE) * self.BYTES_PER_LINE
+            self._editing_nibble = False
+            self._render_view()
+            self._update_cursor_info()
+            return "break"
+        elif key == "End":
+            self._cursor_offset = min(len(self._buffer) - 1,
+                                      (offset // self.BYTES_PER_LINE + 1) * self.BYTES_PER_LINE - 1)
+            self._editing_nibble = False
+            self._render_view()
+            self._update_cursor_info()
+            return "break"
+
+        # Hex editing: accept 0-9, a-f
+        ch = event.char.lower()
+        if ch in '0123456789abcdef' and offset < len(self._buffer):
+            nibble = int(ch, 16)
+            old_byte = self._buffer[offset]
+
+            if not self._editing_nibble:
+                # First nibble (high) — store and wait for second
+                self._pending_nibble = nibble
+                self._editing_nibble = True
+                return "break"
+            else:
+                # Second nibble (low) — combine and write
+                new_byte = (self._pending_nibble << 4) | nibble
+                self._buffer[offset] = new_byte
+                self._modified_offsets.add(offset)
+                self._editing_nibble = False
+
+                if self._edit_callback:
+                    self._edit_callback(offset, old_byte, new_byte)
+
+                # Advance cursor
+                if offset < len(self._buffer) - 1:
+                    self._cursor_offset += 1
+                self._ensure_visible()
+                self._render_view()
+                self._update_cursor_info()
+                return "break"
+
+        return "break"
+
+    def _on_scroll(self, *args):
+        """Handle scrollbar drag."""
+        if not self._buffer:
+            return
+        if args[0] == "moveto":
+            frac = float(args[1])
+            self._visible_start = max(0, int(frac * self._total_lines))
+            self._render_view()
+        elif args[0] == "scroll":
+            amount = int(args[1])
+            if args[2] == "units":
+                self._visible_start = max(0, min(self._total_lines - 1,
+                                                  self._visible_start + amount))
+            elif args[2] == "pages":
+                page = self._get_visible_lines()
+                self._visible_start = max(0, min(self._total_lines - 1,
+                                                  self._visible_start + amount * page))
+            self._render_view()
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scroll."""
+        if not self._buffer:
+            return
+        delta = -1 * (event.delta // 120) * 3
+        self._visible_start = max(0, min(self._total_lines - self._get_visible_lines(),
+                                         self._visible_start + delta))
+        self._render_view()
+        return "break"
+
+    def _on_configure(self, event):
+        """Handle resize — re-render with new visible line count."""
+        if self._buffer:
+            self._render_view()
+
+    def _ensure_visible(self):
+        """Ensure the cursor line is visible."""
+        cursor_line = self._cursor_offset // self.BYTES_PER_LINE
+        visible = self._get_visible_lines()
+        if cursor_line < self._visible_start:
+            self._visible_start = cursor_line
+        elif cursor_line >= self._visible_start + visible - 1:
+            self._visible_start = cursor_line - visible + 2
+
+    # ── Navigation commands ───────────────────────────────────
+
+    def _goto_offset(self):
+        raw = self._goto_offset_var.get().strip()
+        if not raw:
+            return
+        try:
+            off = int(raw, 16) if raw.startswith(('0x', '0X')) else int(raw, 16)
+            self.goto_offset(off)
+        except ValueError:
+            pass
+
+    def _goto_rva(self):
+        raw = self._goto_rva_var.get().strip()
+        if not raw:
+            return
+        try:
+            rva = int(raw, 16) if raw.startswith(('0x', '0X')) else int(raw, 16)
+            self.goto_rva(rva)
+        except ValueError:
+            pass
+
+    def _goto_section(self):
+        sec_name = self._section_var.get()
+        if not sec_name:
+            return
+        for sec in self._sections:
+            if sec.get('name', '') == sec_name:
+                raw_off = sec.get('raw_offset', 0)
+                if raw_off > 0:
+                    self.goto_offset(raw_off)
+                elif sec.get('rva', 0) > 0:
+                    self.goto_rva(sec['rva'])
+                break
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Tab 17: UBRT — Universal Binary Rewriter & Translator
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -7523,7 +8151,8 @@ class UBRTTab(ttk.Frame):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(6, weight=1)
+        self.rowconfigure(3, weight=1)  # hex editor gets the main space
+        self.rowconfigure(6, weight=1)  # output also resizable
         self._engine = None
 
         # ── Row 0: File picker (supports PE / ELF / Mach-O) ──
@@ -7557,85 +8186,67 @@ class UBRTTab(ttk.Frame):
                    command=self._save).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u21A9  Undo",
                    command=self._undo).pack(side="left", padx=5)
+        ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
+        ttk.Button(btn_frm, text="\U0001F4DD  Insert Bytes\u2026",
+                   command=self._insert_bytes_dialog).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="\u2702  Delete Bytes\u2026",
+                   command=self._delete_bytes_dialog).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="NOP Sled\u2026",
+                   command=self._nop_sled_dialog).pack(side="left", padx=5)
 
-        # ── Row 2: Shift Engine Operations (professional layout) ──
-        op_frm = tk.LabelFrame(self, text=" Shift Engine Operations ",
-                               bg=T["bg"], fg=T["accent"], font=("Segoe UI", 10, "bold"),
-                               padx=8, pady=6)
-        op_frm.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
-        op_frm.columnconfigure(3, weight=1)
+        # ── Row 2: Info bar (format + ref count + cursor info) ──
+        self._info_frm = tk.Frame(self, bg=T["bg"])
+        self._info_frm.grid(row=2, column=0, sticky="ew", padx=12, pady=2)
+        self._info_lbl = tk.Label(self._info_frm, text="", bg=T["bg"],
+                                  fg=T["accent"], font=("Consolas", 9, "bold"),
+                                  anchor="w")
+        self._info_lbl.pack(side="left", fill="x", expand=True)
 
-        # Row 0: Operation + RVA
-        tk.Label(op_frm, text="Operation:", bg=T["bg"], fg=T["fg"],
-                 font=("Segoe UI", 9)).grid(row=0, column=0, padx=(0, 4), sticky="e")
-        self._op_var = tk.StringVar(value="INSERT")
-        op_menu = ttk.Combobox(op_frm, textvariable=self._op_var, width=14,
-                               values=["INSERT", "DELETE", "PATCH", "NOP SLED"],
-                               state="readonly")
-        op_menu.grid(row=0, column=1, sticky="w", padx=4)
+        # ── Row 3: Hex Editor (main area) ──
+        self._hex_editor = HexEditorWidget(self)
+        self._hex_editor.grid(row=3, column=0, sticky="nsew", padx=10, pady=4)
+        self._hex_editor.set_edit_callback(self._on_hex_edit)
 
-        tk.Label(op_frm, text="RVA:", bg=T["bg"], fg=T["fg"],
-                 font=("Segoe UI", 9)).grid(row=0, column=2, padx=(12, 4), sticky="e")
-        self._rva_var = tk.StringVar()
-        self._rva_ent = tk.Entry(op_frm, textvariable=self._rva_var, width=14,
-                                 bg=T["entry_bg"], fg=T["fg"],
-                                 insertbackground=T["fg"], font=("Consolas", 10),
-                                 relief="flat", bd=4)
-        self._rva_ent.grid(row=0, column=3, padx=4, sticky="w")
+        # ── Row 4: QEMU Tracer panel (collapsible) ──
+        self._qemu_visible = tk.BooleanVar(value=False)
+        qemu_container = tk.Frame(self, bg=T["bg"])
+        qemu_container.grid(row=4, column=0, sticky="ew", padx=12, pady=(4, 0))
+        qemu_container.columnconfigure(0, weight=1)
 
-        tk.Label(op_frm, text="Size / Hex data:", bg=T["bg"], fg=T["fg"],
-                 font=("Segoe UI", 9)).grid(row=0, column=4, padx=(12, 4), sticky="e")
-        self._data_var = tk.StringVar()
-        self._data_ent = tk.Entry(op_frm, textvariable=self._data_var, width=30,
-                                  bg=T["entry_bg"], fg=T["fg"],
-                                  insertbackground=T["fg"], font=("Consolas", 10),
-                                  relief="flat", bd=4)
-        self._data_ent.grid(row=0, column=5, padx=4, sticky="ew")
+        self._qemu_toggle_btn = ttk.Button(qemu_container,
+            text="\u25B6  QEMU Dynamic Tracer",
+            command=self._toggle_qemu)
+        self._qemu_toggle_btn.grid(row=0, column=0, sticky="w")
 
-        # Row 1: hint + buttons
-        hint_text = ("INSERT/NOP SLED: size in bytes (e.g. 64 or 0x40)  |  "
-                     "DELETE: count in bytes  |  PATCH: hex bytes (e.g. 90 90 CC)")
-        tk.Label(op_frm, text=hint_text, bg=T["bg"], fg=T["fg_dim"],
-                 font=("Segoe UI", 8)).grid(row=1, column=0, columnspan=4,
-                                             sticky="w", padx=4, pady=(2, 0))
-        op_btn_frm = tk.Frame(op_frm, bg=T["bg"])
-        op_btn_frm.grid(row=1, column=4, columnspan=2, sticky="e", pady=(2, 0))
-        ttk.Button(op_btn_frm, text="\U0001F441  Preview",
-                   command=self._preview).pack(side="left", padx=4)
-        ttk.Button(op_btn_frm, text="\u26A1  Apply",
-                   style="Accent.TButton",
-                   command=self._apply).pack(side="left", padx=4)
+        self._qemu_frm = tk.LabelFrame(qemu_container, text=" QEMU Dynamic Tracer ",
+                                        bg=T["bg"], fg=T["accent"],
+                                        font=("Segoe UI", 10, "bold"), padx=8, pady=6)
+        # Initially hidden (will be gridded at row=1 in container when toggled)
+        self._qemu_frm.columnconfigure(1, weight=1)
 
-        # ── Row 3: QEMU Tracer panel ──
-        qemu_frm = tk.LabelFrame(self, text=" QEMU Dynamic Tracer ",
-                                 bg=T["bg"], fg=T["accent"],
-                                 font=("Segoe UI", 10, "bold"), padx=8, pady=6)
-        qemu_frm.grid(row=3, column=0, sticky="ew", padx=12, pady=4)
-        qemu_frm.columnconfigure(1, weight=1)
-
-        tk.Label(qemu_frm, text="QEMU:", bg=T["bg"], fg=T["fg"]).grid(
+        tk.Label(self._qemu_frm, text="QEMU:", bg=T["bg"], fg=T["fg"]).grid(
             row=0, column=0, padx=(0, 4))
         self._qemu_var = tk.StringVar()
-        self._qemu_ent = tk.Entry(qemu_frm, textvariable=self._qemu_var, width=40,
+        self._qemu_ent = tk.Entry(self._qemu_frm, textvariable=self._qemu_var, width=40,
                                   bg=T["entry_bg"], fg=T["fg"],
                                   insertbackground=T["fg"], font=("Consolas", 10),
                                   relief="flat", bd=4)
         self._qemu_ent.grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(qemu_frm, text="Find",
+        ttk.Button(self._qemu_frm, text="Find",
                    command=self._find_qemu).grid(row=0, column=2, padx=4)
 
-        tk.Label(qemu_frm, text="Disk Image:", bg=T["bg"], fg=T["fg"]).grid(
+        tk.Label(self._qemu_frm, text="Disk Image:", bg=T["bg"], fg=T["fg"]).grid(
             row=1, column=0, padx=(0, 4), pady=(4, 0))
         self._disk_var = tk.StringVar()
-        self._disk_ent = tk.Entry(qemu_frm, textvariable=self._disk_var, width=40,
+        self._disk_ent = tk.Entry(self._qemu_frm, textvariable=self._disk_var, width=40,
                                   bg=T["entry_bg"], fg=T["fg"],
                                   insertbackground=T["fg"], font=("Consolas", 10),
                                   relief="flat", bd=4)
         self._disk_ent.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
-        ttk.Button(qemu_frm, text="Browse\u2026",
+        ttk.Button(self._qemu_frm, text="Browse\u2026",
                    command=self._browse_disk).grid(row=1, column=2, padx=4, pady=(4, 0))
 
-        qemu_btn_frm = tk.Frame(qemu_frm, bg=T["bg"])
+        qemu_btn_frm = tk.Frame(self._qemu_frm, bg=T["bg"])
         qemu_btn_frm.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Button(qemu_btn_frm, text="\u25B6  Start Trace",
                    command=self._start_trace).pack(side="left", padx=4)
@@ -7649,14 +8260,6 @@ class UBRTTab(ttk.Frame):
                                      bg=T["bg"], fg=T["fg_dim"],
                                      font=("Segoe UI", 9))
         self._qemu_status.pack(side="left", padx=12)
-
-        # ── Row 4: Info bar (format + ref count + history) ──
-        self._info_frm = tk.Frame(self, bg=T["bg"])
-        self._info_frm.grid(row=4, column=0, sticky="ew", padx=12, pady=2)
-        self._info_lbl = tk.Label(self._info_frm, text="", bg=T["bg"],
-                                  fg=T["accent"], font=("Consolas", 9, "bold"),
-                                  anchor="w")
-        self._info_lbl.pack(side="left", fill="x", expand=True)
 
         # ── Row 5: Status bar ──
         self.status_var, self._prog_start, self._prog_stop = make_status_with_progress(
@@ -7778,7 +8381,13 @@ class UBRTTab(ttk.Frame):
             out(f"    Medium (\u22650.7): {conf['medium']:>7,}\n", "peach")
             out(f"    Low (<0.7):    {conf['low']:>7,}\n", "error")
 
-            out(f"\n  \u2714 Ready for operations. Use the Shift Engine panel or the action buttons above.\n", "ok")
+            out(f"\n  \u2714 Ready for operations. Edit bytes directly in the hex editor above.\n", "ok")
+            out(f"  \u2022 Click a byte to set the cursor; type hex (0-9, A-F) to edit.\n", "dim")
+            out(f"  \u2022 Use Insert/Delete/NOP Sled buttons for shift operations with auto ref-recalculation.\n", "dim")
+            out(f"  \u2022 Navigate: Arrow keys, Page Up/Down, Home/End, Go to Offset/RVA, Section jump.\n", "dim")
+
+            # Load binary data into the hex editor
+            self._load_hex_editor()
 
             self.status_var.set(
                 f"\u2714 {fmt_name} | {stats['total']:,} references found in "
@@ -7786,6 +8395,51 @@ class UBRTTab(ttk.Frame):
 
         run_with_progress_dialog(self.app,
             "Analyzing binary references\u2026", work, done)
+
+    def _load_hex_editor(self):
+        """Populate the hex editor with the loaded binary data."""
+        if not self._engine or not self._engine.shift_engine:
+            return
+
+        se = self._engine.shift_engine
+        sections = self._engine.pe_info.get('sections', [])
+
+        # Build section-for-offset lookup
+        def section_for_offset(offset):
+            for sec in sections:
+                raw_off = sec.get('raw_offset', 0)
+                raw_sz = sec.get('raw_size', 0)
+                if raw_off > 0 and raw_off <= offset < raw_off + raw_sz:
+                    return sec.get('name', '?')
+            if offset < sections[0].get('raw_offset', 0) if sections else 0xFFFFFFFF:
+                return "Headers"
+            return "----"
+
+        # Wrap engine methods for the hex editor
+        def rva_to_offset(rva):
+            try:
+                return se._rva_to_offset(rva)
+            except Exception:
+                return None
+
+        def offset_to_rva(offset):
+            try:
+                return se._offset_to_rva(offset)
+            except Exception:
+                return None
+
+        def refs_at_rva(rva, range_size=0x100):
+            return self._engine.get_refs_at_rva(rva, range_size)
+
+        self._hex_editor.load_buffer(
+            buffer=se.buffer,
+            image_base=se.image_base,
+            sections=sections,
+            rva_to_offset=rva_to_offset,
+            offset_to_rva=offset_to_rva,
+            section_for_offset=section_for_offset,
+            refs_at_rva=refs_at_rva,
+        )
 
     # ── Stats ─────────────────────────────────────────────────────────
 
@@ -7846,6 +8500,7 @@ class UBRTTab(ttk.Frame):
                 out(f"    {sec.get('name', '?')}: {sec.get('reclaimed', 0):,} bytes reclaimed\n")
             out(f"\n  \u2714 Binary compacted successfully.\n", "ok")
             self.status_var.set(f"\u2714 Compacted: {result.get('reclaimed', 0):,} bytes reclaimed")
+            self._hex_editor.refresh()
         else:
             out(f"  No reclaimable padding found.\n", "dim")
             self.status_var.set("\u2714 No padding to reclaim")
@@ -7875,6 +8530,7 @@ class UBRTTab(ttk.Frame):
             out(f"  Bytes removed:   {result.get('bytes_removed', 0):,}\n", "ok")
             out(f"\n  \u2714 Signature stripped. Save the binary to write changes.\n", "ok")
             self.status_var.set(f"\u2714 Signature stripped ({result.get('type', '')})")
+            self._hex_editor.refresh()
         elif result.get('not_found') or 'not found' in result.get('message', '').lower() or 'no ' in result.get('message', '').lower():
             out(f"  {result.get('message', 'No signature found.')}\n", "dim")
             self.status_var.set(f"\u2714 {result.get('message', 'No signature')}")
@@ -7882,120 +8538,209 @@ class UBRTTab(ttk.Frame):
             out(f"  \u26A0 {result.get('error', result.get('message', 'Failed'))}\n", "error")
             self.status_var.set(f"\u26A0 {result.get('error', 'Strip failed')}")
 
-    # ── Parse helpers ─────────────────────────────────────────────────
+    # ── Hex editor callbacks ────────────────────────────────────────
 
-    def _parse_rva(self) -> int:
-        raw = self._rva_var.get().strip()
-        if not raw:
-            raise ValueError("RVA is empty")
-        return int(raw, 16) if raw.startswith(('0x', '0X')) else int(raw, 16)
+    def _on_hex_edit(self, offset, old_byte, new_byte):
+        """Called when user edits a byte in the hex editor — apply as patch."""
+        if not self._engine or not self._engine.shift_engine:
+            return
+        se = self._engine.shift_engine
+        rva = se._offset_to_rva(offset)
+        if rva is not None:
+            # Use patch to record in history (undo support)
+            result = self._engine.patch(rva, bytes([new_byte]))
+            self.status_var.set(
+                f"\u270F Patched byte at offset 0x{offset:08X} (RVA 0x{rva:08X}): "
+                f"0x{old_byte:02X} \u2192 0x{new_byte:02X}")
 
-    def _parse_hex_data(self) -> bytes:
-        raw = self._data_var.get().strip()
-        if not raw:
-            raise ValueError("Data/size is empty")
-        cleaned = raw.replace(' ', '').replace('0x', '').replace('0X', '')
-        return bytes.fromhex(cleaned)
+    def _toggle_qemu(self):
+        """Toggle QEMU tracer panel visibility."""
+        if self._qemu_visible.get():
+            self._qemu_frm.grid_forget()
+            self._qemu_visible.set(False)
+            self._qemu_toggle_btn.config(text="\u25B6  QEMU Dynamic Tracer")
+        else:
+            self._qemu_frm.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+            self._qemu_visible.set(True)
+            self._qemu_toggle_btn.config(text="\u25BC  QEMU Dynamic Tracer")
 
-    def _parse_size(self) -> int:
-        raw = self._data_var.get().strip()
-        if not raw:
-            raise ValueError("Size is empty")
-        if raw.startswith(('0x', '0X')):
-            return int(raw, 16)
-        return int(raw)
+    # ── Shift operation dialogs ───────────────────────────────────────
 
-    # ── Preview ───────────────────────────────────────────────────────
-
-    def _preview(self):
-        if not self._engine or not self._engine.ref_db:
+    def _insert_bytes_dialog(self):
+        """Show a dialog to insert bytes at the current cursor RVA."""
+        if not self._engine or not self._engine.shift_engine:
             self.status_var.set("\u26A0 Analyze a binary first")
             return
-        try:
-            rva = self._parse_rva()
-        except ValueError as e:
-            self.status_var.set(f"\u26A0 Bad RVA: {e}")
+
+        cursor_off = self._hex_editor._cursor_offset
+        se = self._engine.shift_engine
+        cursor_rva = se._offset_to_rva(cursor_off)
+        if cursor_rva is None:
+            self.status_var.set("\u26A0 Cursor is not at a valid RVA position")
             return
 
-        op = self._op_var.get()
-        try:
-            if op in ("INSERT", "NOP SLED"):
-                size = self._parse_size()
-            elif op == "DELETE":
-                size = self._parse_size()
-            elif op == "PATCH":
-                data = self._parse_hex_data()
-                size = len(data)
-            else:
-                size = self._parse_size()
-        except ValueError as e:
-            self.status_var.set(f"\u26A0 Bad data/size: {e}")
-            return
+        dlg = tk.Toplevel(self)
+        dlg.title("Insert Bytes")
+        dlg.configure(bg=T["bg"])
+        dlg.geometry("420x200")
+        dlg.transient(self)
+        dlg.grab_set()
 
-        preview = self._engine.preview('insert', rva, size)
-        tab = self.output.add_tab(f"Preview @0x{rva:X}")
-        out = lambda t, tag="": output_write(tab, t, tag)
+        tk.Label(dlg, text=f"Insert at RVA: 0x{cursor_rva:08X}  (Offset: 0x{cursor_off:08X})",
+                 bg=T["bg"], fg=T["accent"], font=("Consolas", 10, "bold")).pack(pady=(12, 8))
 
-        out(f"\n{'='*72}\n", "title")
-        out(f"  SHIFT PREVIEW: {op} {size} bytes at RVA 0x{rva:X}\n", "title")
-        out(f"{'='*72}\n\n", "title")
+        frm = tk.Frame(dlg, bg=T["bg"])
+        frm.pack(fill="x", padx=16, pady=4)
+        tk.Label(frm, text="Hex bytes:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
+        data_var = tk.StringVar()
+        data_ent = tk.Entry(frm, textvariable=data_var, width=40,
+                            bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                            font=("Consolas", 10), relief="flat", bd=4)
+        data_ent.pack(side="left", fill="x", expand=True)
 
-        out(f"  Total references:  {preview.get('total_refs', 0):,}\n")
-        out(f"  Refs affected:     {preview.get('refs_affected', 0):,}\n")
-        out(f"  Warnings:          {len(preview.get('warnings', []))}\n\n")
+        tk.Label(dlg, text="e.g.  90 90 CC  or  4883EC28  (hex bytes, spaces optional)",
+                 bg=T["bg"], fg=T["fg_dim"], font=("Segoe UI", 8)).pack(pady=(2, 8))
 
-        if preview.get('warnings'):
-            out("  \u26A0 WARNINGS:\n", "error")
-            for w in preview['warnings']:
-                out(f"    {w}\n", "error")
-            out("\n")
-
-        changes = preview.get('changes', [])
-        if changes:
-            out(f"  Changes ({len(changes):,}):\n", "heading")
-            for ch in changes[:500]:
-                out(f"    {ch}\n")
-            if len(changes) > 500:
-                out(f"\n    \u2026 and {len(changes)-500:,} more\n", "dim")
-
-        self.status_var.set(
-            f"\U0001F441 Preview: {preview.get('refs_affected', 0):,} refs affected, "
-            f"{len(preview.get('warnings', []))} warnings")
-
-    # ── Apply ─────────────────────────────────────────────────────────
-
-    def _apply(self):
-        if not self._engine or not self._engine.ref_db:
-            self.status_var.set("\u26A0 Analyze a binary first")
-            return
-        try:
-            rva = self._parse_rva()
-        except ValueError as e:
-            self.status_var.set(f"\u26A0 Bad RVA: {e}")
-            return
-
-        op = self._op_var.get()
-        try:
-            if op == "INSERT":
-                data = self._parse_hex_data()
-                result = self._engine.insert(rva, data)
-            elif op == "NOP SLED":
-                size = self._parse_size()
-                result = self._engine.insert_nops(rva, size)
-            elif op == "DELETE":
-                size = self._parse_size()
-                result = self._engine.delete(rva, size)
-            elif op == "PATCH":
-                data = self._parse_hex_data()
-                result = self._engine.patch(rva, data)
-            else:
-                self.status_var.set(f"\u26A0 Unknown op: {op}")
+        def do_insert():
+            raw = data_var.get().strip()
+            if not raw:
                 return
-        except Exception as e:
-            self.status_var.set(f"\u26A0 {e}")
+            try:
+                cleaned = raw.replace(' ', '').replace('0x', '').replace('0X', '')
+                data = bytes.fromhex(cleaned)
+            except ValueError:
+                self.status_var.set("\u26A0 Invalid hex data")
+                return
+            result = self._engine.insert(cursor_rva, data)
+            self._show_operation_result("INSERT", result)
+            self._hex_editor.refresh()
+            dlg.destroy()
+
+        btn_frm = tk.Frame(dlg, bg=T["bg"])
+        btn_frm.pack(pady=8)
+        ttk.Button(btn_frm, text="\u26A1  Insert", style="Accent.TButton",
+                   command=do_insert).pack(side="left", padx=6)
+        ttk.Button(btn_frm, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        data_ent.focus_set()
+
+    def _delete_bytes_dialog(self):
+        """Show a dialog to delete bytes at the current cursor RVA."""
+        if not self._engine or not self._engine.shift_engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
             return
 
-        tab = self.output.add_tab(f"{op} @0x{rva:X}")
+        cursor_off = self._hex_editor._cursor_offset
+        se = self._engine.shift_engine
+        cursor_rva = se._offset_to_rva(cursor_off)
+        if cursor_rva is None:
+            self.status_var.set("\u26A0 Cursor is not at a valid RVA position")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Delete Bytes")
+        dlg.configure(bg=T["bg"])
+        dlg.geometry("420x180")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"Delete at RVA: 0x{cursor_rva:08X}  (Offset: 0x{cursor_off:08X})",
+                 bg=T["bg"], fg=T["accent"], font=("Consolas", 10, "bold")).pack(pady=(12, 8))
+
+        frm = tk.Frame(dlg, bg=T["bg"])
+        frm.pack(fill="x", padx=16, pady=4)
+        tk.Label(frm, text="Count (bytes):", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
+        count_var = tk.StringVar()
+        count_ent = tk.Entry(frm, textvariable=count_var, width=16,
+                             bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                             font=("Consolas", 10), relief="flat", bd=4)
+        count_ent.pack(side="left")
+
+        tk.Label(dlg, text="e.g.  16  or  0x10  (number of bytes to delete)",
+                 bg=T["bg"], fg=T["fg_dim"], font=("Segoe UI", 8)).pack(pady=(2, 8))
+
+        def do_delete():
+            raw = count_var.get().strip()
+            if not raw:
+                return
+            try:
+                count = int(raw, 16) if raw.startswith(('0x', '0X')) else int(raw)
+            except ValueError:
+                self.status_var.set("\u26A0 Invalid count")
+                return
+            result = self._engine.delete(cursor_rva, count)
+            self._show_operation_result("DELETE", result)
+            self._hex_editor.refresh()
+            dlg.destroy()
+
+        btn_frm = tk.Frame(dlg, bg=T["bg"])
+        btn_frm.pack(pady=8)
+        ttk.Button(btn_frm, text="\u2702  Delete", style="Accent.TButton",
+                   command=do_delete).pack(side="left", padx=6)
+        ttk.Button(btn_frm, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        count_ent.focus_set()
+
+    def _nop_sled_dialog(self):
+        """Show a dialog to insert a NOP sled at the current cursor RVA."""
+        if not self._engine or not self._engine.shift_engine:
+            self.status_var.set("\u26A0 Analyze a binary first")
+            return
+
+        cursor_off = self._hex_editor._cursor_offset
+        se = self._engine.shift_engine
+        cursor_rva = se._offset_to_rva(cursor_off)
+        if cursor_rva is None:
+            self.status_var.set("\u26A0 Cursor is not at a valid RVA position")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Insert NOP Sled")
+        dlg.configure(bg=T["bg"])
+        dlg.geometry("420x180")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"NOP Sled at RVA: 0x{cursor_rva:08X}  (Offset: 0x{cursor_off:08X})",
+                 bg=T["bg"], fg=T["accent"], font=("Consolas", 10, "bold")).pack(pady=(12, 8))
+
+        frm = tk.Frame(dlg, bg=T["bg"])
+        frm.pack(fill="x", padx=16, pady=4)
+        tk.Label(frm, text="NOP count:", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
+        count_var = tk.StringVar()
+        count_ent = tk.Entry(frm, textvariable=count_var, width=16,
+                             bg=T["entry_bg"], fg=T["fg"], insertbackground=T["fg"],
+                             font=("Consolas", 10), relief="flat", bd=4)
+        count_ent.pack(side="left")
+
+        tk.Label(dlg, text="e.g.  64  or  0x40  (number of 0x90 NOP bytes to insert)",
+                 bg=T["bg"], fg=T["fg_dim"], font=("Segoe UI", 8)).pack(pady=(2, 8))
+
+        def do_nop():
+            raw = count_var.get().strip()
+            if not raw:
+                return
+            try:
+                count = int(raw, 16) if raw.startswith(('0x', '0X')) else int(raw)
+            except ValueError:
+                self.status_var.set("\u26A0 Invalid count")
+                return
+            result = self._engine.insert_nops(cursor_rva, count)
+            self._show_operation_result("NOP SLED", result)
+            self._hex_editor.refresh()
+            dlg.destroy()
+
+        btn_frm = tk.Frame(dlg, bg=T["bg"])
+        btn_frm.pack(pady=8)
+        ttk.Button(btn_frm, text="\u26A1  Insert NOPs", style="Accent.TButton",
+                   command=do_nop).pack(side="left", padx=6)
+        ttk.Button(btn_frm, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        count_ent.focus_set()
+
+    def _show_operation_result(self, op_name, result):
+        """Show the result of a shift operation in the output panel."""
+        tab = self.output.add_tab(f"{op_name} @0x{result.rva:X}")
         out = lambda t, tag="": output_write(tab, t, tag)
 
         status_icon = "\u2714" if result.success else "\u274C"
@@ -8042,6 +8787,7 @@ class UBRTTab(ttk.Frame):
         msg = self._engine.undo()
         if msg:
             self.status_var.set(f"\u21A9 {msg}")
+            self._hex_editor.refresh()
         else:
             self.status_var.set("\u26A0 Nothing to undo")
 
@@ -8074,9 +8820,9 @@ class UBRTTab(ttk.Frame):
         found = QEMUTracer.find_qemu()
         if found:
             self._qemu_var.set(found)
-            self._qemu_status.config(text=f"Found: {os.path.basename(found)}", fg=T["ok"])
+            self._qemu_status.config(text=f"Found: {os.path.basename(found)}", fg=T["green"])
         else:
-            self._qemu_status.config(text="QEMU not found \u2014 install or set path manually", fg=T["error"])
+            self._qemu_status.config(text="QEMU not found \u2014 install or set path manually", fg=T["red"])
 
     def _browse_disk(self):
         path = filedialog.askopenfilename(
@@ -8103,10 +8849,10 @@ class UBRTTab(ttk.Frame):
         if result.get('success'):
             self._qemu_status.config(
                 text=f"Running (PID {result['pid']}, GDB :{result['gdb_port']})",
-                fg=T["ok"])
+                fg=T["green"])
             self.status_var.set(f"\u25B6 QEMU started \u2014 trace log: {result['trace_log']}")
         else:
-            self._qemu_status.config(text=f"Error: {result['error']}", fg=T["error"])
+            self._qemu_status.config(text=f"Error: {result['error']}", fg=T["red"])
             self.status_var.set(f"\u26A0 {result['error']}")
 
     def _stop_trace(self):
