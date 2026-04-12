@@ -8878,10 +8878,21 @@ class UBRTTab(ttk.Frame):
 
             self._engine.save(out_path)
 
+            # If user loaded symbols, export updated .map alongside the binary
+            map_generated = False
+            symbols = self._engine.get_symbols()
+            if symbols:
+                map_path = out_base + '.map'
+                self._engine.export_symbol_map(map_path)
+                map_generated = True
+                copied_syms.append(os.path.basename(map_path))
+
             # Build status message
             parts = [f"\U0001F4BE Saved to {out_path}"]
             if copied_syms:
-                parts.append(f"Copied: {', '.join(copied_syms)}")
+                parts.append(f"Symbols: {', '.join(copied_syms)}")
+            if map_generated and self._engine.get_history():
+                parts.append(f"\u26A0 .pdb has original addresses \u2014 .map has updated ones")
             if backups:
                 bak_names = ', '.join(os.path.basename(b) for b in backups)
                 parts.append(f"Backups: {bak_names}")
