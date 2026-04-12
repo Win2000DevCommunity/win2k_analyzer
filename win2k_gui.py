@@ -19,6 +19,7 @@ import threading
 import os
 import re
 import json
+import datetime
 import importlib
 
 
@@ -8800,6 +8801,17 @@ class UBRTTab(ttk.Frame):
 
     # ── Save ──────────────────────────────────────────────────────────
 
+    def _backup_file(self, filepath):
+        """Backup a file with a datetime suffix .bak in the same directory.
+        Returns the backup path, or None if the file doesn't exist."""
+        if not filepath or not os.path.isfile(filepath):
+            return None
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        bak_path = f"{filepath}.{stamp}.bak"
+        import shutil
+        shutil.copy2(filepath, bak_path)
+        return bak_path
+
     def _save(self):
         if not self._engine or not self._engine.shift_engine:
             self.status_var.set("\u26A0 No binary loaded")
@@ -8815,8 +8827,39 @@ class UBRTTab(ttk.Frame):
         if not out_path:
             return
         try:
+            # Backup binary if overwriting an existing file
+            backups = []
+            bak = self._backup_file(out_path)
+            if bak:
+                backups.append(bak)
+
+            # Backup .pdb / .dbg alongside the binary (same base name)
+            out_base = os.path.splitext(out_path)[0]
+            for ext in ('.pdb', '.dbg'):
+                sym_path = out_base + ext
+                bak = self._backup_file(sym_path)
+                if bak:
+                    backups.append(bak)
+
+            # Also backup symbol source if it's in the same directory
+            if self._engine._symbol_source:
+                sym_src = self._engine._symbol_source
+                if (os.path.dirname(os.path.abspath(sym_src))
+                        == os.path.dirname(os.path.abspath(out_path))
+                        and os.path.abspath(sym_src) not in
+                        [os.path.abspath(out_base + e) for e in ('.pdb', '.dbg')]):
+                    bak = self._backup_file(sym_src)
+                    if bak:
+                        backups.append(bak)
+
             self._engine.save(out_path)
-            self.status_var.set(f"\U0001F4BE Saved to {out_path}")
+
+            if backups:
+                bak_names = ', '.join(os.path.basename(b) for b in backups)
+                self.status_var.set(
+                    f"\U0001F4BE Saved to {out_path}  \u2502  Backups: {bak_names}")
+            else:
+                self.status_var.set(f"\U0001F4BE Saved to {out_path}")
         except Exception as e:
             self.status_var.set(f"\u26A0 Save failed: {e}")
 
