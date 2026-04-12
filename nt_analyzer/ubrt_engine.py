@@ -5019,6 +5019,222 @@ class SymbolUpdater:
 
         return result
 
+    # ------------------------------------------------------------------
+    #  Inject new symbols into PDB 2.0
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def inject_symbols_pdb(pdb_path: str, symbols: Dict[int, str],
+                           pe_path: str,
+                           image_base: int = 0) -> Dict[str, Any]:
+        """
+        Inject new public symbols into a PDB 2.0 file.
+
+        Builds S_PUB32_16t records for each symbol and inserts them into
+        the GSI stream at the end of the existing symbol records.  The
+        stream size in the root directory is updated accordingly.
+
+        Args:
+            pdb_path:    Path to a PDB 2.0 file (modified in-place).
+            symbols:     {VA: name} of symbols to inject.
+            pe_path:     Patched PE file for section→segment mapping.
+            image_base:  PE ImageBase (auto-detected from pe_path if 0).
+
+        Returns:
+            dict  'injected', 'errors'.
+        """
+        result: Dict[str, Any] = {'injected': 0, 'errors': []}
+        if not symbols:
+            return result
+
+        # ── Read PDB ─────────────────────────────────────────────────
+        try:
+            with open(pdb_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            result['errors'].append(f'Cannot read {pdb_path}: {e}')
+            return result
+
+        PDB20_SIG = b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00'
+        if len(data) < 44 or bytes(data[:44]) != PDB20_SIG:
+            result['errors'].append('Only PDB 2.0 format supported')
+            return result
+
+        # ── Parse MSF header ─────────────────────────────────────────
+        page_size = struct.unpack_from('<I', data, 44)[0]
+        root_size = struct.unpack_from('<I', data, 52)[0]
+
+        if page_size == 0 or page_size > 0x10000:
+            result['errors'].append(f'Invalid page size: {page_size}')
+            return result
+
+        num_root_pages = math.ceil(root_size / page_size)
+        root_page_nums = [
+            struct.unpack_from('<H', data, 60 + i * 2)[0]
+            for i in range(num_root_pages)
+        ]
+
+        root_data = bytearray()
+        for pn in root_page_nums:
+            start = pn * page_size
+            root_data.extend(data[start:start + page_size])
+        root_data = bytearray(root_data[:root_size])
+
+        # ── Parse stream directory ───────────────────────────────────
+        num_streams = struct.unpack_from('<H', root_data, 0)[0]
+        off = 4
+        stream_sizes: List[int] = []
+        stream_size_offsets: List[int] = []  # root-data offset of each size
+        for _ in range(num_streams):
+            stream_size_offsets.append(off)
+            stream_sizes.append(struct.unpack_from('<I', root_data, off)[0])
+            off += 8
+
+        stream_pages: List[List[int]] = []
+        for sz in stream_sizes:
+            pn_count = math.ceil(sz / page_size) if sz > 0 else 0
+            pages = [
+                struct.unpack_from('<H', root_data, off + j * 2)[0]
+                for j in range(pn_count)
+            ]
+            off += pn_count * 2
+            stream_pages.append(pages)
+
+        # ── Section info from PE ─────────────────────────────────────
+        sections: List[Tuple[int, int, str]] = []  # (rva, vsize, name)
+        try:
+            import pefile as _pefile
+            _pe = _pefile.PE(pe_path, fast_load=True)
+            for s in _pe.sections:
+                nm = s.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+                sections.append((s.VirtualAddress, s.Misc_VirtualSize, nm))
+            if image_base == 0:
+                image_base = _pe.OPTIONAL_HEADER.ImageBase
+            _pe.close()
+        except Exception as e:
+            result['errors'].append(f'Cannot load PE: {e}')
+            return result
+
+        def va_to_seg_off(va: int):
+            rva = va - image_base
+            for i, (sec_rva, sec_vs, _) in enumerate(sections):
+                if sec_rva <= rva <= sec_rva + max(sec_vs, 1):
+                    return (i + 1, rva - sec_rva)
+            return None
+
+        # ── Build S_PUB32_16t records ────────────────────────────────
+        new_records = bytearray()
+        inject_count = 0
+        for va, name in sorted(symbols.items()):
+            mapping = va_to_seg_off(va)
+            if mapping is None:
+                continue
+            segment, offset = mapping
+            name_bytes = name.encode('ascii', errors='replace')
+            if len(name_bytes) > 255:
+                name_bytes = name_bytes[:255]
+            # reclen = rectyp(2) + flags(4) + offset(4) + segment(2)
+            #        + name_len(1) + name(N)
+            reclen = 2 + 4 + 4 + 2 + 1 + len(name_bytes)
+            rec = struct.pack('<HH', reclen, 0x1009)
+            rec += struct.pack('<I', 0)                  # flags
+            rec += struct.pack('<I', offset)             # offset
+            rec += struct.pack('<H', segment)            # segment
+            rec += struct.pack('<B', len(name_bytes))    # name_len
+            rec += name_bytes
+            total = len(rec)
+            if total % 4:
+                rec += b'\x00' * (4 - total % 4)
+            new_records += rec
+            inject_count += 1
+
+        if not new_records:
+            result['errors'].append('No symbols mapped to valid sections')
+            return result
+
+        # ── Find GSI stream and end of symbol records ────────────────
+        def read_stream(idx: int) -> bytes:
+            if idx >= num_streams or stream_sizes[idx] == 0:
+                return b''
+            sd = bytearray()
+            for pn in stream_pages[idx]:
+                start = pn * page_size
+                sd.extend(data[start:start + page_size])
+            return bytes(sd[:stream_sizes[idx]])
+
+        gsi_idx = -1
+        sym_end = 0
+        for si in (7, 6, 5):
+            if si >= num_streams:
+                continue
+            gsi = read_stream(si)
+            if len(gsi) < 4:
+                continue
+            so = 0
+            found = False
+            while so + 4 <= len(gsi):
+                rl = struct.unpack_from('<H', gsi, so)[0]
+                if rl < 2 or so + 2 + rl > len(gsi):
+                    break
+                rt = struct.unpack_from('<H', gsi, so + 2)[0]
+                if rt == 0x1009:
+                    found = True
+                step = 2 + rl
+                if step % 4:
+                    step += 4 - step % 4
+                so += step
+            if found:
+                gsi_idx = si
+                sym_end = so
+                break
+
+        if gsi_idx < 0:
+            result['errors'].append('No GSI symbol stream found in PDB')
+            return result
+
+        # ── Check space ──────────────────────────────────────────────
+        allocated = len(stream_pages[gsi_idx]) * page_size
+        new_stream_size = sym_end + len(new_records)
+        if new_stream_size > allocated:
+            result['errors'].append(
+                f'Insufficient space in GSI stream ({allocated} allocated, '
+                f'{new_stream_size} needed). Use MAP export instead.')
+            return result
+
+        # ── Write new records into stream pages ──────────────────────
+        def stream_off_to_file_off(s_idx: int, s_off: int) -> int:
+            pg = s_off // page_size
+            ip = s_off % page_size
+            if pg >= len(stream_pages[s_idx]):
+                return -1
+            return stream_pages[s_idx][pg] * page_size + ip
+
+        for i, b in enumerate(new_records):
+            fo = stream_off_to_file_off(gsi_idx, sym_end + i)
+            if 0 <= fo < len(data):
+                data[fo] = b
+
+        result['injected'] = inject_count
+
+        # ── Update stream size in root directory ─────────────────────
+        struct.pack_into('<I', root_data, stream_size_offsets[gsi_idx],
+                         new_stream_size)
+        # Write modified root stream back
+        for pi, pn in enumerate(root_page_nums):
+            src_s = pi * page_size
+            src_e = min(src_s + page_size, len(root_data))
+            dst_s = pn * page_size
+            data[dst_s:dst_s + (src_e - src_s)] = root_data[src_s:src_e]
+
+        # ── Write file ───────────────────────────────────────────────
+        try:
+            with open(pdb_path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            result['errors'].append(f'Cannot write {pdb_path}: {e}')
+
+        return result
+
 
 # ─── Shift Engine ─────────────────────────────────────────────────────────
 

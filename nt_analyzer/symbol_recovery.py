@@ -412,12 +412,14 @@ class SymbolRecoveryEngine:
         return content
 
     def export_pdb(self, orig_pdb_path: str, output_path: str,
-                   orig_pe_path: str = None) -> Dict[str, Any]:
+                   orig_pe_path: str = None,
+                   patched_pe_path: str = None) -> Dict[str, Any]:
         """
         Create a patched copy of the original PDB with recovered addresses.
 
         Strategy: for each matched section, compute the delta and apply
-        section-specific shifts using the PDB patcher.
+        section-specific shifts using the PDB patcher.  Then inject any
+        discovered symbols (new sections) into the PDB.
         """
         import shutil
         if self._diff is None:
@@ -454,10 +456,20 @@ class SymbolRecoveryEngine:
                 'errors': r.get('errors', []),
             })
 
+        # Inject discovered symbols (new sections like .sec21)
+        inject_result = None
+        discovered = {r.recovered_va: r.name for r in self._recovered
+                      if r.status == 'discovered'}
+        if discovered and patched_pe_path:
+            inject_result = SymbolUpdater.inject_symbols_pdb(
+                output_path, discovered, pe_path=patched_pe_path,
+                image_base=self._diff.patched_image_base)
+
         return {
             'output_path': output_path,
             'section_results': results,
             'total_sections_shifted': sum(1 for r in results if r['patched'] > 0),
+            'injected': inject_result,
         }
 
     # ------------------------------------------------------------------

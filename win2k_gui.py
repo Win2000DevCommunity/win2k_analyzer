@@ -9758,9 +9758,12 @@ class SymbolRecoveryTab(ttk.Frame):
         self.status_var.set("\u23F3 Patching PDB...")
 
         orig_pe = self._orig_ent.get_value()
+        patched_pe = self._patch_ent.get_value()
 
         def work():
-            return self._engine.export_pdb(sym_path, out_path, orig_pe_path=orig_pe)
+            return self._engine.export_pdb(sym_path, out_path,
+                                           orig_pe_path=orig_pe,
+                                           patched_pe_path=patched_pe)
 
         def done(result):
             if isinstance(result, Exception):
@@ -9768,8 +9771,13 @@ class SymbolRecoveryTab(ttk.Frame):
                 output_write(self.output, f"  \u2717 PDB error: {result}\n", "error")
                 return
             shifted = result.get('total_sections_shifted', 0)
-            self.status_var.set(
-                f"\U0001F4BE PDB exported: {shifted} sections shifted \u2192 {os.path.basename(out_path)}")
+            inj = result.get('injected')
+            inj_count = inj.get('injected', 0) if inj else 0
+            status_msg = (
+                f"\U0001F4BE PDB exported: {shifted} sections shifted"
+                f"{f', {inj_count} new symbols injected' if inj_count else ''}"
+                f" \u2192 {os.path.basename(out_path)}")
+            self.status_var.set(status_msg)
             output_write(self.output, f"\n  \u2714 PDB exported: {out_path}\n", "ok")
             for sr in result.get('section_results', []):
                 output_write(self.output,
@@ -9777,6 +9785,12 @@ class SymbolRecoveryTab(ttk.Frame):
                     f"symbols shifted by {sr['delta']:+d}\n",
                     "ok" if sr['patched'] > 0 else "dim")
                 for err in sr.get('errors', []):
+                    output_write(self.output, f"      \u26A0 {err}\n", "warn")
+            if inj:
+                if inj_count > 0:
+                    output_write(self.output,
+                        f"    Injected {inj_count} new-section symbols into PDB\n", "ok")
+                for err in inj.get('errors', []):
                     output_write(self.output, f"      \u26A0 {err}\n", "warn")
 
         run_with_progress(self, work, done)
