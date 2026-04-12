@@ -4,7 +4,15 @@
 
 Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (17 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.5 — Universal Binary Rewriting Tool (UBRT) v7.2:**
+**NEW in v3.6 — Symbol-Aware Binary Rewriting:**
+- **Direct .pdb/.dbg patching:** When you save a modified binary, UBRT now patches the actual symbol files in-place — PDB 2.0 symbol offsets (S_PUB32_16t records in GSI stream) and DBG files (COFF symbol tables, FPO entries, section headers) are all shifted to match the new binary layout. No more stale symbol addresses.
+- **Full hex editor:** The UBRT tab now includes a proper hex editor widget (~480 lines) with offset display, hex+ASCII columns, keyboard navigation, and selection — replaces the old text-entry fields.
+- **Symbol lifecycle management:** Load Symbols / From Exports / Export .map buttons in the UBRT tab. Symbols are automatically shifted in memory after every insert/delete operation. On save, a Microsoft-format .map file with correct shifted addresses is generated alongside the binary.
+- **Auto-backup on save:** Binary and associated .pdb/.dbg files are automatically backed up with datetime-stamped `.bak` suffixes before overwriting.
+- **Atomic save:** Uses temp-file + `os.replace()` for crash-safe writes. PE file handles are properly closed before writing (fixes Windows "Errno 22" on same-directory saves).
+- **Tested with real Win2K symbols:** Round-trip verified with ntoskrnl.pdb (7,679 PDB symbols patched), ntoskrnl.dbg (4,652 FPO entries patched), all addresses confirmed correct after shift.
+
+**Previously in v3.5 — Universal Binary Rewriting Tool (UBRT) v7.2:**
 - **Universal Binary Rewriter:** Insert, delete, or patch bytes anywhere in a PE, ELF, or Mach-O binary and have **every reference in the file automatically recalculated** — relocations, jump tables, export/import tables, exception tables, TLS, debug directories, resource directories, load configs, delay imports, bound imports, and more.
 - **15 reference analysis passes** — discovers 109,000+ relocatable references in ntoskrnl.exe alone: direct relocations, export RVAs, import thunks, exception handler RVAs, TLS callbacks, debug directory entries, resource RVAs, load config pointers, delay import descriptors, bound import descriptors, indirect calls through memory, indirect jumps through memory, section-relative data, cross-section references, and QEMU dynamic trace targets.
 - **Multi-format support:** PE (32/64-bit), ELF (with full section/program header updates, SHT_RELA addend correction), Mach-O (including fat/universal binaries with automatic arch offset shifting).
@@ -51,6 +59,7 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 ## Table of Contents
 
 - [What Does This Tool Do?](#what-does-this-tool-do)
+- [What's New in v3.6 — Symbol-Aware Binary Rewriting](#whats-new-in-v36--symbol-aware-binary-rewriting)
 - [What's New in v3.5 — UBRT Engine](#whats-new-in-v35--ubrt-engine)
 - [What's New in v3.4 — Dynamic PDB Structure Extraction](#whats-new-in-v34--dynamic-pdb-structure-extraction)
 - [What's New in v3.2](#whats-new-in-v32)
@@ -94,6 +103,93 @@ This tool gives you everything in one place:
 7. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
 8. **Scan** — System-wide cross-reference scanning: find every PE in a directory that imports or calls a given function
 9. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+
+---
+
+## What's New in v3.6 — Symbol-Aware Binary Rewriting
+
+### Direct .pdb/.dbg Patching (NEW)
+
+When you modify a binary with UBRT (insert, delete bytes) and save, the associated symbol files are now **patched in-place** with the correct shifted addresses — not just copied. Both formats used by Windows 2000 debug symbols are supported:
+
+**PDB 2.0 patching (`SymbolUpdater.patch_pdb_file()`):**
+- Parses the MSF (Multi-Stream Format) page structure natively
+- Walks S_PUB32_16t symbol records in the GSI stream (streams 5/6/7)
+- For each symbol whose `section:offset` resolves to an RVA >= the shift threshold, shifts the offset field in-place
+- Writes modified bytes back to the correct MSF pages in the file
+- Requires the PE file for segment→RVA mapping via section headers
+
+**DBG patching (`SymbolUpdater.patch_dbg_file()`):**
+- Patches COFF symbol tables (shifts the 4-byte `Value` field for external/static/label symbols)
+- Patches FPO (Frame Pointer Omission) entries (shifts `ulOffStart` — function start addresses)
+- Patches section header `VirtualAddress` fields inside the DBG file
+- Updates `SizeOfImage` in the IMAGE_SEPARATE_DEBUG_HEADER
+
+**Round-trip verified with Win2K SP4 debug symbols:**
+```
+ntoskrnl.pdb: 7,679 symbols found, 7,587 patched (shift at RVA 0x1000, +0x200)
+ntoskrnl.dbg: 4,652 FPO entries + 21 section headers patched
+All symbol addresses verified correct after re-reading patched files
+```
+
+### Hex Editor Widget (NEW)
+
+The UBRT tab's input fields have been replaced with a full hex editor widget:
+
+- **Offset column** — file offset display in hex
+- **Hex grid** — 16 bytes per row with proper spacing
+- **ASCII column** — printable character display alongside hex
+- **Keyboard navigation** — arrow keys, Page Up/Down, Home/End
+- **Selection support** — click and drag to select byte ranges
+- **Integrated** — works directly with the UBRT engine's buffer
+
+### Symbol Lifecycle Management (NEW)
+
+Three new buttons in the UBRT tab button bar:
+
+| Button | Function |
+|--------|----------|
+| **Load Symbols** | Opens a file dialog for `.map`, `.pdb`, `.dbg`, or `.sym` files. Symbols are loaded as `{virtual_address: name}` and tracked in the engine. |
+| **From Exports** | Populates symbols from the PE's own export table — works on DLLs/drivers without any external symbol file. |
+| **Export .map** | Generates a Microsoft-format `.map` file with current (shifted) symbol addresses. |
+
+**Automatic symbol maintenance:**
+- After every insert/delete operation, loaded symbols are shifted in memory via `SymbolUpdater.shift_symbols()`
+- On save, all shift operations from history are replayed against `.pdb`/`.dbg` files
+- A `.map` file with correct addresses is always generated alongside the saved binary
+- Status bar shows patch results: `"Patched: ntoskrnl.pdb(7587), ntoskrnl.dbg(4672)"`
+
+### Save Improvements
+
+- **Auto-backup:** Before overwriting, the binary and any `.pdb`/`.dbg` files are backed up with datetime suffixes (e.g., `ntoskrnl.exe.20260412_143052.bak`)
+- **Atomic writes:** Uses `tempfile` + `os.replace()` for crash-safe saves — no partial writes on power loss
+- **PE handle management:** Always closes the `pefile.PE` file handle before writing, then re-opens from the buffer — fixes the Windows "Errno 22: Invalid argument" error on same-directory saves
+- **Symbol file copying:** When saving to a different directory, `.pdb`/`.dbg` files are copied from the source directory
+
+### Python API
+
+```python
+from nt_analyzer.ubrt_engine import SymbolUpdater
+
+# Patch a PDB 2.0 file after binary modification
+result = SymbolUpdater.patch_pdb_file(
+    "ntoskrnl.pdb",
+    shift_rva=0x5000,      # RVA threshold
+    delta=0x200,            # bytes inserted
+    pe_path="ntoskrnl.exe", # for section mapping
+    image_base=0x400000
+)
+print(f"Patched {result['patched']}/{result['total']} symbols")
+
+# Patch a DBG file
+result = SymbolUpdater.patch_dbg_file(
+    "ntoskrnl.dbg",
+    shift_rva=0x5000,
+    delta=0x200,
+    image_base=0x400000
+)
+print(f"Patched {result['patched']}/{result['total']} entries (FPO + COFF + sections)")
+```
 
 ---
 
@@ -575,6 +671,9 @@ All long-running operations now show a **real-time progress dialog** with:
 | | **15-pass reference analysis (relocations, exports, imports, exceptions, TLS, resources, ...)** | Python API | Tab 17 |
 | | **Multi-format: PE (32/64), ELF (RELA), Mach-O (fat/universal)** | Python API | Tab 17 |
 | | **QEMU dynamic tracing — discover indirect call/jump targets** | Python API | Tab 17 |
+| | **Direct .pdb/.dbg symbol file patching — PDB 2.0 + COFF/FPO** | Python API | Tab 17 |
+| | **Symbol lifecycle: load/shift/export .map + hex editor widget** | Python API | Tab 17 |
+| | **Atomic save with auto-backup (.bak with datetime suffix)** | Python API | Tab 17 |
 | | **compact() — reclaim section padding (PE, ELF, Mach-O)** | Python API | Tab 17 |
 | | **strip_signature() — remove PE Authenticode / Mach-O LC_CODE_SIGNATURE** | Python API | Tab 17 |
 | | **Resource directory protection (.rsrc conflict detection)** | Python API | Tab 17 |
@@ -1498,11 +1597,14 @@ Live kernel-state debugger — a portable WinDbg built entirely in Python:
 Universal Binary Rewriting Tool — treat any binary like a text file. Insert, delete, or patch bytes anywhere and have every reference in the file automatically recalculated:
 
 - **Browse to any PE, ELF, or Mach-O binary** — format is auto-detected
+- **Hex editor** — full hex editor widget with offset column, hex+ASCII display, keyboard navigation, and selection
 - **Analyze References** — runs 15 analysis passes to discover all relocatable references (relocations, exports, imports, exception handlers, TLS callbacks, debug directories, resource RVAs, load config pointers, delay imports, bound imports, indirect calls/jumps, section-relative data, cross-section refs)
 - **Results display** — shows reference count by type, broken down by analysis pass
 - **Insert Bytes** — insert N bytes at any RVA/offset; all references after the insertion point are shifted forward automatically
 - **Delete Bytes** — remove N bytes at any RVA/offset; all references shift backward
 - **Patch Bytes** — overwrite bytes at any offset without shifting
+- **Load Symbols / From Exports / Export .map** — load debug symbols, auto-shift on modify, export Microsoft-format .map files
+- **Save** — atomic temp-file writes, auto-backup with datetime suffix, patches .pdb/.dbg symbol files with shifted addresses, generates .map alongside binary
 - **compact()** — reclaim trailing zero padding from sections to shrink the binary
 - **strip_signature()** — remove code signatures (PE Authenticode / Mach-O LC_CODE_SIGNATURE) so modified binaries don't trigger verification failures
 - **QEMU Trace** — load a QEMU `-d exec` trace log to discover indirect call/jump targets; merged as first-class references
@@ -1515,7 +1617,7 @@ Universal Binary Rewriting Tool — treat any binary like a text file. Insert, d
 
 ## UBRT Engine — Universal Binary Rewriting
 
-The UBRT Engine (Tab 17, `nt_analyzer/ubrt_engine.py`) is a **universal binary shift engine** that lets you insert, delete, or patch bytes at arbitrary locations in PE, ELF, and Mach-O binaries while automatically recalculating every internal reference. Think of it as `sed` for compiled binaries.
+The UBRT Engine (Tab 17, `nt_analyzer/ubrt_engine.py`) is a **universal binary shift engine** that lets you insert, delete, or patch bytes at arbitrary locations in PE, ELF, and Mach-O binaries while automatically recalculating every internal reference — and now **patching associated symbol files** (.pdb, .dbg) so debugger info stays correct. Think of it as `sed` for compiled binaries.
 
 ### Why UBRT?
 
@@ -1583,7 +1685,10 @@ engine.compact()
 # Strip code signatures before distribution
 engine.strip_signature()
 
-# Save the modified binary
+# Load symbols from .pdb/.dbg/.map (auto-shifted on insert/delete)
+engine.load_symbols("ntoskrnl.pdb")
+
+# Save — binary + patched .pdb/.dbg + .map with shifted addresses
 engine.save("ntoskrnl_modified.exe")
 ```
 
@@ -1996,8 +2101,8 @@ win2k_analyzer/
 │   ├── deep_analyzer.py       # IDA Pro-level function discovery, profiling, XRefs, deep compare
 │   ├── symbol_loader.py       # Multi-format symbol loader (.map/.pdb/.dbg/.sym)
 │   ├── emulator.py            # Unicorn-based kernel function emulator with API mocking
-│   ├── kernel_debugger.py     # (NEW) Live kernel-state debugger: multi-PE loader, breakpoints, stepping
-│   └── ubrt_engine.py         # (NEW) Universal Binary Rewriting Tool: PE/ELF/Mach-O shift engine, 15-pass ref analysis
+│   ├── kernel_debugger.py     # Live kernel-state debugger: multi-PE loader, breakpoints, stepping
+│   └── ubrt_engine.py         # Universal Binary Rewriting Tool: PE/ELF/Mach-O shift engine, 15-pass ref analysis, .pdb/.dbg symbol patching
 │
 ├── generated_headers/         # Output: generated C header files
 │   ├── peb_win2k.h
