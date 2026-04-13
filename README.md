@@ -2401,7 +2401,7 @@ A: Yes. Each module in `nt_analyzer/` is standalone. Add new detection rules to 
 
 ## Contributing
 
-This is a community project for Windows 2000 preservation and ReactOS compatibility research.
+This is a community project for Windows 2000 preservation.
 
 1. Fork the repository
 2. Create a feature branch
