@@ -4,7 +4,16 @@
 
 Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (18 tabs)** and a **full CLI (27 commands)**.
 
-**NEW in v3.8 — New-Section Symbol Discovery & PDB Injection:**
+**NEW in v3.9 — Project Save/Load System (.am files):**
+- **Custom `.am` project format:** Save and restore the complete state of all 18 GUI tabs — every file path, every option, every output pane — in a single JSON-based `.am` file. Open a project tomorrow and pick up exactly where you left off.
+- **Auto-save:** Toggle auto-save from the File menu — your project is silently saved every 2 minutes while you work. Never lose progress.
+- **Save-on-quit prompt:** Closing the app with unsaved changes triggers a Save/Discard/Cancel dialog.
+- **Dirty tracking:** The title bar shows `*` when there are unsaved changes.
+- **Recent Projects:** The File menu tracks your last 5 opened projects for quick access.
+- **Full keyboard shortcuts:** Ctrl+S (Save), Ctrl+Shift+S (Save As), Ctrl+O (Open), Ctrl+N (New Project).
+- **18-tab state serialization:** Every tab class implements `get_state()` / `set_state()` — file picker values, checkboxes, radio buttons, combo box selections, output notebook contents (with per-tab titles), treeview data (Symbol Recovery tab), and all other widget state.
+
+**Previously in v3.8 — New-Section Symbol Discovery & PDB Injection:**
 - **Discover symbols in new sections:** When a patcher adds sections (like `.sec21`), the engine automatically discovers and labels every structural element — section boundary markers (`__sec21_start`/`__sec21_end`), PE data directory entries (`__PE_EXPORT_Directory`), export table structures (`__ExportAddressTable`, `__ExportNameTable`, `__ExportOrdinalTable`), export name strings, and DLL name strings. Executable new sections are also scanned for function prologues.
 - **New export discovery:** Compares original vs patched export tables to find **89 new exported functions** added by the patcher (blackwingcat) — `DbgPrintEx`, `IoCsqInitialize`, `RtlGetVersion`, `PsGetCurrentThread`, `KeAreApcsDisabled`, `NtOpenThreadTokenEx`, `SeFilterToken`, `IoAssignDriveLetters`, `InterlockedPopEntrySList`, AVL tree APIs, Job object APIs, and more. Functions are discovered regardless of which section their code lives in (`.text`, `.edata`, `PAGE`, `.data`).
 - **PDB symbol injection:** The "Export PDB" button injects all discovered symbols as S_PUB32_16t records directly into the PDB 2.0 GSI stream. When the stream runs out of space, new MSF pages are automatically allocated and the root directory is rebuilt — no size limits.
@@ -71,6 +80,7 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 ## Table of Contents
 
 - [What Does This Tool Do?](#what-does-this-tool-do)
+- [What's New in v3.9 — Project Save/Load System](#whats-new-in-v39--project-saveload-system-am-files)
 - [What's New in v3.6 — Symbol-Aware Binary Rewriting](#whats-new-in-v36--symbol-aware-binary-rewriting)
 - [What's New in v3.5 — UBRT Engine](#whats-new-in-v35--ubrt-engine)
 - [What's New in v3.4 — Dynamic PDB Structure Extraction](#whats-new-in-v34--dynamic-pdb-structure-extraction)
@@ -116,6 +126,53 @@ This tool gives you everything in one place:
 7. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
 8. **Scan** — System-wide cross-reference scanning: find every PE in a directory that imports or calls a given function
 9. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+
+---
+
+## What's New in v3.9 — Project Save/Load System (.am files)
+
+All GUI state is now persistable via a custom `.am` project file format. Every file path, option, checkbox, output pane, and treeview across all 18 tabs is captured and restored.
+
+### File Menu
+
+| Action | Shortcut | Description |
+|--------|----------|-------------|
+| New Project | Ctrl+N | Clear all state, start fresh |
+| Open Project | Ctrl+O | Load a `.am` file, restore all 18 tabs |
+| Save | Ctrl+S | Save current state (prompts for path if new) |
+| Save As | Ctrl+Shift+S | Save to a new `.am` file |
+| Auto-save | — | Toggle 2-minute auto-save (checkbutton) |
+| Recent Projects | — | Quick-open last 5 projects |
+| Exit | — | Quit with save-on-close prompt |
+
+### What Gets Saved
+
+Every tab serializes its complete state via `get_state()` / `set_state()`:
+
+- **All file picker paths** — DLL paths, PE paths, output directories, symbol files
+- **All options** — checkboxes, radio buttons, combo box selections, spinbox values
+- **All output panes** — the `TabbedOutput` notebook saves every tab's title and text content
+- **Treeview data** — Symbol Recovery tab (Tab 18) saves all rows with columns intact
+- **App-level state** — active tab index, window geometry, theme
+
+### .am File Format
+
+JSON with forward-compatible versioning:
+
+```json
+{
+  "_am_version": 1,
+  "_saved_at": "2026-04-13T12:00:00",
+  "theme": "dark",
+  "active_tab": 0,
+  "geometry": "1400x900+100+50",
+  "tabs": {
+    "export_import": { ... },
+    "syscall": { ... },
+    ...all 18 tabs...
+  }
+}
+```
 
 ---
 

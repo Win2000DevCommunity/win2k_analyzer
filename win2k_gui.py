@@ -208,6 +208,260 @@ class PlaceholderEntry(tk.Entry):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Project Manager — .am file save / load system
+# ══════════════════════════════════════════════════════════════════════════
+
+_AM_VERSION = 1          # format version for forward-compat
+_AM_FILTER  = [("Analyzer Project", "*.am"), ("All Files", "*.*")]
+_AUTOSAVE_INTERVAL_MS = 120_000   # 2 minutes
+
+
+class ProjectManager:
+    """Manages .am project files — save, load, auto-save, dirty tracking."""
+
+    def __init__(self, app):
+        self.app = app
+        self._path = None          # current .am file path
+        self._auto_save = False
+        self._dirty = False
+        self._auto_save_id = None  # after() id for auto-save timer
+        self._recent = []          # last 5 recent files
+
+        # Load recent list from a small cache file next to the script
+        self._recent_file = os.path.join(os.path.dirname(__file__), ".am_recent")
+        self._load_recent()
+
+    # ── dirty state ──────────────────────────────────────────────────
+    def mark_dirty(self):
+        if not self._dirty:
+            self._dirty = True
+            self._refresh_title()
+
+    def _refresh_title(self):
+        base = "Win2K NT Internals Analyzer"
+        if self._path:
+            name = os.path.basename(self._path)
+            star = " *" if self._dirty else ""
+            self.app.title(f"{base} — {name}{star}")
+        else:
+            star = " *" if self._dirty else ""
+            self.app.title(f"{base}{star}")
+
+    # ── recent list ──────────────────────────────────────────────────
+    def _load_recent(self):
+        try:
+            if os.path.isfile(self._recent_file):
+                with open(self._recent_file, "r", encoding="utf-8") as f:
+                    self._recent = [l.strip() for l in f if l.strip()][:5]
+        except Exception:
+            self._recent = []
+
+    def _save_recent(self):
+        try:
+            with open(self._recent_file, "w", encoding="utf-8") as f:
+                for p in self._recent[:5]:
+                    f.write(p + "\n")
+        except Exception:
+            pass
+
+    def _add_recent(self, path):
+        path = os.path.abspath(path)
+        if path in self._recent:
+            self._recent.remove(path)
+        self._recent.insert(0, path)
+        self._recent = self._recent[:5]
+        self._save_recent()
+        self.app._rebuild_recent_menu()
+
+    # ── collect / restore state ──────────────────────────────────────
+    def _tab_map(self):
+        """Return ordered list of (key, tab_widget) for all 18 tabs."""
+        a = self.app
+        return [
+            ("exports",    a.tab_exports),
+            ("syscalls",   a.tab_syscalls),
+            ("compare",    a.tab_compare),
+            ("structs",    a.tab_structs),
+            ("pe",         a.tab_pe),
+            ("defgen",     a.tab_defgen),
+            ("scpatch",    a.tab_scpatch),
+            ("rospatch",   a.tab_rospatch),
+            ("build",      a.tab_build),
+            ("behavior",   a.tab_behavior),
+            ("decompiler", a.tab_decompiler),
+            ("compat",     a.tab_compat),
+            ("deep",       a.tab_deep),
+            ("xref",       a.tab_xref),
+            ("patcher",    a.tab_patcher),
+            ("kdbg",       a.tab_kdbg),
+            ("ubrt",       a.tab_ubrt),
+            ("symrecov",   a.tab_symrecov),
+        ]
+
+    def _collect(self):
+        """Collect entire project state into a serialisable dict."""
+        state = {
+            "_am_version": _AM_VERSION,
+            "_saved_at": datetime.datetime.now().isoformat(),
+            "theme": self.app.theme_var.get(),
+            "active_tab": self.app.nb.index(self.app.nb.select()) if self.app.nb.select() else 0,
+            "geometry": self.app.geometry(),
+            "tabs": {},
+        }
+        for key, tab in self._tab_map():
+            try:
+                state["tabs"][key] = tab.get_state()
+            except Exception:
+                state["tabs"][key] = {}
+        return state
+
+    def _restore(self, state):
+        """Restore full project state from a dict."""
+        # Theme
+        theme = state.get("theme", "Dark")
+        if theme in THEMES:
+            self.app.theme_var.set(theme)
+            self.app._apply_theme(theme)
+        # Geometry
+        geo = state.get("geometry")
+        if geo:
+            try:
+                self.app.geometry(geo)
+            except Exception:
+                pass
+        # Tabs
+        tabs_data = state.get("tabs", {})
+        for key, tab in self._tab_map():
+            try:
+                tab.set_state(tabs_data.get(key))
+            except Exception:
+                pass
+        # Active tab
+        active = state.get("active_tab", 0)
+        tab_ids = self.app.nb.tabs()
+        if tab_ids and 0 <= active < len(tab_ids):
+            self.app.nb.select(tab_ids[active])
+
+    # ── file I/O ─────────────────────────────────────────────────────
+    def _write(self, path):
+        data = self._collect()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def _read(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # ── public API ───────────────────────────────────────────────────
+    def new_project(self):
+        if self._dirty:
+            ans = messagebox.askyesnocancel(
+                "Unsaved changes", "Save current project before creating a new one?")
+            if ans is None:
+                return  # cancel
+            if ans:
+                self.save()
+        self._path = None
+        self._dirty = False
+        self._refresh_title()
+
+    def save(self):
+        if not self._path:
+            return self.save_as()
+        self._write(self._path)
+        self._dirty = False
+        self._add_recent(self._path)
+        self._refresh_title()
+        self.app.set_status(f"\U0001F4BE Project saved: {os.path.basename(self._path)}")
+
+    def save_as(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Project",
+            defaultextension=".am",
+            filetypes=_AM_FILTER)
+        if not path:
+            return
+        self._path = path
+        self._write(self._path)
+        self._dirty = False
+        self._add_recent(self._path)
+        self._refresh_title()
+        self.app.set_status(f"\U0001F4BE Project saved: {os.path.basename(self._path)}")
+
+    def load(self, path=None):
+        if self._dirty:
+            ans = messagebox.askyesnocancel(
+                "Unsaved changes", "Save current project before opening another?")
+            if ans is None:
+                return
+            if ans:
+                self.save()
+        if not path:
+            path = filedialog.askopenfilename(
+                title="Open Project",
+                filetypes=_AM_FILTER)
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            state = self._read(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load project:\n{e}")
+            return
+        self._path = path
+        self._restore(state)
+        self._dirty = False
+        self._add_recent(path)
+        self._refresh_title()
+        self.app.set_status(f"\U0001F4C2 Project loaded: {os.path.basename(path)}")
+
+    def toggle_auto_save(self):
+        self._auto_save = not self._auto_save
+        if self._auto_save:
+            self._schedule_auto_save()
+            self.app.set_status("\U0001F501 Auto-save enabled (every 2 minutes)")
+        else:
+            if self._auto_save_id:
+                self.app.after_cancel(self._auto_save_id)
+                self._auto_save_id = None
+            self.app.set_status("\u23F8 Auto-save disabled")
+
+    def _schedule_auto_save(self):
+        if not self._auto_save:
+            return
+        if self._dirty and self._path:
+            try:
+                self._write(self._path)
+                self._dirty = False
+                self._refresh_title()
+            except Exception:
+                pass
+        self._auto_save_id = self.app.after(_AUTOSAVE_INTERVAL_MS, self._schedule_auto_save)
+
+    def on_closing(self):
+        """Called from WM_DELETE_WINDOW."""
+        if self._dirty:
+            ans = messagebox.askyesnocancel(
+                "Unsaved changes", "Save project before quitting?")
+            if ans is None:
+                return  # cancel close
+            if ans:
+                self.save()
+        self.app.destroy()
+
+    @property
+    def auto_save(self):
+        return self._auto_save
+
+    @property
+    def recent(self):
+        return list(self._recent)
+
+    @property
+    def current_path(self):
+        return self._path
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Main Application
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -223,9 +477,61 @@ class App(tk.Tk):
         self._placeholder_entries = []
 
         self._configure_styles()
+        self._build_menu()
         self._build_header()
         self._build_notebook()
         self._build_statusbar()
+
+        # Project manager (must be after notebook so all tabs exist)
+        self.project = ProjectManager(self)
+        self._rebuild_recent_menu()
+        self.protocol("WM_DELETE_WINDOW", self.project.on_closing)
+
+        # Keyboard shortcuts
+        self.bind_all("<Control-s>", lambda e: self.project.save())
+        self.bind_all("<Control-S>", lambda e: self.project.save())
+        self.bind_all("<Control-Shift-s>", lambda e: self.project.save_as())
+        self.bind_all("<Control-Shift-S>", lambda e: self.project.save_as())
+        self.bind_all("<Control-o>", lambda e: self.project.load())
+        self.bind_all("<Control-O>", lambda e: self.project.load())
+        self.bind_all("<Control-n>", lambda e: self.project.new_project())
+        self.bind_all("<Control-N>", lambda e: self.project.new_project())
+
+    # ── Menu bar ──────────────────────────────────────────────────────────
+    def _build_menu(self):
+        self._menubar = tk.Menu(self, tearoff=0)
+        self.configure(menu=self._menubar)
+
+        self._file_menu = tk.Menu(self._menubar, tearoff=0)
+        self._menubar.add_cascade(label="File", menu=self._file_menu)
+
+        self._file_menu.add_command(label="New Project        Ctrl+N",
+                                    command=lambda: self.project.new_project())
+        self._file_menu.add_command(label="Open Project…    Ctrl+O",
+                                    command=lambda: self.project.load())
+        self._file_menu.add_separator()
+        self._file_menu.add_command(label="Save                   Ctrl+S",
+                                    command=lambda: self.project.save())
+        self._file_menu.add_command(label="Save As…",
+                                    command=lambda: self.project.save_as())
+        self._file_menu.add_separator()
+        self._auto_save_idx = self._file_menu.index("end") + 1
+        self._file_menu.add_checkbutton(label="Auto-save (every 2 min)",
+                                        command=lambda: self.project.toggle_auto_save())
+        self._file_menu.add_separator()
+        self._recent_menu = tk.Menu(self._file_menu, tearoff=0)
+        self._file_menu.add_cascade(label="Recent Projects", menu=self._recent_menu)
+        self._file_menu.add_separator()
+        self._file_menu.add_command(label="Exit",
+                                    command=lambda: self.project.on_closing())
+
+    def _rebuild_recent_menu(self):
+        self._recent_menu.delete(0, "end")
+        for p in self.project.recent:
+            self._recent_menu.add_command(
+                label=p, command=lambda path=p: self.project.load(path))
+        if not self.project.recent:
+            self._recent_menu.add_command(label="(none)", state="disabled")
 
     # ── Style engine ──────────────────────────────────────────────────────
     def _configure_styles(self):
@@ -801,6 +1107,34 @@ class TabbedOutput(ttk.Frame):
         except Exception:
             pass
 
+    # ── Project save / restore ────────────────────────────────
+    def get_state(self):
+        """Return serialisable list of (title, content) for every tab."""
+        tabs = []
+        for tab_id in self._nb.tabs():
+            title = self._nb.tab(tab_id, "text").strip()
+            txt = self._tabs.get(tab_id)
+            content = txt.get("1.0", "end-1c") if txt else ""
+            tabs.append({"title": title, "content": content})
+        sel = self._nb.select()
+        active = self._nb.index(sel) if sel else 0
+        return {"tabs": tabs, "active": active}
+
+    def set_state(self, state):
+        """Restore tabs from state dict produced by get_state()."""
+        if not state:
+            return
+        self.close_all()
+        for entry in state.get("tabs", []):
+            txt = self.new_tab(entry["title"])
+            txt.configure(state="normal")
+            txt.insert("1.0", entry.get("content", ""))
+            txt.configure(state="disabled")
+        tab_ids = self._nb.tabs()
+        active = state.get("active", 0)
+        if tab_ids and 0 <= active < len(tab_ids):
+            self._nb.select(tab_ids[active])
+
 
 def output_write(txt_widget, content, tag=None):
     """Append text to a read-only ScrolledText."""
@@ -1288,6 +1622,24 @@ class ExportImportTab(ttk.Frame):
                 json.dump(self._last_data, f, indent=2)
             self.status_var.set(f"\U0001F4BE Saved to {os.path.basename(path)}")
 
+    def get_state(self):
+        return {
+            "dll": self._get_dll(),
+            "click_mode": self._click_mode_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("dll"):
+            self.dll_var.set(s["dll"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self.dll_var:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        self._click_mode_var.set(s.get("click_mode", "Assembly"))
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 2: Syscall Extractor
@@ -1369,6 +1721,22 @@ class SyscallTab(ttk.Frame):
             with open(path, 'w') as f:
                 json.dump(self._last_data, f, indent=2)
             self.status_var.set(f"\U0001F4BE Saved to {os.path.basename(path)}")
+
+    def get_state(self):
+        return {
+            "ntdll": self._get_ntdll(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("ntdll"):
+            self.ntdll_var.set(s["ntdll"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self.ntdll_var:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        self.output.set_state(s.get("output"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1531,6 +1899,28 @@ class CompareTab(ttk.Frame):
             _comparator().save_comparison_report(self._last_report, path)
             self.status_var.set(f"\U0001F4BE Saved to {os.path.basename(path)}")
 
+    def get_state(self):
+        return {
+            "dll1": self._get_dll1(),
+            "dll2": self._get_dll2(),
+            "label1": self.label1_var.get(),
+            "label2": self.label2_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, var in [("dll1", self.dll1_var), ("dll2", self.dll2_var)]:
+            if s.get(key):
+                var.set(s[key])
+                for e in self.app._placeholder_entries:
+                    if getattr(e, '_var', None) is var:
+                        e._showing_ph = False; e.configure(fg=T["fg"])
+        self.label1_var.set(s.get("label1", "Win2000"))
+        self.label2_var.set(s.get("label2", "ReactOS"))
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 4: NT Structure Viewer
@@ -1645,6 +2035,20 @@ class StructTab(ttk.Frame):
             self.status_var.set(f"\U0001F4BE Exported {len(files)} header files to {d}")
             messagebox.showinfo("Done", f"Generated {len(files)} header files:\n" +
                                 "\n".join(os.path.basename(f) for f in files))
+
+    def get_state(self):
+        return {
+            "struct": self.struct_var.get(),
+            "filter": self._filter_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        self._filter_var.set(s.get("filter", ""))
+        self.struct_var.set(s.get("struct", ""))
+        self.output.set_state(s.get("output"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1763,6 +2167,24 @@ class PEHeaderTab(ttk.Frame):
 
         run_with_progress(self, work, done)
 
+    def get_state(self):
+        return {
+            "file": self._get_file(),
+            "dir": self._get_dir(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, var in [("file", self.file_var), ("dir", self.dir_var)]:
+            if s.get(key):
+                var.set(s[key])
+                for e in self.app._placeholder_entries:
+                    if getattr(e, '_var', None) is var:
+                        e._showing_ph = False; e.configure(fg=T["fg"])
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 6: DEF File Generator
@@ -1872,6 +2294,24 @@ class DefGenTab(ttk.Frame):
                 f.write(self._last_def)
             self.status_var.set(f"\U0001F4BE Saved to {os.path.basename(path)}")
 
+    def get_state(self):
+        return {
+            "dll": self._get_dll(),
+            "ros_def": self._get_ros(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, var in [("dll", self.dll_var), ("ros_def", self.ros_def_var)]:
+            if s.get(key):
+                var.set(s[key])
+                for e in self.app._placeholder_entries:
+                    if getattr(e, '_var', None) is var:
+                        e._showing_ph = False; e.configure(fg=T["fg"])
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 7: Syscall Patcher
@@ -1952,6 +2392,24 @@ class SyscallPatchTab(ttk.Frame):
             with open(path, 'w') as f:
                 f.write(self._last_header)
             self.status_var.set(f"\U0001F4BE Saved to {os.path.basename(path)}")
+
+    def get_state(self):
+        return {
+            "ntdll": self._get_ntdll(),
+            "style": self.style_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("ntdll"):
+            self.ntdll_var.set(s["ntdll"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self.ntdll_var:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        self.style_var.set(s.get("style", "napi"))
+        self.output.set_state(s.get("output"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2078,6 +2536,26 @@ class ROSPatchTab(ttk.Frame):
 
         run_with_progress(self, work, done)
 
+    def get_state(self):
+        return {
+            "ros_dir": self._get_ros(),
+            "ntdll": self._get_ntdll(),
+            "dryrun": self.dryrun_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, var in [("ros_dir", self.ros_dir), ("ntdll", self.ntdll_var)]:
+            if s.get(key):
+                var.set(s[key])
+                for e in self.app._placeholder_entries:
+                    if getattr(e, '_var', None) is var:
+                        e._showing_ph = False; e.configure(fg=T["fg"])
+        self.dryrun_var.set(s.get("dryrun", True))
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 9: Build Script Generator
@@ -2174,6 +2652,28 @@ class BuildGenTab(ttk.Frame):
             with open(path, 'w') as f:
                 f.write(self._last_script)
             self.status_var.set(f"\U0001F4BE Saved to {os.path.basename(path)}")
+
+    def get_state(self):
+        return {
+            "ros_dir": self._get_ros(),
+            "targets": {n: v.get() for n, v in self.target_vars.items()},
+            "build": self.build_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("ros_dir"):
+            self.ros_dir.set(s["ros_dir"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self.ros_dir:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        for n, v in s.get("targets", {}).items():
+            if n in self.target_vars:
+                self.target_vars[n].set(v)
+        self.build_var.set(s.get("build", "rosbe"))
+        self.output.set_state(s.get("output"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3071,6 +3571,42 @@ class BehaviorTab(ttk.Frame):
 
         run_with_progress_dialog(self.app, f"Resolving unknown calls in {func}\u2026", work, done)
 
+    def get_state(self):
+        return {
+            "dll_a": self._get_a(),
+            "dll_b": self._get_b(),
+            "func": self._func_entry.get_value(),
+            "max": self.max_var.get(),
+            "dll_dir": self._dll_dir_entry.get_value(),
+            "version": self._version_var.get(),
+            "struct_mode": self._struct_mode_var.get(),
+            "click_mode": self._click_mode_var.get(),
+            "sym_a": self._sym_a_entry.get_value(),
+            "sym_b": self._sym_b_entry.get_value(),
+            "show_trace": self._show_trace_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, var in [("dll_a", self.dll_a_var), ("dll_b", self.dll_b_var)]:
+            if s.get(key):
+                var.set(s[key])
+                for e in self.app._placeholder_entries:
+                    if getattr(e, '_var', None) is var:
+                        e._showing_ph = False; e.configure(fg=T["fg"])
+        for key, ent in [("func", self._func_entry), ("dll_dir", self._dll_dir_entry),
+                         ("sym_a", self._sym_a_entry), ("sym_b", self._sym_b_entry)]:
+            if s.get(key):
+                ent.set_value(s[key])
+        self.max_var.set(s.get("max", "100"))
+        self._version_var.set(s.get("version", "win2k"))
+        self._struct_mode_var.set(s.get("struct_mode", "Database"))
+        self._click_mode_var.set(s.get("click_mode", "Assembly"))
+        self._show_trace_var.set(s.get("show_trace", False))
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 11: Decompiler
@@ -3468,6 +4004,35 @@ class DecompilerTab(ttk.Frame):
                 output_write(self.output, line + '\n')
 
 
+    def get_state(self):
+        return {
+            "pe": self._get_pe(),
+            "func": self._func_entry.get_value(),
+            "max": self.max_var.get(),
+            "expand": self.expand_var.get(),
+            "sym": self._sym_entry.get_value(),
+            "click_mode": self._click_mode_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("pe"):
+            self.pe_var.set(s["pe"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self.pe_var:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        if s.get("func"):
+            self._func_entry.set_value(s["func"])
+        if s.get("sym"):
+            self._sym_entry.set_value(s["sym"])
+        self.max_var.set(s.get("max", "50"))
+        self.expand_var.set(s.get("expand", False))
+        self._click_mode_var.set(s.get("click_mode", "Assembly"))
+        self.output.set_state(s.get("output"))
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 12: Compat Analyzer
 # ══════════════════════════════════════════════════════════════════════════
@@ -3643,6 +4208,30 @@ class CompatAnalyzerTab(ttk.Frame):
                 output_write(self.output, line + '\n', "peach")
             else:
                 output_write(self.output, line + '\n')
+
+    def get_state(self):
+        return {
+            "pe_a": self._get_a(),
+            "pe_b": self._get_b(),
+            "label_a": self.label_a_var.get(),
+            "label_b": self.label_b_var.get(),
+            "click_mode": self._click_mode_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, var in [("pe_a", self.pe_a_var), ("pe_b", self.pe_b_var)]:
+            if s.get(key):
+                var.set(s[key])
+                for e in self.app._placeholder_entries:
+                    if getattr(e, '_var', None) is var:
+                        e._showing_ph = False; e.configure(fg=T["fg"])
+        self.label_a_var.set(s.get("label_a", "Win2000"))
+        self.label_b_var.set(s.get("label_b", "ReactOS/XP"))
+        self._click_mode_var.set(s.get("click_mode", "Assembly"))
+        self.output.set_state(s.get("output"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -4796,6 +5385,36 @@ class DeepAnalyzerTab(ttk.Frame):
                  bg=T["bg_light"], fg=T["fg"], wraplength=1350,
                  justify="left", anchor="w").pack(fill="x", padx=5, pady=3)
 
+    def get_state(self):
+        return {
+            "pe": self._get_pe(),
+            "func": self._func_entry.get_value(),
+            "pe_b": self._get_pe_b(),
+            "max": self.max_var.get(),
+            "show_internal": self.show_internal_var.get(),
+            "sym": self._sym_entry.get_value(),
+            "click_mode": self._click_mode_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, var in [("pe", self.pe_var), ("pe_b", self.pe_b_var)]:
+            if s.get(key):
+                var.set(s[key])
+                for e in self.app._placeholder_entries:
+                    if getattr(e, '_var', None) is var:
+                        e._showing_ph = False; e.configure(fg=T["fg"])
+        if s.get("func"):
+            self._func_entry.set_value(s["func"])
+        if s.get("sym"):
+            self._sym_entry.set_value(s["sym"])
+        self.max_var.set(s.get("max", "3000"))
+        self.show_internal_var.set(s.get("show_internal", True))
+        self._click_mode_var.set(s.get("click_mode", "Assembly"))
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 14: System-Wide XRef Scanner
@@ -4905,6 +5524,25 @@ class XRefScannerTab(ttk.Frame):
 
         run_with_progress_dialog(self.app,
                                  f"Scanning for {func_name}...", work, done)
+
+    def get_state(self):
+        return {
+            "func": self._func_entry.get_value(),
+            "dir": self._get_dir(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("func"):
+            self._func_entry.set_value(s["func"])
+        if s.get("dir"):
+            self.dir_var.set(s["dir"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self.dir_var:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        self.output.set_state(s.get("output"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -5201,6 +5839,35 @@ class PEPatcherTab(ttk.Frame):
             self.status_var.set("\u2705 Done")
 
         run_with_progress(self, work, done)
+
+    def get_state(self):
+        return {
+            "pe": self._get_pe(),
+            "out": self._out_entry.get_value(),
+            "chk_version": self.chk_version.get(),
+            "chk_syscalls": self.chk_syscalls.get(),
+            "chk_strip_debug": self.chk_strip_debug.get(),
+            "shim": self._shim_entry.get_value(),
+            "rebase": self._rebase_entry.get_value(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("pe"):
+            self.pe_var.set(s["pe"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self.pe_var:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        for key, ent in [("out", self._out_entry), ("shim", self._shim_entry),
+                         ("rebase", self._rebase_entry)]:
+            if s.get(key):
+                ent.set_value(s[key])
+        self.chk_version.set(s.get("chk_version", True))
+        self.chk_syscalls.set(s.get("chk_syscalls", True))
+        self.chk_strip_debug.set(s.get("chk_strip_debug", False))
+        self.output.set_state(s.get("output"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -7514,6 +8181,33 @@ class KernelDebuggerTab(ttk.Frame):
         run_with_progress_dialog(self.app,
             f"Scanning for callers of {func}\u2026", work, done)
 
+    def get_state(self):
+        return {
+            "sys32": self._get_sys32(),
+            "func": self._func_ent.get_value(),
+            "args": self._args_ent.get_value(),
+            "bp": self._bp_ent.get_value(),
+            "show_trace": self._show_trace_var.get(),
+            "user_mode": self._user_mode_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("sys32"):
+            self._sys32_var.set(s["sys32"])
+            for e in self.app._placeholder_entries:
+                if getattr(e, '_var', None) is self._sys32_var:
+                    e._showing_ph = False; e.configure(fg=T["fg"])
+        for key, ent in [("func", self._func_ent), ("args", self._args_ent),
+                         ("bp", self._bp_ent)]:
+            if s.get(key):
+                ent.set_value(s[key])
+        self._show_trace_var.set(s.get("show_trace", False))
+        self._user_mode_var.set(s.get("user_mode", False))
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  HexEditorWidget — Embedded hex editor for binary editing
@@ -9154,6 +9848,25 @@ class UBRTTab(ttk.Frame):
         else:
             self.status_var.set(f"\u26A0 Export failed: {result.get('error')}")
 
+    def get_state(self):
+        return {
+            "pe": self._pe_ent.get_value(),
+            "qemu": self._qemu_var.get(),
+            "disk": self._disk_var.get(),
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        if s.get("pe"):
+            self._pe_ent.set_value(s["pe"])
+        if s.get("qemu"):
+            self._qemu_var.set(s["qemu"])
+        if s.get("disk"):
+            self._disk_var.set(s["disk"])
+        self.output.set_state(s.get("output"))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Tab 18: Symbol Recovery
@@ -9806,6 +10519,36 @@ class SymbolRecoveryTab(ttk.Frame):
         self.output.close_all()
         self._count_lbl.config(text="")
         self.status_var.set("\u2022 Load original binary + symbols and patched binary, then Analyze Diff")
+
+    def get_state(self):
+        # Save treeview data
+        tree_data = []
+        for iid in self._tree.get_children():
+            tree_data.append(list(self._tree.item(iid, "values")))
+        return {
+            "orig": self._orig_ent.get_value(),
+            "sym": self._sym_ent.get_value(),
+            "patch": self._patch_ent.get_value(),
+            "filter": self._filter_var.get(),
+            "status_filter": self._status_filter.get(),
+            "tree_data": tree_data,
+            "output": self.output.get_state(),
+        }
+
+    def set_state(self, s):
+        if not s:
+            return
+        for key, ent in [("orig", self._orig_ent), ("sym", self._sym_ent),
+                         ("patch", self._patch_ent)]:
+            if s.get(key):
+                ent.set_value(s[key])
+        self._filter_var.set(s.get("filter", ""))
+        self._status_filter.set(s.get("status_filter", "all"))
+        # Restore treeview
+        self._tree.delete(*self._tree.get_children())
+        for row in s.get("tree_data", []):
+            self._tree.insert("", "end", values=row)
+        self.output.set_state(s.get("output"))
 
 
 if __name__ == '__main__':

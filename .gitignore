@@ -24,3 +24,7 @@ Desktop.ini
 *.backup
 *_patched.*
 *_old.py
+
+# Project files (user-specific)
+.am_recent
+*.am
