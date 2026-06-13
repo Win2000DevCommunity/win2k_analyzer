@@ -10469,6 +10469,19 @@ class SymbolRecoveryTab(ttk.Frame):
             filetypes=[("PDB Files", "*.pdb"), ("All Files", "*.*")])
         if not out_path:
             return
+
+        # Clobber protection: never write the recovered PDB straight over
+        # the source symbols the recovery was built from. Redirect to a
+        # ".recovered.pdb" sibling and tell the user.
+        if os.path.abspath(out_path) == os.path.abspath(sym_path):
+            base, ext = os.path.splitext(out_path)
+            out_path = base + ".recovered" + (ext or ".pdb")
+            messagebox.showinfo(
+                "Source protected",
+                "The export target was the same file as the loaded source "
+                "PDB. To avoid destroying your original symbols, it will be "
+                f"written to:\n\n{out_path}")
+
         self.status_var.set("\u23F3 Patching PDB...")
 
         orig_pe = self._orig_ent.get_value()
@@ -10504,8 +10517,66 @@ class SymbolRecoveryTab(ttk.Frame):
                 if inj_count > 0:
                     output_write(self.output,
                         f"    Injected {inj_count} new-section symbols into PDB\n", "ok")
+                dupes = inj.get('skipped_duplicates') or []
+                if dupes:
+                    ell = '\u2026' if len(dupes) > 3 else ''
+                    eg = ', '.join(dupes[:3])
+                    output_write(self.output,
+                        f"    Skipped {len(dupes)} duplicate(s) already present "
+                        f"as decorated public symbols (e.g. {eg}{ell})\n", "dim")
                 for err in inj.get('errors', []):
                     output_write(self.output, f"      \u26A0 {err}\n", "warn")
+
+            # Report publics hash re-indexing (makes injected symbols
+            # enumerable in WinDbg's `x nt!*`).
+            reidx = result.get('reindexed')
+            repro = result.get('publics_reproducible') or {}
+            if reidx and reidx.get('reindexed'):
+                output_write(self.output,
+                    f"    \u2714 Publics hash rebuilt ({reidx.get('publics')} "
+                    f"symbols indexed) \u2014 injected symbols are now "
+                    f"enumerable in WinDbg\n", "ok")
+            elif inj_count > 0 and not repro.get('reproducible'):
+                output_write(self.output,
+                    f"      \u26A0 Publics hash left unchanged "
+                    f"(reason: {repro.get('reason', 'n/a')}); injected symbols "
+                    f"are present but may not show in `x nt!*`. Existing "
+                    f"symbols are unaffected.\n", "warn")
+            elif reidx and reidx.get('errors'):
+                for err in reidx['errors']:
+                    output_write(self.output,
+                        f"      \u26A0 reindex: {err}\n", "warn")
+
+            # Report PDB<->image matching + validation + backup
+            cv = result.get('codeview') or {}
+            if cv.get('format') == 'NB10':
+                stamp = result.get('stamped') or {}
+                if stamp.get('stamped'):
+                    output_write(self.output,
+                        f"    Stamped PDB signature 0x{cv.get('signature', 0):08X}"
+                        f" age {cv.get('age')} to match patched image\n", "ok")
+                else:
+                    for err in stamp.get('errors', []):
+                        output_write(self.output,
+                            f"      \u26A0 signature stamp: {err}\n", "warn")
+            elif cv.get('format') == 'RSDS':
+                output_write(self.output,
+                    "    \u26A0 Patched image uses RSDS (PDB 7.0) debug info; "
+                    "this PDB 2.0 export cannot be signature-matched to it\n",
+                    "warn")
+            dbg_stamp = result.get('dbg_stamped') or {}
+            if dbg_stamp.get('stamped'):
+                output_write(self.output,
+                    "    Stamped sibling .dbg TimeDateStamp to match image\n",
+                    "ok")
+            val = result.get('validation') or {}
+            if val.get('valid'):
+                output_write(self.output,
+                    f"    \u2714 PDB validated: {val.get('streams')} streams, "
+                    f"{val.get('file_pages')} pages\n", "ok")
+            if result.get('backup'):
+                output_write(self.output,
+                    f"    Backup of previous file: {result['backup']}\n", "dim")
 
         run_with_progress(self, work, done)
 

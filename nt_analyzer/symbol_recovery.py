@@ -420,56 +420,157 @@ class SymbolRecoveryEngine:
         Strategy: for each matched section, compute the delta and apply
         section-specific shifts using the PDB patcher.  Then inject any
         discovered symbols (new sections) into the PDB.
+
+        Safety model:
+          * All edits happen on a temporary copy, never on the source or
+            the destination in place.
+          * The temp is validated structurally (MSF invariants) before it
+            is allowed to replace ``output_path``.
+          * If the destination already exists it is backed up (.bak) first.
+          * The PDB info-stream signature/age is re-stamped to match the
+            *patched* binary's CodeView (NB10) record so WinDbg can bind
+            the remapped symbols to the patched image.
         """
         import shutil
+        import tempfile
         if self._diff is None:
             raise RuntimeError("No diff result available")
 
-        # Copy original PDB to output
-        shutil.copy2(orig_pdb_path, output_path)
-
-        # Apply cumulative shifts per section
-        # We process sections from highest VA to lowest to avoid double-shifting
-        results = []
-        sorted_matches = sorted(self._diff.matches,
-                                key=lambda m: m.orig.va, reverse=True)
-
         from nt_analyzer.ubrt_engine import SymbolUpdater
-        for m in sorted_matches:
-            if m.va_delta == 0:
-                continue
-            # shift_rva = start of this original section
-            # delta = the VA shift for this section
-            r = SymbolUpdater.patch_pdb_file(
-                output_path,
-                shift_rva=m.orig.va,
-                delta=m.va_delta,
-                pe_path=orig_pe_path,
-                image_base=self._diff.orig_image_base
-            )
-            results.append({
-                'section': m.orig.name,
-                'orig_va': m.orig.va,
-                'delta': m.va_delta,
-                'patched': r.get('patched', 0),
-                'total': r.get('total', 0),
-                'errors': r.get('errors', []),
-            })
 
-        # Inject discovered symbols (new sections like .sec21)
-        inject_result = None
-        discovered = {r.recovered_va: r.name for r in self._recovered
-                      if r.status == 'discovered'}
-        if discovered and patched_pe_path:
-            inject_result = SymbolUpdater.inject_symbols_pdb(
-                output_path, discovered, pe_path=patched_pe_path,
-                image_base=self._diff.patched_image_base)
+        if not os.path.isfile(orig_pdb_path):
+            raise FileNotFoundError(f"Source PDB not found: {orig_pdb_path}")
+
+        # Work on a temp copy in the destination directory (same volume so
+        # the final replace is atomic).
+        out_dir = os.path.dirname(os.path.abspath(output_path)) or '.'
+        os.makedirs(out_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(suffix='.pdb.tmp', dir=out_dir)
+        os.close(fd)
+        shutil.copy2(orig_pdb_path, tmp_path)
+
+        try:
+            # Safety gate for publics re-indexing: decide up-front (on the
+            # pristine copy, before any edit) whether our GSI serializer can
+            # reproduce this file's existing publics hash byte-for-byte.  If
+            # it can't, we will append symbols but not touch the hash, so we
+            # can never regress symbols that already resolve.
+            repro = SymbolUpdater.verify_publics_reproducible(tmp_path)
+            # Apply cumulative shifts per section.  Process sections from
+            # highest VA to lowest to avoid double-shifting.
+            results = []
+            sorted_matches = sorted(self._diff.matches,
+                                    key=lambda m: m.orig.va, reverse=True)
+            for m in sorted_matches:
+                if m.va_delta == 0:
+                    continue
+                r = SymbolUpdater.patch_pdb_file(
+                    tmp_path,
+                    shift_rva=m.orig.va,
+                    delta=m.va_delta,
+                    pe_path=orig_pe_path,
+                    image_base=self._diff.orig_image_base
+                )
+                results.append({
+                    'section': m.orig.name,
+                    'orig_va': m.orig.va,
+                    'delta': m.va_delta,
+                    'patched': r.get('patched', 0),
+                    'total': r.get('total', 0),
+                    'errors': r.get('errors', []),
+                })
+
+            # Inject discovered symbols (new sections like .sec21).
+            inject_result = None
+            discovered = {r.recovered_va: r.name for r in self._recovered
+                          if r.status == 'discovered'}
+            # Drop discovered symbols whose function already has a public
+            # symbol in the PDB (e.g. the exported, undecorated `NtCreateJobObject`
+            # vs the existing `_NtCreateJobObject@12`).  Injecting those would
+            # add a confusing second entry at the export/stub address while the
+            # real, correctly-decorated symbol is already present.
+            skipped_dupes = []
+            if discovered:
+                existing_cores = SymbolUpdater.existing_public_cores(tmp_path)
+                if existing_cores:
+                    deduped = {}
+                    for va, name in discovered.items():
+                        if SymbolUpdater._decorated_core(name) in existing_cores:
+                            skipped_dupes.append(name)
+                        else:
+                            deduped[va] = name
+                    discovered = deduped
+            if discovered and patched_pe_path:
+                inject_result = SymbolUpdater.inject_symbols_pdb(
+                    tmp_path, discovered, pe_path=patched_pe_path,
+                    image_base=self._diff.patched_image_base)
+            if inject_result is not None:
+                inject_result['skipped_duplicates'] = skipped_dupes
+
+            # Re-index the publics hash so the injected symbols become
+            # enumerable in WinDbg (`x nt!*`) and resolvable by name.  Only
+            # run when injection added records *and* the reproduce gate
+            # proved our serializer matches this file exactly.
+            reindex_result = None
+            if (inject_result and inject_result.get('injected') and
+                    repro.get('reproducible')):
+                reindex_result = SymbolUpdater.rebuild_publics_index(
+                    tmp_path, variant=repro.get('variant'))
+
+            # Re-stamp signature/age so the remapped PDB matches the image
+            # being debugged (the patched binary).
+            stamp_result = None
+            cv = {}
+            if patched_pe_path and os.path.isfile(patched_pe_path):
+                cv = SymbolUpdater.read_pe_codeview(patched_pe_path)
+                if cv.get('format') == 'NB10' and 'signature' in cv:
+                    stamp_result = SymbolUpdater.stamp_pdb_signature(
+                        tmp_path, cv['signature'], cv.get('age'))
+
+            # Validate the temp BEFORE it is allowed to replace anything.
+            validation = SymbolUpdater.validate_pdb(tmp_path)
+            if not validation.get('valid'):
+                raise RuntimeError(
+                    "Refusing to write a structurally invalid PDB; the "
+                    "existing symbol file was left untouched. Details: "
+                    + "; ".join(validation.get('errors', ['unknown'])))
+
+            # Back up an existing destination, then atomically swap in.
+            backup_path = None
+            if os.path.isfile(output_path) and \
+                    os.path.abspath(output_path) != os.path.abspath(tmp_path):
+                backup_path = output_path + '.bak'
+                shutil.copy2(output_path, backup_path)
+            os.replace(tmp_path, output_path)
+            tmp_path = None  # consumed by os.replace
+
+            # If a sibling .dbg lives next to the output, match its
+            # TimeDateStamp to the patched image too (stripped images are
+            # matched to their .dbg by timestamp only).
+            dbg_stamp = None
+            sibling_dbg = os.path.splitext(output_path)[0] + '.dbg'
+            if cv.get('timestamp') and os.path.isfile(sibling_dbg):
+                dbg_stamp = SymbolUpdater.stamp_dbg_timestamp(
+                    sibling_dbg, cv['timestamp'])
+        finally:
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
         return {
             'output_path': output_path,
             'section_results': results,
             'total_sections_shifted': sum(1 for r in results if r['patched'] > 0),
             'injected': inject_result,
+            'publics_reproducible': repro,
+            'reindexed': reindex_result,
+            'codeview': cv,
+            'stamped': stamp_result,
+            'dbg_stamped': dbg_stamp,
+            'validation': validation,
+            'backup': backup_path,
         }
 
     # ------------------------------------------------------------------

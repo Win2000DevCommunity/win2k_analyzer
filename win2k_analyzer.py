@@ -18,7 +18,8 @@ Usage:
   python win2k_analyzer.py syscall-patch <ntdll_path>           - Generate syscall header
   python win2k_analyzer.py build-script <reactos_dir>           - Generate build script
   python win2k_analyzer.py disasm <dll_path> <function>         - Disassemble a function
-  python win2k_analyzer.py behavior <dll_path> <function>       - Analyze function behavior
+  python win2k_analyzer.py ubrt-shift <pe> <op> <rva> <data>  - UBRT byte shift
+  python win2k_analyzer.py symrecov --orig <pe> --patched <pe> --symbols <pdb> [--output <pdb>]
 """
 
 import argparse
@@ -711,6 +712,110 @@ def cmd_ubrt_shift(args):
     print(f"  Saved: {out}")
 
 
+def cmd_symrecov(args):
+    """Binary diff + symbol recovery + optional PDB export."""
+    from nt_analyzer.symbol_recovery import SymbolRecoveryEngine
+
+    orig = os.path.abspath(args.orig)
+    patched = os.path.abspath(args.patched)
+    symbols = os.path.abspath(args.symbols) if args.symbols else None
+
+    for label, path in (('Original', orig), ('Patched', patched)):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{label} PE not found: {path}")
+    if symbols and not os.path.isfile(symbols):
+        raise FileNotFoundError(f"Symbols not found: {symbols}")
+
+    engine = SymbolRecoveryEngine()
+    diff = engine.diff_binaries(orig, patched)
+
+    print(f"\n{'='*70}")
+    print(f"  SYMBOL RECOVERY: {os.path.basename(orig)} → {os.path.basename(patched)}")
+    print(f"{'='*70}\n")
+
+    print(f"  Sections matched: {len(diff.matches)}  "
+          f"new: {len(diff.new_sections)}  removed: {len(diff.removed_sections)}")
+    for m in diff.matches:
+        if m.va_delta or m.vsize_delta:
+            print(f"    {m.orig.name:<12s} VA {m.va_delta:+6d}  VSize {m.vsize_delta:+6d}")
+    if diff.new_sections:
+        for s in diff.new_sections:
+            print(f"    + {s.name} VA=0x{s.va:08X} VSize=0x{s.vsize:08X}")
+    print()
+
+    sym_count = 0
+    sym_meta = {}
+    if symbols:
+        sym_count, sym_meta = engine.load_symbols(symbols, pe_path=orig)
+        print(f"  Loaded {sym_count:,} symbols ({sym_meta.get('format', '?')}) "
+              f"from {os.path.basename(symbols)}")
+    else:
+        print("  No symbol file provided — diff only.")
+
+    if sym_count:
+        engine.recover_symbols(orig_pe_path=orig)
+        new_syms = []
+        if diff.new_sections:
+            new_syms = engine.discover_new_section_symbols(
+                patched, orig_pe_path=orig)
+        stats = engine.get_stats()
+        print(f"\n  Recovery: {stats.get('ok', 0):,}/{stats.get('total', 0):,} OK "
+              f"({stats.get('success_rate', 0):.1%})")
+        if stats.get('discovered'):
+            print(f"  Discovered: {stats.get('discovered', 0):,} new symbols")
+        if new_syms:
+            by_sec = {}
+            for s in new_syms:
+                by_sec.setdefault(s.section_name, []).append(s)
+            for sec, lst in sorted(by_sec.items()):
+                print(f"    {sec}: {len(lst)} discovered")
+                for s in lst[:5]:
+                    print(f"      0x{s.recovered_va:08X}  {s.name}")
+                if len(lst) > 5:
+                    print(f"      ... +{len(lst) - 5} more")
+
+    out_pdb = args.output
+    if out_pdb and sym_count:
+        out_pdb = os.path.abspath(out_pdb)
+        os.makedirs(os.path.dirname(out_pdb) or '.', exist_ok=True)
+        pdb_src = symbols if symbols and symbols.lower().endswith('.pdb') else None
+        if not pdb_src:
+            raise ValueError("--output requires a .pdb symbol source")
+        print(f"\n  Exporting PDB → {out_pdb}")
+        result = engine.export_pdb(pdb_src, out_pdb,
+                                   orig_pe_path=orig,
+                                   patched_pe_path=patched)
+        inj = result.get('injected') or {}
+        repro = result.get('publics_reproducible') or {}
+        reidx = result.get('reindexed') or {}
+        val = result.get('validation') or {}
+        if inj.get('injected'):
+            print(f"    Injected: {inj['injected']}")
+        dupes = inj.get('skipped_duplicates') or []
+        if dupes:
+            print(f"    Skipped duplicates: {len(dupes)} "
+                  f"(e.g. {', '.join(dupes[:3])})")
+        if reidx.get('reindexed'):
+            print(f"    ✔ Publics hash rebuilt ({reidx.get('publics')} indexed)")
+        elif inj.get('injected') and not repro.get('reproducible'):
+            print(f"    ⚠ Publics hash unchanged: {repro.get('reason', 'n/a')}")
+        if val.get('valid'):
+            print(f"    ✔ PDB validated: {val.get('streams', val.get('num_streams'))} streams, "
+                  f"{val.get('pages', val.get('num_pages'))} pages")
+        else:
+            for err in val.get('errors', ['validation failed']):
+                print(f"    ✗ {err}")
+
+    if args.map:
+        if not sym_count:
+            raise ValueError("--map requires symbols")
+        map_path = os.path.abspath(args.map)
+        engine.export_map_file(map_path)
+        print(f"\n  Map exported: {map_path}")
+
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Win2K NT Internals Analyzer - Analyze Windows 2000 SP4 system DLLs for ReactOS compatibility',
@@ -913,6 +1018,15 @@ Examples:
     p.add_argument('data', help='Hex bytes (INSERT/PATCH) or byte count (DELETE/NOP)')
     p.add_argument('-o', '--output', help='Output path (default: <name>_ubrt.<ext>)')
 
+    # symrecov
+    p = subparsers.add_parser('symrecov',
+        help='Binary diff + symbol recovery (+ optional PDB export)')
+    p.add_argument('--orig', required=True, help='Original (pre-patch) PE path')
+    p.add_argument('--patched', required=True, help='Patched PE path')
+    p.add_argument('--symbols', help='Symbol file (.pdb/.dbg/.map)')
+    p.add_argument('-o', '--output', help='Export recovered PDB to this path')
+    p.add_argument('--map', help='Also export a .map file to this path')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -948,6 +1062,7 @@ Examples:
         'hex-dump': cmd_hex_dump,
         'ubrt-refs': cmd_ubrt_refs,
         'ubrt-shift': cmd_ubrt_shift,
+        'symrecov': cmd_symrecov,
     }
 
     try:

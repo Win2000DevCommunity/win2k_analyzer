@@ -5068,6 +5068,14 @@ class SymbolUpdater:
             result['errors'].append(f'Invalid page size: {page_size}')
             return result
 
+        # An MSF file is always an exact number of whole pages.  If the
+        # buffer is ragged (e.g. a prior tool left trailing bytes), pad it
+        # up to a page boundary *before* any page math so that
+        # file_pages * page_size stays equal to the real file size — the
+        # invariant dbghelp validates when it opens the container.
+        if len(data) % page_size:
+            data.extend(b'\x00' * (page_size - (len(data) % page_size)))
+
         num_root_pages = math.ceil(root_size / page_size)
         root_page_nums = [
             struct.unpack_from('<H', data, 60 + i * 2)[0]
@@ -5162,9 +5170,24 @@ class SymbolUpdater:
                 sd.extend(data[start:start + page_size])
             return bytes(sd[:stream_sizes[idx]])
 
+        # Prefer the symbol-record stream named by the DBI header so that
+        # injection, offset-patching and publics re-indexing all operate on
+        # the *same* stream (the publics hash can only reference records that
+        # live in DBI.snSymRecs).  Fall back to the legacy 7/6/5 scan.
+        scan_order: List[int] = []
+        try:
+            di = SymbolUpdater._dbi_stream_indices(read_stream(3))
+            if di and di[2] != 0xFFFF and di[2] < num_streams:
+                scan_order.append(di[2])
+        except Exception:
+            pass
+        for _s in (7, 6, 5):
+            if _s not in scan_order:
+                scan_order.append(_s)
+
         gsi_idx = -1
         sym_end = 0
-        for si in (7, 6, 5):
+        for si in scan_order:
             if si >= num_streams:
                 continue
             gsi = read_stream(si)
@@ -5192,6 +5215,21 @@ class SymbolUpdater:
             result['errors'].append('No GSI symbol stream found in PDB')
             return result
 
+        # ── Free page map accounting ──────────────────────────────────
+        # Mark a page as allocated in the active free page map.  In MSF a
+        # SET bit means "free" and a CLEAR bit means "in use", so newly
+        # allocated pages must have their bit cleared.  Stale free-page
+        # maps don't break readers, but a correct map keeps the container
+        # consistent for any later edit pass.
+        pn_fpm = struct.unpack_from('<H', data, 48)[0]
+
+        def mark_page_used(pn: int):
+            if pn_fpm == 0 or pn_fpm * page_size >= len(data):
+                return
+            byte_off = pn_fpm * page_size + (pn // 8)
+            if 0 <= byte_off < len(data):
+                data[byte_off] &= ~(1 << (pn % 8)) & 0xFF
+
         # ── Allocate pages if needed ──────────────────────────────────
         allocated = len(stream_pages[gsi_idx]) * page_size
         new_stream_size = sym_end + len(new_records)
@@ -5206,6 +5244,8 @@ class SymbolUpdater:
             data.extend(b'\x00' * (extra_pages * page_size))
             # Add new pages to the stream's page list
             stream_pages[gsi_idx].extend(new_page_nums)
+            for _pn in new_page_nums:
+                mark_page_used(_pn)
             # Update file_pages in MSF header (uint16 at offset 50)
             new_total_pages = total_file_pages + extra_pages
             if new_total_pages <= 0xFFFF:
@@ -5260,6 +5300,7 @@ class SymbolUpdater:
             for _ in range(new_root_pages_needed - len(root_page_nums)):
                 root_page_nums.append(total_file_pages)
                 data.extend(b'\x00' * page_size)
+                mark_page_used(total_file_pages)
                 total_file_pages += 1
             # Update root page list in MSF header
             for rpi, rpn in enumerate(root_page_nums):
@@ -5288,6 +5329,973 @@ class SymbolUpdater:
             result['errors'].append(f'Cannot write {pdb_path}: {e}')
 
         return result
+
+    # ------------------------------------------------------------------
+    #  PDB 2.0 structural validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def validate_pdb(pdb_path: str) -> Dict[str, Any]:
+        """
+        Re-parse a PDB 2.0 (JG/MSF) file and verify the container-level
+        invariants that dbghelp checks when it opens a PDB.  This is the
+        gate that prevents a structurally broken export from ever
+        replacing a working symbol file.
+
+        Checks:
+          * magic + page size sane
+          * file_size == file_pages * page_size   (the invariant whose
+            violation surfaces as "file system or network error reading pdb")
+          * every root page index is in range
+          * the root/stream directory re-parses cleanly
+          * every stream page index is in range (no seek past EOF)
+
+        Returns dict: {'valid': bool, 'errors': [..], 'streams': int,
+                       'page_size': int, 'file_pages': int}.
+        """
+        out: Dict[str, Any] = {
+            'valid': False, 'errors': [], 'streams': 0,
+            'page_size': 0, 'file_pages': 0,
+        }
+        try:
+            with open(pdb_path, 'rb') as f:
+                data = f.read()
+        except Exception as e:
+            out['errors'].append(f'Cannot read {pdb_path}: {e}')
+            return out
+
+        PDB20_SIG = b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00'
+        if len(data) < 60 or data[:44] != PDB20_SIG:
+            out['errors'].append('Not a PDB 2.0 (JG) file')
+            return out
+
+        page_size = struct.unpack_from('<I', data, 44)[0]
+        file_pages = struct.unpack_from('<H', data, 50)[0]
+        root_size = struct.unpack_from('<I', data, 52)[0]
+        out['page_size'] = page_size
+        out['file_pages'] = file_pages
+
+        if page_size == 0 or page_size > 0x10000:
+            out['errors'].append(f'Invalid page size: {page_size}')
+            return out
+        if len(data) % page_size:
+            out['errors'].append(
+                f'File size {len(data)} is not a multiple of page size '
+                f'{page_size}')
+        if file_pages * page_size != len(data):
+            out['errors'].append(
+                f'Header page count {file_pages} * {page_size} = '
+                f'{file_pages * page_size} != file size {len(data)}')
+
+        def page_in_range(pn: int) -> bool:
+            return 0 <= pn < max(file_pages, len(data) // page_size)
+
+        # Root page list (header @ offset 60)
+        num_root_pages = math.ceil(root_size / page_size) if root_size else 0
+        root_pages = []
+        for i in range(num_root_pages):
+            pn = struct.unpack_from('<H', data, 60 + i * 2)[0]
+            root_pages.append(pn)
+            if not page_in_range(pn):
+                out['errors'].append(f'Root page {pn} out of range')
+
+        if out['errors']:
+            return out
+
+        root = bytearray()
+        for pn in root_pages:
+            root.extend(data[pn * page_size:pn * page_size + page_size])
+        root = bytes(root[:root_size])
+
+        sizes: List[int] = []
+        stream_pages: List[List[int]] = []
+        try:
+            num_streams = struct.unpack_from('<H', root, 0)[0]
+            out['streams'] = num_streams
+            off = 4
+            for _ in range(num_streams):
+                sizes.append(struct.unpack_from('<I', root, off)[0])
+                off += 8
+            for si, sz in enumerate(sizes):
+                if sz in (0, 0xFFFFFFFF):
+                    stream_pages.append([])
+                    continue
+                pn_count = math.ceil(sz / page_size)
+                pages = []
+                for j in range(pn_count):
+                    pn = struct.unpack_from('<H', root, off + j * 2)[0]
+                    pages.append(pn)
+                    if not page_in_range(pn):
+                        out['errors'].append(
+                            f'Stream {si} page {pn} out of range')
+                stream_pages.append(pages)
+                off += pn_count * 2
+        except Exception as e:
+            out['errors'].append(f'Stream directory parse failed: {e}')
+            return out
+
+        if out['errors']:
+            return out
+
+        # ── Walk the symbol / GSI stream and make sure every record parses
+        #    cleanly to the stream end (no record overruns its stream).
+        #    A broken inject leaves a dangling/oversized final record.
+        def read_stream(idx: int) -> bytes:
+            if idx >= len(sizes) or sizes[idx] in (0, 0xFFFFFFFF):
+                return b''
+            sd = bytearray()
+            for pn in stream_pages[idx]:
+                sd.extend(data[pn * page_size:pn * page_size + page_size])
+            return bytes(sd[:sizes[idx]])
+
+        for sidx in (7, 6, 5):
+            sd = read_stream(sidx)
+            if len(sd) < 4:
+                continue
+            so = 0
+            saw_pub = False
+            ok = True
+            while so + 4 <= len(sd):
+                reclen = struct.unpack_from('<H', sd, so)[0]
+                if reclen < 2:
+                    # trailing alignment padding -> acceptable end
+                    break
+                if so + 2 + reclen > len(sd):
+                    # final record claims more bytes than the stream holds
+                    ok = False
+                    break
+                rectyp = struct.unpack_from('<H', sd, so + 2)[0]
+                if rectyp == 0x1009:
+                    saw_pub = True
+                so += 2 + reclen
+                if so % 4:
+                    so += 4 - (so % 4)
+            if saw_pub:
+                if not ok:
+                    out['errors'].append(
+                        f'Symbol stream {sidx} has a record that overruns '
+                        f'the stream (corrupt record table)')
+                break
+
+        out['valid'] = not out['errors']
+        return out
+
+    # ------------------------------------------------------------------
+    #  PDB <-> image (CodeView NB10) matching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def read_pe_codeview(pe_path: str) -> Dict[str, Any]:
+        """
+        Read a PE's CodeView debug record so the exported symbol file can
+        be stamped to match the image WinDbg actually loads.
+
+        Returns dict with keys (when available):
+          'format'    : 'NB10' or 'RSDS'
+          'signature' : uint32 (NB10) - the PDB signature WinDbg matches
+          'guid'      : bytes (RSDS)
+          'age'       : uint32
+          'pdb'       : pdb file name string
+          'timestamp' : image FileHeader TimeDateStamp (uint32)
+        """
+        info: Dict[str, Any] = {}
+        try:
+            import pefile as _pefile
+            pe = _pefile.PE(pe_path, fast_load=True)
+            pe.parse_data_directories(directories=[
+                _pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_DEBUG']])
+            info['timestamp'] = pe.FILE_HEADER.TimeDateStamp
+            entries = getattr(pe, 'DIRECTORY_ENTRY_DEBUG', None) or []
+            for dbg in entries:
+                if dbg.struct.Type != 2:  # IMAGE_DEBUG_TYPE_CODEVIEW
+                    continue
+                ptr = dbg.struct.PointerToRawData
+                size = dbg.struct.SizeOfData
+                raw = pe.__data__[ptr:ptr + size]
+                if raw[:4] == b'NB10':
+                    # NB10: sig(4)='NB10', offset(4), signature(4), age(4), name
+                    sig = struct.unpack_from('<I', raw, 8)[0]
+                    age = struct.unpack_from('<I', raw, 12)[0]
+                    name = raw[16:].split(b'\x00', 1)[0].decode(
+                        'ascii', 'replace')
+                    info.update({'format': 'NB10', 'signature': sig,
+                                 'age': age, 'pdb': name})
+                    break
+                elif raw[:4] == b'RSDS':
+                    guid = raw[4:20]
+                    age = struct.unpack_from('<I', raw, 20)[0]
+                    name = raw[24:].split(b'\x00', 1)[0].decode(
+                        'ascii', 'replace')
+                    info.update({'format': 'RSDS', 'guid': guid,
+                                 'age': age, 'pdb': name})
+                    break
+            pe.close()
+        except Exception as e:
+            info['error'] = str(e)
+        return info
+
+    @staticmethod
+    def stamp_pdb_signature(pdb_path: str, signature: int,
+                            age: int = None) -> Dict[str, Any]:
+        """
+        Write the NB10 signature (and optional age) into a PDB 2.0 file's
+        PDB info stream (stream 1) so the file matches the target image's
+        CodeView record.  PDB info stream layout (PDB 2.0):
+            uint32 Version
+            uint32 Signature   <- must equal image NB10 signature
+            uint32 Age         <- must equal image NB10 age
+
+        Returns dict: {'stamped': bool, 'errors': [..]}.
+        """
+        res: Dict[str, Any] = {'stamped': False, 'errors': []}
+        try:
+            with open(pdb_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            res['errors'].append(f'Cannot read {pdb_path}: {e}')
+            return res
+
+        PDB20_SIG = b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00'
+        if len(data) < 60 or bytes(data[:44]) != PDB20_SIG:
+            res['errors'].append('Only PDB 2.0 format supported')
+            return res
+
+        page_size = struct.unpack_from('<I', data, 44)[0]
+        root_size = struct.unpack_from('<I', data, 52)[0]
+        if page_size == 0 or page_size > 0x10000:
+            res['errors'].append(f'Invalid page size: {page_size}')
+            return res
+
+        num_root_pages = math.ceil(root_size / page_size) if root_size else 0
+        root_pages = [struct.unpack_from('<H', data, 60 + i * 2)[0]
+                      for i in range(num_root_pages)]
+        root = bytearray()
+        for pn in root_pages:
+            root.extend(data[pn * page_size:pn * page_size + page_size])
+        root = bytes(root[:root_size])
+
+        num_streams = struct.unpack_from('<H', root, 0)[0]
+        if num_streams <= 1:
+            res['errors'].append('PDB has no info stream (stream 1)')
+            return res
+
+        off = 4
+        sizes = []
+        for _ in range(num_streams):
+            sizes.append(struct.unpack_from('<I', root, off)[0])
+            off += 8
+        stream_pages = []
+        for sz in sizes:
+            cnt = math.ceil(sz / page_size) if sz not in (0, 0xFFFFFFFF) else 0
+            stream_pages.append([struct.unpack_from('<H', root, off + j * 2)[0]
+                                 for j in range(cnt)])
+            off += cnt * 2
+
+        info_pages = stream_pages[1]
+        if not info_pages:
+            res['errors'].append('Info stream (1) is empty')
+            return res
+
+        def write_u32_at_stream_off(stream_off: int, value: int):
+            pg = info_pages[stream_off // page_size]
+            ip = stream_off % page_size
+            struct.pack_into('<I', data, pg * page_size + ip,
+                             value & 0xFFFFFFFF)
+
+        # Signature @ +4, Age @ +8 within the info stream
+        write_u32_at_stream_off(4, signature)
+        if age is not None:
+            write_u32_at_stream_off(8, age)
+
+        try:
+            with open(pdb_path, 'wb') as f:
+                f.write(data)
+            res['stamped'] = True
+        except Exception as e:
+            res['errors'].append(f'Cannot write {pdb_path}: {e}')
+        return res
+
+    @staticmethod
+    def stamp_dbg_timestamp(dbg_path: str, timestamp: int) -> Dict[str, Any]:
+        """
+        Set the TimeDateStamp in a .dbg file's IMAGE_SEPARATE_DEBUG_HEADER
+        (offset 8) so it matches the image WinDbg loads.  A stripped image
+        is matched to its .dbg purely by this timestamp, so re-stamping is
+        required whenever the .dbg is reused for a different (e.g. patched)
+        build.
+
+        Returns dict: {'stamped': bool, 'errors': [..]}.
+        """
+        res: Dict[str, Any] = {'stamped': False, 'errors': []}
+        try:
+            with open(dbg_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            res['errors'].append(f'Cannot read {dbg_path}: {e}')
+            return res
+        if len(data) < 48 or struct.unpack_from('<H', data, 0)[0] != 0x4944:
+            res['errors'].append('Invalid DBG signature')
+            return res
+        struct.pack_into('<I', data, 8, timestamp & 0xFFFFFFFF)
+        try:
+            with open(dbg_path, 'wb') as f:
+                f.write(data)
+            res['stamped'] = True
+        except Exception as e:
+            res['errors'].append(f'Cannot write {dbg_path}: {e}')
+        return res
+
+    # ------------------------------------------------------------------
+    #  Public-symbol (GSI/PSI) hash indexing
+    #
+    #  Appending S_PUB32 records to the symbol-record stream is *not*
+    #  enough for WinDbg to see them: dbghelp enumerates publics through
+    #  the hash table held in the public-symbols stream (snPSSyms).  A
+    #  record with no hash entry is invisible to `x nt!*` and to name
+    #  lookups.  The helpers below rebuild that hash so injected symbols
+    #  become enumerable.
+    #
+    #  Safety model — "reproduce then extend":
+    #    Before trusting our serializer on a real file we first regenerate
+    #    the file's *existing* publics stream from its own symbol records
+    #    and require a byte-for-byte match against what is already on disk
+    #    (verify_publics_reproducible).  Only when our model reproduces the
+    #    linker's bytes exactly do we rebuild the stream with the new
+    #    symbols added.  If anything differs we decline and leave the
+    #    working file untouched, so this can never regress symbols that
+    #    already resolve.
+    # ------------------------------------------------------------------
+
+    _IPHR_HASH = 4096
+
+    @staticmethod
+    def _gsi_hash_name(name: bytes, modulo: int = 4096) -> int:
+        """The classic mspdb/dbghelp name hash (HashPbCb) used to bucket
+        GSI/PSI public symbols."""
+        h = 0
+        i = 0
+        n = len(name)
+        while n - i >= 4:
+            h ^= struct.unpack_from('<I', name, i)[0]
+            i += 4
+        if n - i >= 2:
+            h ^= struct.unpack_from('<H', name, i)[0]
+            i += 2
+        if n - i >= 1:
+            h ^= name[i]
+        h |= 0x20202020          # fold case (tolower on each byte)
+        h &= 0xFFFFFFFF
+        h ^= (h >> 11)
+        h &= 0xFFFFFFFF
+        h ^= (h >> 16)
+        h &= 0xFFFFFFFF
+        return h % modulo
+
+    @classmethod
+    def _parse_pdb20(cls, data: bytes):
+        """Parse a PDB 2.0 MSF container.
+
+        Returns a dict with page_size, num_streams, sizes, stream_pages,
+        root_pages, root_size, file_pages and a read_stream() callable, or
+        None if the buffer is not a PDB 2.0 file.
+        """
+        sig = b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00'
+        if len(data) < 60 or bytes(data[:44]) != sig:
+            return None
+        page_size = struct.unpack_from('<I', data, 44)[0]
+        file_pages = struct.unpack_from('<H', data, 50)[0]
+        root_size = struct.unpack_from('<I', data, 52)[0]
+        if page_size == 0 or page_size > 0x10000:
+            return None
+        num_root_pages = math.ceil(root_size / page_size) if root_size else 0
+        root_pages = [struct.unpack_from('<H', data, 60 + i * 2)[0]
+                      for i in range(num_root_pages)]
+        root = bytearray()
+        for pn in root_pages:
+            root.extend(data[pn * page_size:pn * page_size + page_size])
+        root = bytes(root[:root_size])
+        if len(root) < 4:
+            return None
+        num_streams = struct.unpack_from('<H', root, 0)[0]
+        off = 4
+        sizes: List[int] = []
+        for _ in range(num_streams):
+            if off + 8 > len(root):
+                return None
+            sizes.append(struct.unpack_from('<I', root, off)[0])
+            off += 8
+        stream_pages: List[List[int]] = []
+        for sz in sizes:
+            cnt = math.ceil(sz / page_size) if sz not in (0, 0xFFFFFFFF) else 0
+            pages = [struct.unpack_from('<H', root, off + j * 2)[0]
+                     for j in range(cnt)]
+            off += cnt * 2
+            stream_pages.append(pages)
+
+        def read_stream(idx: int) -> bytes:
+            if idx < 0 or idx >= num_streams or sizes[idx] in (0, 0xFFFFFFFF):
+                return b''
+            sd = bytearray()
+            for pn in stream_pages[idx]:
+                sd.extend(data[pn * page_size:pn * page_size + page_size])
+            return bytes(sd[:sizes[idx]])
+
+        return {
+            'page_size': page_size, 'file_pages': file_pages,
+            'root_size': root_size, 'root_pages': root_pages,
+            'num_streams': num_streams, 'sizes': sizes,
+            'stream_pages': stream_pages, 'read_stream': read_stream,
+        }
+
+    @staticmethod
+    def _dbi_stream_indices(dbi: bytes):
+        """Return (snGSSyms, snPSSyms, snSymRecs) from a DBI stream, handling
+        both the old (unsigned) and new (0xFFFFFFFF-signature) headers."""
+        if len(dbi) < 24:
+            return None
+        if struct.unpack_from('<I', dbi, 0)[0] == 0xFFFFFFFF:
+            # NewDBIHdr
+            sn_gs = struct.unpack_from('<H', dbi, 12)[0]
+            sn_ps = struct.unpack_from('<H', dbi, 16)[0]
+            sn_sym = struct.unpack_from('<H', dbi, 20)[0]
+        else:
+            # old DBIHdr: snGSSyms, snPSSyms, snSymRecs at 0/2/4
+            sn_gs = struct.unpack_from('<H', dbi, 0)[0]
+            sn_ps = struct.unpack_from('<H', dbi, 2)[0]
+            sn_sym = struct.unpack_from('<H', dbi, 4)[0]
+        return sn_gs, sn_ps, sn_sym
+
+    @staticmethod
+    def _walk_pub32(symrec: bytes):
+        """Yield (rec_offset, name_bytes, segment, offset) for every
+        S_PUB32_16t (0x1009) record in a symbol-record stream."""
+        out = []
+        so = 0
+        n = len(symrec)
+        while so + 4 <= n:
+            reclen = struct.unpack_from('<H', symrec, so)[0]
+            if reclen < 2 or so + 2 + reclen > n:
+                break
+            rectyp = struct.unpack_from('<H', symrec, so + 2)[0]
+            if rectyp == 0x1009 and reclen >= 13:
+                offset = struct.unpack_from('<I', symrec, so + 8)[0]
+                segment = struct.unpack_from('<H', symrec, so + 12)[0]
+                nl = symrec[so + 14]
+                name = symrec[so + 15:so + 15 + nl]
+                out.append((so, name, segment, offset))
+            step = 2 + reclen
+            if step % 4:
+                step += 4 - (step % 4)
+            so += step
+        return out
+
+    @staticmethod
+    def _decorated_core(name) -> str:
+        """Reduce a public-symbol name to its bare identifier so that the
+        same function under different calling-convention decoration compares
+        equal: ``_NtCreateJobObject@12``, ``@ExfFoo@8`` and ``NtCreateJobObject``
+        all collapse to a common core."""
+        if isinstance(name, (bytes, bytearray)):
+            name = name.decode('ascii', errors='replace')
+        n = name.lstrip('_@?')
+        at = n.rfind('@')
+        if at > 0 and n[at + 1:].isdigit():
+            n = n[:at]
+        return n
+
+    @classmethod
+    def existing_public_cores(cls, pdb_path: str):
+        """Return the set of decoration-stripped public-symbol cores already
+        present in *pdb_path* (empty set on any failure)."""
+        cores = set()
+        try:
+            with open(pdb_path, 'rb') as f:
+                data = f.read()
+            p = cls._parse_pdb20(data)
+            if not p:
+                return cores
+            idx = cls._dbi_stream_indices(p['read_stream'](3))
+            sn_sym = idx[2] if idx else None
+            if sn_sym is None or sn_sym == 0xFFFF or sn_sym >= p['num_streams']:
+                return cores
+            for _ro, name, _seg, _off in cls._walk_pub32(p['read_stream'](sn_sym)):
+                cores.add(cls._decorated_core(name))
+        except Exception:
+            pass
+        return cores
+
+    # Candidate GSI on-disk layouts.  PDB 2.0 (Win2000-era) files use an
+    # *old* uncompressed bucket table; PDB 7.0 introduced the compressed
+    # bitmap form.  We don't assume which one a given file uses — we try
+    # each and keep whichever reproduces the file byte-for-byte.
+    @classmethod
+    def _gsi_candidate_variants(cls):
+        variants = []
+        # New / compressed (PDB 7.0): GSIHashHdr + HR + bitmap + present offsets
+        variants.append({'fmt': 'new', 'off_base': 1, 'cref': 1, 'stride': 12,
+                         'bucket_sort': 'name'})
+        # Old / uncompressed (PDB 2.0): HR + bucket table.  Permutations,
+        # ordered most-likely-first for the Win2000 ntkrnlmp.pdb layout:
+        #   bucket_sort : records inside a bucket kept in symbol-record order
+        #                 (confirmed by disk_hr_increasing=True) vs name-sorted
+        #   empty_buck  : empty buckets / sentinel encoded as 0xFFFFFFFF
+        #                 (confirmed by disk_bucket_last=0xFFFFFFFF) vs cumulative
+        #   addr_base   : address-map values raw vs offset+1
+        #   stride      : in-memory 12-byte HR vs on-disk 8-byte
+        #   nbuck       : with trailing sentinel vs without
+        for bsort in ('symrec', 'name'):
+            for empty in ('ffff', 'cum'):
+                for addr_base in (0, 1):
+                    for stride in (12, 8):
+                        for nbuck in (cls._IPHR_HASH + 1, cls._IPHR_HASH):
+                            variants.append({
+                                'fmt': 'old', 'off_base': 1, 'cref': 1,
+                                'stride': stride, 'nbuck': nbuck,
+                                'bucket_sort': bsort, 'empty_buck': empty,
+                                'addr_base': addr_base})
+        return variants
+
+    @classmethod
+    def _serialize_gsi_symhash(cls, pubs, variant):
+        """Serialize the GSI symbol-hash blob for a given on-disk *variant*
+        from a list of (rec_offset, name, segment, offset) publics."""
+        iphr = cls._IPHR_HASH
+        buckets = [[] for _ in range(iphr)]
+        for rec_off, name, _seg, _off in pubs:
+            b = cls._gsi_hash_name(bytes(name), iphr)
+            buckets[b].append((rec_off, bytes(name)))
+        # mspdb orders records inside a bucket by (case-folded name, record
+        # offset) so the on-disk layout is deterministic.
+        counts = []
+        hr = bytearray()
+        off_base = variant['off_base']
+        cref = variant['cref']
+        bucket_sort = variant.get('bucket_sort', 'name')
+        for bi in range(iphr):
+            lst = buckets[bi]
+            if bucket_sort == 'name':
+                # mspdb-style: case-folded name, then record offset.
+                lst.sort(key=lambda t: (t[1].lower(), t[0]))
+            else:
+                # preserve symbol-record order within the bucket
+                lst.sort(key=lambda t: t[0])
+            counts.append(len(lst))
+            for rec_off, _name in lst:
+                hr += struct.pack('<II', rec_off + off_base, cref)
+
+        if variant['fmt'] == 'new':
+            stride = variant['stride']
+            bitmap = [0] * (iphr // 32 + 1)
+            present: List[int] = []
+            idx = 0
+            for bi in range(iphr):
+                if counts[bi]:
+                    bitmap[bi // 32] |= (1 << (bi % 32))
+                    present.append(idx * stride)
+                idx += counts[bi]
+            buck = bytearray()
+            for w in bitmap:
+                buck += struct.pack('<I', w)
+            for po in present:
+                buck += struct.pack('<I', po)
+            hdr = struct.pack('<IIII', 0xFFFFFFFF, 0xEFFE0000 + 19990810,
+                              len(hr), len(buck))
+            return hdr + bytes(hr) + bytes(buck)
+
+        # Old / uncompressed: a flat bucket table.  A non-empty bucket holds
+        # the offset of its first hash record = (records in earlier buckets) *
+        # stride.  Empty buckets (and the trailing sentinel) are encoded
+        # either as that same cumulative value ('cum') or as 0xFFFFFFFF
+        # ('ffff'), depending on the linker that wrote the file.
+        stride = variant['stride']
+        nbuck = variant['nbuck']
+        empty_ffff = variant.get('empty_buck') == 'ffff'
+        buck = bytearray()
+        cum = 0
+        for bi in range(nbuck):
+            non_empty = bi < iphr and counts[bi] > 0
+            if non_empty or not empty_ffff:
+                buck += struct.pack('<I', (cum * stride) & 0xFFFFFFFF)
+            else:
+                buck += struct.pack('<I', 0xFFFFFFFF)
+            if bi < iphr:
+                cum += counts[bi]
+        return bytes(hr) + bytes(buck)
+
+    @staticmethod
+    def _parse_publics_addrmap(original: bytes):
+        """Return the original address map as a list of record offsets, or
+        None if the stream is too short."""
+        if len(original) < 28:
+            return None
+        o_cbSymHash, o_cbAddrMap = struct.unpack_from('<ii', original, 0)
+        start = 28 + o_cbSymHash
+        am = original[start:start + o_cbAddrMap]
+        return [struct.unpack_from('<I', am, k * 4)[0]
+                for k in range(len(am) // 4)]
+
+    @classmethod
+    def _build_addrmap(cls, pubs, original: bytes, variant):
+        """Build the address-map bytes (an array of record offsets ordered by
+        symbol address).
+
+        Reproduction vs rebuild are handled distinctly:
+
+        * When *pubs* is exactly the set the original map already lists (the
+          reproduce/gate case), the file's existing order is preserved
+          verbatim so the stream round-trips byte-for-byte.  The original
+          linker's tiebreak among equal addresses is not reproducible by
+          re-sorting, so we never try.
+        * When records have been added (the rebuild case), the map is
+          re-sorted by current address over all records, so address->symbol
+          lookups stay correct after the relocation shifts.  dbghelp only
+          requires the map be address-sorted; the exact tiebreak is its own
+          business at that point."""
+        addr_base = variant.get('addr_base', 0)
+        addr_of = {ro: (seg, off) for ro, _name, seg, off in pubs}
+        orig = cls._parse_publics_addrmap(original)
+        if orig is not None and all(v in addr_of for v in orig):
+            known = set(orig)
+            new_offs = [ro for ro, _n, _s, _o in pubs if ro not in known]
+            if not new_offs:
+                order = orig            # exact reproduction (gate)
+            else:
+                order = [t[0] for t in
+                         sorted(pubs, key=lambda t: (t[2], t[3], t[0]))]
+        else:
+            order = [t[0] for t in sorted(pubs, key=lambda t: (t[2], t[3], t[0]))]
+        addrmap = bytearray()
+        for rec_off in order:
+            addrmap += struct.pack('<I', (rec_off + addr_base) & 0xFFFFFFFF)
+        return bytes(addrmap)
+
+    @classmethod
+    def _serialize_publics_stream(cls, pubs, original: bytes, variant):
+        """Rebuild a full public-symbols stream (PSGSIHDR + symhash +
+        address map [+ preserved thunk/section tail]) from *pubs* using the
+        given GSI *variant*, copying the thunk/section parameters from the
+        *original* stream so a thunk-free kernel PDB round-trips exactly.
+
+        Returns the new stream bytes, or None if the original is too short
+        to carry a PSGSIHDR."""
+        if len(original) < 28:
+            return None
+        (o_cbSymHash, o_cbAddrMap, nThunks, cbSizeOfThunk, isectThunk,
+         pad, offThunk, nSects) = struct.unpack_from('<iiIiHHii', original, 0)
+        # Tail (thunk map + section map) lives after symhash+addrmap.
+        tail = original[28 + o_cbSymHash + o_cbAddrMap:]
+
+        symhash = cls._serialize_gsi_symhash(pubs, variant)
+        addrmap = cls._build_addrmap(pubs, original, variant)
+
+        hdr = struct.pack('<iiIiHHii', len(symhash), len(addrmap), nThunks,
+                          cbSizeOfThunk, isectThunk, pad, offThunk, nSects)
+        return bytes(hdr) + symhash + bytes(addrmap) + tail
+
+    @classmethod
+    def _find_publics_variant(cls, pubs, original: bytes):
+        """Return the GSI variant that reproduces *original* byte-for-byte,
+        or None if no candidate layout matches."""
+        for v in cls._gsi_candidate_variants():
+            rebuilt = cls._serialize_publics_stream(pubs, original, v)
+            if rebuilt is not None and rebuilt == original:
+                return v
+        return None
+
+    @classmethod
+    def verify_publics_reproducible(cls, pdb_path: str) -> Dict[str, Any]:
+        """Safety gate.  Regenerate the file's existing public-symbols
+        stream from its own symbol records and require a byte-exact match
+        with what is on disk.  Only a match proves our serializer models
+        this exact file, making it safe to rebuild the index."""
+        res: Dict[str, Any] = {'reproducible': False, 'reason': ''}
+        try:
+            with open(pdb_path, 'rb') as f:
+                data = f.read()
+        except Exception as e:
+            res['reason'] = f'cannot read: {e}'
+            return res
+        p = cls._parse_pdb20(data)
+        if not p:
+            res['reason'] = 'not a PDB 2.0 file'
+            return res
+        dbi = p['read_stream'](3)
+        idx = cls._dbi_stream_indices(dbi)
+        if not idx:
+            res['reason'] = 'no DBI header'
+            return res
+        _sn_gs, sn_ps, sn_sym = idx
+        if sn_ps == 0xFFFF or sn_ps >= p['num_streams']:
+            res['reason'] = 'no public-symbols stream'
+            return res
+        if sn_sym == 0xFFFF or sn_sym >= p['num_streams']:
+            res['reason'] = 'no symbol-record stream'
+            return res
+        symrec = p['read_stream'](sn_sym)
+        pubstream = p['read_stream'](sn_ps)
+        pubs = cls._walk_pub32(symrec)
+        if not pubs:
+            res['reason'] = 'no S_PUB32 records found'
+            return res
+        variant = cls._find_publics_variant(pubs, pubstream)
+        if variant is not None:
+            res['reproducible'] = True
+            res['variant'] = variant
+            res['sn_ps'] = sn_ps
+            res['sn_sym'] = sn_sym
+            res['publics'] = len(pubs)
+        else:
+            # Detailed breakdown so a single export run reveals exactly which
+            # component (symhash / HR records / buckets / addrmap / tail)
+            # differs from the linker's bytes.  Report against both the new
+            # (compressed) and old (uncompressed) candidate layouts.
+            rebuilt = None
+            try:
+                (o_cbSymHash, o_cbAddrMap, nThunks, cbThunk, isectThunk,
+                 _pad, offThunk, nSects) = struct.unpack_from('<iiIiHHii',
+                                                              pubstream, 0)
+                v_new = {'fmt': 'new', 'off_base': 1, 'cref': 1, 'stride': 12,
+                         'bucket_sort': 'name'}
+                v_old = {'fmt': 'old', 'off_base': 1, 'cref': 1, 'stride': 12,
+                         'nbuck': cls._IPHR_HASH + 1, 'bucket_sort': 'symrec',
+                         'empty_buck': 'ffff'}
+                my_sh = cls._serialize_gsi_symhash(pubs, v_new)
+                my_sh_old = cls._serialize_gsi_symhash(pubs, v_old)
+                rebuilt = cls._serialize_publics_stream(pubs, pubstream, v_new)
+                disk_sh = pubstream[28:28 + o_cbSymHash]
+
+                def u32(buf, o):
+                    return struct.unpack_from('<I', buf, o)[0] if o + 4 <= len(buf) else -1
+
+                tail_len = len(pubstream) - 28 - o_cbSymHash - o_cbAddrMap
+                diag = {
+                    'nPubs': len(pubs),
+                    'my_symhash_new': len(my_sh),
+                    'my_symhash_old': len(my_sh_old),
+                    'disk_cbSymHash': o_cbSymHash,
+                    'my_addrmap': 4 * len(pubs), 'disk_cbAddrMap': o_cbAddrMap,
+                    'nThunks': nThunks, 'tail_len': tail_len,
+                }
+
+                # When the OLD layout size matches, decode the on-disk HR
+                # array + bucket table and compare against ours field-by-
+                # field so we can pin the exact ordering/encoding.
+                extra = ''
+                nHR = len(pubs)
+                hr_bytes = 8 * nHR
+                if o_cbSymHash == hr_bytes + (cls._IPHR_HASH + 1) * 4:
+                    disk_hr = disk_sh[:hr_bytes]
+                    disk_buck = disk_sh[hr_bytes:]
+                    my_hr = my_sh_old[:hr_bytes]
+                    my_buck = my_sh_old[hr_bytes:]
+                    disk_addr = pubstream[28 + o_cbSymHash:
+                                          28 + o_cbSymHash + o_cbAddrMap]
+                    addr_sorted = sorted(pubs, key=lambda t: (t[2], t[3], t[0]))
+                    my_addr = b''.join(struct.pack('<I', t[0]) for t in addr_sorted)
+
+                    def offs(buf, count):
+                        return [u32(buf, k * 8) for k in range(count)]
+
+                    def words(buf, count):
+                        return [u32(buf, k * 4) for k in range(count)]
+
+                    disk_offs = offs(disk_hr, min(10, nHR))
+                    my_offs = offs(my_hr, min(10, nHR))
+                    disk_inc = all(u32(disk_hr, k * 8) <= u32(disk_hr, (k + 1) * 8)
+                                   for k in range(nHR - 1))
+                    dbh = words(disk_buck, 10)
+                    mbh = words(my_buck, 10)
+                    # Is the disk address map merely a different ordering of
+                    # the same record offsets we have (then it's a sort key
+                    # problem), or genuinely different values (a base/encoding
+                    # problem)?
+                    disk_av = sorted(words(disk_addr, o_cbAddrMap // 4))
+                    my_av = sorted(t[0] for t in addr_sorted)
+                    diag.update({
+                        'hr_match': my_hr == disk_hr,
+                        'buck_match': my_buck == disk_buck,
+                        'addr_match': my_addr == disk_addr,
+                        'disk_hr_increasing': disk_inc,
+                        'disk_hr_offs': disk_offs,
+                        'my_hr_offs': my_offs,
+                        'disk_buckets_head': dbh,
+                        'my_buckets_head': mbh,
+                        'disk_bucket_last': u32(disk_buck, cls._IPHR_HASH * 4),
+                        'disk_addr_head': words(disk_addr, 8),
+                        'my_addr_head': words(my_addr, 8),
+                        'addr_same_set': disk_av == my_av,
+                        'addr_off_by_one': disk_av == [v + 1 for v in my_av],
+                    })
+                    extra = (
+                        ' | OLD-layout decode: hr_match={hr_match} '
+                        'buck_match={buck_match} addr_match={addr_match} '
+                        'disk_hr_increasing={disk_hr_increasing} '
+                        'disk_hr_offs={disk_hr_offs} my_hr_offs={my_hr_offs} '
+                        'disk_buckets_head={disk_buckets_head} '
+                        'my_buckets_head={my_buckets_head} '
+                        'disk_bucket_last={disk_bucket_last} '
+                        'disk_addr_head={disk_addr_head} '
+                        'my_addr_head={my_addr_head} '
+                        'addr_same_set={addr_same_set} '
+                        'addr_off_by_one={addr_off_by_one}').format(**diag)
+
+                res['diag'] = diag
+                res['reason'] = (
+                    'no variant matched | nPubs={nPubs} symhash mine '
+                    'new={my_symhash_new} old={my_symhash_old} '
+                    'disk={disk_cbSymHash} addrmap my={my_addrmap}/'
+                    'disk={disk_cbAddrMap} nThunks={nThunks} '
+                    'tail={tail_len}'.format(**diag) + extra)
+            except Exception as e:
+                rb = len(rebuilt) if rebuilt is not None else -1
+                res['reason'] = (f'byte mismatch (rebuilt {rb} vs '
+                                 f'on-disk {len(pubstream)}); diag failed: {e}')
+        return res
+
+    @classmethod
+    def _replace_stream_bytes(cls, data: bytearray, stream_idx: int,
+                              new_bytes: bytes) -> bool:
+        """Replace the entire contents of one stream, growing the file with
+        fresh pages if needed and rebuilding the root directory.  Returns
+        True on success.  Mirrors the proven page-append logic used by
+        inject_symbols_pdb."""
+        p = cls._parse_pdb20(bytes(data))
+        if not p or stream_idx >= p['num_streams']:
+            return False
+        page_size = p['page_size']
+        sizes = list(p['sizes'])
+        stream_pages = [list(x) for x in p['stream_pages']]
+        root_pages = list(p['root_pages'])
+        num_streams = p['num_streams']
+
+        if len(data) % page_size:
+            data.extend(b'\x00' * (page_size - (len(data) % page_size)))
+
+        pn_fpm = struct.unpack_from('<H', data, 48)[0]
+
+        def mark_used(pn: int):
+            if pn_fpm == 0 or pn_fpm * page_size >= len(data):
+                return
+            bo = pn_fpm * page_size + (pn // 8)
+            if 0 <= bo < len(data):
+                data[bo] &= ~(1 << (pn % 8)) & 0xFF
+
+        need_pages = math.ceil(len(new_bytes) / page_size) if new_bytes else 0
+        have_pages = len(stream_pages[stream_idx])
+        if need_pages > have_pages:
+            total = len(data) // page_size
+            extra = list(range(total, total + (need_pages - have_pages)))
+            data.extend(b'\x00' * ((need_pages - have_pages) * page_size))
+            stream_pages[stream_idx].extend(extra)
+            for pn in extra:
+                mark_used(pn)
+            nt = len(data) // page_size
+            if nt <= 0xFFFF:
+                struct.pack_into('<H', data, 50, nt)
+        # truncate page list if the stream shrank
+        stream_pages[stream_idx] = stream_pages[stream_idx][:max(need_pages, 0)]
+        sizes[stream_idx] = len(new_bytes)
+
+        # Zero the target pages, then write the new bytes across them.
+        for pi, pn in enumerate(stream_pages[stream_idx]):
+            base = pn * page_size
+            data[base:base + page_size] = b'\x00' * page_size
+        for i, b in enumerate(new_bytes):
+            pi = i // page_size
+            ip = i % page_size
+            pn = stream_pages[stream_idx][pi]
+            data[pn * page_size + ip] = b
+
+        # Rebuild the root directory.
+        new_root = bytearray()
+        new_root += struct.pack('<HH', num_streams, 0)
+        for si in range(num_streams):
+            new_root += struct.pack('<II', sizes[si], 0)
+        for si in range(num_streams):
+            cnt = math.ceil(sizes[si] / page_size) if sizes[si] not in (0, 0xFFFFFFFF) else 0
+            pages = stream_pages[si]
+            for pi in range(cnt):
+                new_root += struct.pack('<H', pages[pi] if pi < len(pages) else 0)
+
+        root_pages_needed = math.ceil(len(new_root) / page_size)
+        if root_pages_needed > len(root_pages):
+            total = len(data) // page_size
+            for _ in range(root_pages_needed - len(root_pages)):
+                root_pages.append(total)
+                data.extend(b'\x00' * page_size)
+                mark_used(total)
+                total += 1
+            for ri, rpn in enumerate(root_pages):
+                struct.pack_into('<H', data, 60 + ri * 2, rpn)
+            if total <= 0xFFFF:
+                struct.pack_into('<H', data, 50, total)
+        struct.pack_into('<I', data, 52, len(new_root))
+        for pi, pn in enumerate(root_pages):
+            s = pi * page_size
+            e = min(s + page_size, len(new_root))
+            if s < len(new_root):
+                data[pn * page_size:pn * page_size + (e - s)] = new_root[s:e]
+        return True
+
+    @classmethod
+    def rebuild_publics_index(cls, pdb_path: str,
+                              variant=None) -> Dict[str, Any]:
+        """Rebuild the public-symbols hash so every S_PUB32 record in the
+        symbol-record stream (including freshly injected ones) is
+        enumerable by dbghelp.  Must only be called after
+        verify_publics_reproducible() returned True for the *pre-injection*
+        file; pass the ``variant`` it reported so the rebuilt hash uses the
+        same on-disk layout that file already uses."""
+        res: Dict[str, Any] = {'reindexed': False, 'publics': 0, 'errors': []}
+        if variant is None:
+            variant = {'fmt': 'new', 'off_base': 1, 'cref': 1, 'stride': 12}
+        try:
+            with open(pdb_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            res['errors'].append(f'cannot read: {e}')
+            return res
+        p = cls._parse_pdb20(bytes(data))
+        if not p:
+            res['errors'].append('not a PDB 2.0 file')
+            return res
+        idx = cls._dbi_stream_indices(p['read_stream'](3))
+        if not idx:
+            res['errors'].append('no DBI header')
+            return res
+        _sn_gs, sn_ps, sn_sym = idx
+        if sn_ps >= p['num_streams'] or sn_sym >= p['num_streams']:
+            res['errors'].append('publics/symbol stream index out of range')
+            return res
+        symrec = p['read_stream'](sn_sym)
+        pubstream = p['read_stream'](sn_ps)
+        pubs = cls._walk_pub32(symrec)
+        new_pub = cls._serialize_publics_stream(pubs, pubstream, variant)
+        if new_pub is None:
+            res['errors'].append('publics stream not modellable')
+            return res
+        if not cls._replace_stream_bytes(data, sn_ps, new_pub):
+            res['errors'].append('failed to rewrite publics stream')
+            return res
+
+        # Self-check: re-parse the in-memory result and confirm the publics
+        # stream reads back byte-for-byte through its (possibly new) pages.
+        # This catches any page-mapping/root-rebuild mistake before we ever
+        # touch the file on disk.
+        verify = cls._parse_pdb20(bytes(data))
+        if not verify or verify['read_stream'](sn_ps) != new_pub:
+            res['errors'].append('post-write verification failed; not saved')
+            return res
+
+        try:
+            with open(pdb_path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            res['errors'].append(f'cannot write: {e}')
+            return res
+        res['reindexed'] = True
+        res['publics'] = len(pubs)
+        return res
 
 
 # ─── Shift Engine ─────────────────────────────────────────────────────────
