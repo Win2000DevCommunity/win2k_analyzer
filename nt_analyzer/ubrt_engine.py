@@ -4765,10 +4765,13 @@ class SymbolUpdater:
                 if dd_ptr + 8 > len(data):
                     continue
                 num_symbols = struct.unpack_from('<I', data, dd_ptr)[0]
+                sym_base = struct.unpack_from('<I', data, dd_ptr + 4)[0]
+                if sym_base < 8:
+                    sym_base = 32
 
                 idx = 0
                 while idx < min(num_symbols, 50000):
-                    entry_off = dd_ptr + 8 + idx * 18
+                    entry_off = dd_ptr + sym_base + idx * 18
                     if entry_off + 18 > len(data):
                         break
 
@@ -5616,6 +5619,54 @@ class SymbolUpdater:
         return res
 
     @staticmethod
+    def read_dbg_codeview(dbg_path: str) -> Dict[str, Any]:
+        """Read the CodeView (NB10/RSDS) record embedded in a .dbg file."""
+        info: Dict[str, Any] = {}
+        try:
+            with open(dbg_path, 'rb') as f:
+                data = f.read()
+        except Exception as e:
+            info['error'] = str(e)
+            return info
+        if len(data) < 48 or struct.unpack_from('<H', data, 0)[0] != 0x4944:
+            info['error'] = 'Not a valid DBG file'
+            return info
+        info['timestamp'] = struct.unpack_from('<I', data, 8)[0]
+        num_sections = struct.unpack_from('<I', data, 24)[0]
+        exported_names_size = struct.unpack_from('<I', data, 28)[0]
+        debug_dir_size = struct.unpack_from('<I', data, 32)[0]
+        dd_start = 48 + num_sections * 40 + exported_names_size
+        for i in range(debug_dir_size // 28):
+            off = dd_start + i * 28
+            if off + 28 > len(data):
+                break
+            dd_type = struct.unpack_from('<I', data, off + 12)[0]
+            dd_size = struct.unpack_from('<I', data, off + 16)[0]
+            dd_ptr = struct.unpack_from('<I', data, off + 24)[0]
+            if dd_type != 2 or dd_ptr + dd_size > len(data):
+                continue
+            raw = data[dd_ptr:dd_ptr + dd_size]
+            if raw[:4] == b'NB10':
+                info.update({
+                    'format': 'NB10',
+                    'signature': struct.unpack_from('<I', raw, 8)[0],
+                    'age': struct.unpack_from('<I', raw, 12)[0],
+                    'pdb': raw[16:].split(b'\x00', 1)[0].decode(
+                        'ascii', 'replace'),
+                })
+                break
+            elif raw[:4] == b'RSDS':
+                info.update({
+                    'format': 'RSDS',
+                    'guid': raw[4:20],
+                    'age': struct.unpack_from('<I', raw, 20)[0],
+                    'pdb': raw[24:].split(b'\x00', 1)[0].decode(
+                        'ascii', 'replace'),
+                })
+                break
+        return info
+
+    @staticmethod
     def stamp_dbg_timestamp(dbg_path: str, timestamp: int) -> Dict[str, Any]:
         """
         Set the TimeDateStamp in a .dbg file's IMAGE_SEPARATE_DEBUG_HEADER
@@ -5643,6 +5694,473 @@ class SymbolUpdater:
             res['stamped'] = True
         except Exception as e:
             res['errors'].append(f'Cannot write {dbg_path}: {e}')
+        return res
+
+    @staticmethod
+    def _pe_section_header_bytes(section) -> bytes:
+        """Pack one IMAGE_SECTION_HEADER (40 bytes) from a pefile section."""
+        return struct.pack(
+            '<8sIIIIIIHHI',
+            section.Name,
+            section.Misc_VirtualSize,
+            section.VirtualAddress,
+            section.SizeOfRawData,
+            section.PointerToRawData,
+            section.PointerToRelocations,
+            section.PointerToLinenumbers,
+            section.NumberOfRelocations,
+            section.NumberOfLinenumbers,
+            section.Characteristics,
+        )
+
+    @staticmethod
+    def sync_dbg_sections_from_pe(dbg_path: str, pe_path: str) -> Dict[str, Any]:
+        """Rebuild the .dbg section table and header fields from a target PE.
+
+        Patched HAL images often gain sections (e.g. ``.xcode``) that the
+        original Microsoft ``halmacpi.dbg`` does not describe.  WinDbg/dbghelp
+        validate the separate-debug header (timestamp, checksum, SizeOfImage,
+        section count/RVAs) against the loaded image; stale section tables
+        prevent the .dbg (and chained .pdb) from binding.
+        """
+        res: Dict[str, Any] = {
+            'synced': False, 'errors': [],
+            'old_sections': 0, 'new_sections': 0,
+        }
+        try:
+            import pefile as _pefile
+            pe = _pefile.PE(pe_path, fast_load=False)
+            pe_sections = list(pe.sections)
+            ts = pe.FILE_HEADER.TimeDateStamp
+            chk = pe.OPTIONAL_HEADER.CheckSum
+            soi = pe.OPTIONAL_HEADER.SizeOfImage
+            pe.close()
+        except Exception as e:
+            res['errors'].append(f'Cannot read PE {pe_path}: {e}')
+            return res
+
+        try:
+            with open(dbg_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            res['errors'].append(f'Cannot read {dbg_path}: {e}')
+            return res
+
+        if len(data) < 48 or struct.unpack_from('<H', data, 0)[0] != 0x4944:
+            res['errors'].append('Invalid DBG signature')
+            return res
+
+        old_ns = struct.unpack_from('<I', data, 24)[0]
+        ens = struct.unpack_from('<I', data, 28)[0]
+        dds = struct.unpack_from('<I', data, 32)[0]
+        new_ns = len(pe_sections)
+        res['old_sections'] = old_ns
+        res['new_sections'] = new_ns
+
+        new_sec = b''.join(
+            SymbolUpdater._pe_section_header_bytes(s) for s in pe_sections)
+
+        old_sec_end = 48 + old_ns * 40
+        old_dd_start = old_sec_end + ens
+        old_dd_end = old_dd_start + dds
+        layout_delta = (new_ns - old_ns) * 40
+
+        if layout_delta == 0:
+            data[48:48 + new_ns * 40] = new_sec
+        else:
+            rebuilt = bytearray()
+            rebuilt += data[:48]
+            rebuilt += new_sec
+            rebuilt += data[old_sec_end:old_dd_start]
+            for i in range(dds // 28):
+                entry = bytearray(data[old_dd_start + i * 28:
+                                        old_dd_start + (i + 1) * 28])
+                ptr = struct.unpack_from('<I', entry, 24)[0]
+                if ptr >= old_dd_end:
+                    struct.pack_into('<I', entry, 24,
+                                     (ptr + layout_delta) & 0xFFFFFFFF)
+                rebuilt += entry
+            rebuilt += data[old_dd_end:]
+            data = rebuilt
+
+        struct.pack_into('<I', data, 8, ts & 0xFFFFFFFF)
+        struct.pack_into('<I', data, 12, chk & 0xFFFFFFFF)
+        struct.pack_into('<I', data, 20, soi & 0xFFFFFFFF)
+        struct.pack_into('<I', data, 24, new_ns)
+        nb10 = data.find(b'NB10')
+        if nb10 >= 0 and nb10 + 16 <= len(data):
+            struct.pack_into('<I', data, nb10 + 8, ts & 0xFFFFFFFF)
+
+        try:
+            with open(dbg_path, 'wb') as f:
+                f.write(data)
+            res['synced'] = True
+            res['timestamp'] = ts
+            res['checksum'] = chk
+            res['size_of_image'] = soi
+        except Exception as e:
+            res['errors'].append(f'Cannot write {dbg_path}: {e}')
+        return res
+
+    @staticmethod
+    def stamp_dbg_from_pe(dbg_path: str, pe_path: str) -> Dict[str, Any]:
+        """Sync a .dbg header (and embedded NB10) to a target PE image.
+
+        Delegates to :meth:`sync_dbg_sections_from_pe` so section layout,
+        checksum, and timestamp stay consistent with the image WinDbg loads.
+        """
+        return SymbolUpdater.sync_dbg_sections_from_pe(dbg_path, pe_path)
+
+    @staticmethod
+    def inject_dbg_coff_symbols(dbg_path: str, symbols,
+                                image_base: int = None) -> Dict[str, Any]:
+        """Add a COFF symbol table (debug dir type 1) to a separate .dbg file.
+
+        Win2K kernel debugger reads COFF/FPO from ``.dbg`` files; it does not
+        understand the PDB 7.0 files referenced by the NB10 block in Microsoft's
+        HAL debug package.  Injecting recovered symbols as COFF makes ``lm``
+        show real function names under the classic kernel debugger.
+        """
+        res: Dict[str, Any] = {
+            'injected': 0, 'skipped': 0, 'errors': [],
+        }
+        try:
+            with open(dbg_path, 'rb') as f:
+                data = bytearray(f.read())
+        except Exception as e:
+            res['errors'].append(f'Cannot read {dbg_path}: {e}')
+            return res
+
+        if len(data) < 48 or struct.unpack_from('<H', data, 0)[0] != 0x4944:
+            res['errors'].append('Invalid DBG signature')
+            return res
+
+        if image_base is None:
+            image_base = struct.unpack_from('<I', data, 16)[0]
+
+        num_sections = struct.unpack_from('<I', data, 24)[0]
+        ens = struct.unpack_from('<I', data, 28)[0]
+        dds = struct.unpack_from('<I', data, 32)[0]
+        dd_start = 48 + num_sections * 40 + ens
+        dd_end = dd_start + dds
+
+        sec_map: Dict[str, int] = {}
+        for si in range(num_sections):
+            sh_off = 48 + si * 40
+            sec_name = data[sh_off:sh_off + 8].split(b'\x00', 1)[0].decode(
+                'ascii', 'replace')
+            sec_map[sec_name] = si + 1
+
+        kept_entries = bytearray()
+        for i in range(dds // 28):
+            off = dd_start + i * 28
+            if struct.unpack_from('<I', data, off + 12)[0] == 1:
+                continue
+            kept_entries += data[off:off + 28]
+        data = data[:dd_start] + kept_entries + data[dd_end:]
+        struct.pack_into('<I', data, 32, len(kept_entries))
+
+        code_start = code_end = data_start = data_end = 0
+        for si in range(num_sections):
+            sh_off = 48 + si * 40
+            raw_name = data[sh_off:sh_off + 8].split(b'\x00', 1)[0]
+            vs = struct.unpack_from('<I', data, sh_off + 8)[0]
+            va = struct.unpack_from('<I', data, sh_off + 12)[0]
+            if raw_name == b'.text':
+                code_start, code_end = va, va + vs
+            elif raw_name == b'.data' and data_start == 0:
+                data_start, data_end = va, va + vs
+
+        entries = []
+        strtab = bytearray(struct.pack('<I', 4))
+        str_off = 4
+
+        for sym in symbols:
+            status = getattr(sym, 'status', 'ok')
+            if status not in ('ok', 'discovered'):
+                res['skipped'] += 1
+                continue
+            name = getattr(sym, 'name', None) or sym.get('name')
+            va = getattr(sym, 'recovered_va', None)
+            if va is None:
+                va = sym.get('recovered_va', sym.get('va'))
+            sec_name = getattr(sym, 'section_name', None) or sym.get('section_name')
+            if not name or va is None or not sec_name:
+                res['skipped'] += 1
+                continue
+            sec_num = sec_map.get(sec_name)
+            if not sec_num:
+                sec_idx = getattr(sym, 'section_index', None)
+                if sec_idx and sec_idx > 0:
+                    sec_num = sec_idx
+            if not sec_num:
+                res['skipped'] += 1
+                continue
+            rva = (int(va) - int(image_base)) & 0xFFFFFFFF
+            nm = name.encode('ascii', 'replace')
+            if len(nm) <= 8:
+                name_field = nm.ljust(8, b'\x00')[:8]
+            else:
+                name_field = struct.pack('<II', 0, str_off)
+                strtab += nm + b'\x00'
+                str_off = len(strtab)
+            entries.append((name_field, rva, sec_num))
+
+        if not entries:
+            res['errors'].append('No symbols eligible for COFF injection')
+            return res
+
+        struct.pack_into('<I', strtab, 0, len(strtab))
+        entries.sort(key=lambda e: (e[2], e[1], e[0]))
+
+        # IMAGE_COFF_SYMBOLS_HEADER (32 bytes).  Real .dbg files use
+        # LvaToFirstSymbol=32 and place COFF as the first debug directory.
+        lva_first = 32
+        coff = bytearray(struct.pack(
+            '<8I',
+            len(entries),
+            lva_first,
+            0,
+            0,
+            code_start or 0x340,
+            code_end or 0x8600,
+            data_start or 0x8600,
+            data_end or 0xA674,
+        ))
+        for name_field, rva, sec_num in entries:
+            coff += name_field
+            coff += struct.pack('<I', rva)
+            coff += struct.pack('<h', sec_num)
+            coff += struct.pack('<H', 0)
+            coff += bytes((2, 0))
+        coff += strtab
+
+        new_entry = bytearray(28)
+        struct.pack_into('<I', new_entry, 12, 1)
+        struct.pack_into('<I', new_entry, 16, len(coff))
+
+        # Insert the COFF directory entry first (real .dbg layout), then
+        # append the COFF payload at EOF so pointer fixups stay simple.
+        data = data[:dd_start] + new_entry + data[dd_start:]
+        struct.pack_into('<I', data, 32, len(kept_entries) + 28)
+        for i in range(1, (len(kept_entries) + 28) // 28):
+            off = dd_start + i * 28
+            ptr = struct.unpack_from('<I', data, off + 24)[0]
+            if ptr:
+                struct.pack_into('<I', data, off + 24, (ptr + 28) & 0xFFFFFFFF)
+
+        coff_ptr = len(data)
+        data += coff
+        struct.pack_into('<I', data, dd_start + 24, coff_ptr)
+
+        try:
+            with open(dbg_path, 'wb') as f:
+                f.write(data)
+            res['injected'] = len(entries)
+        except Exception as e:
+            res['errors'].append(f'Cannot write {dbg_path}: {e}')
+        return res
+
+    @staticmethod
+    def inject_pe_hal_debug_chain(
+            pe_path: str,
+            dbg_relpath: str = 'dll\\halmacpi.dbg',
+            pdb_name: str = 'halmacpi.pdb',
+            pdb_info_sig: int = None,
+            misc_size: int = 272) -> Dict[str, Any]:
+        """Restore HAL debug chain on symbol-path PE copies.
+
+        Patched HAL images lose the in-PE debug directory.  Win2K kd loads
+        PDB 7.0 reliably from **in-PE CodeView** (see ACPI.sys + ACPI.pdb) but
+        often will not walk ``.dbg NB10 -> .pdb`` for MSF 7.00 files.
+
+        This injects both entries Microsoft used for separate-debug HAL:
+          * type 4 MISC  -> ``dll\\halmacpi.dbg`` (timestamp .dbg bind)
+          * type 2 NB10  -> ``halmacpi.pdb`` (direct PDB open, like other drivers)
+        """
+        res: Dict[str, Any] = {
+            'injected': False, 'errors': [],
+            'dbg_path': dbg_relpath, 'pdb_name': pdb_name,
+        }
+        try:
+            import pefile as _pefile
+            pe = _pefile.PE(pe_path, fast_load=False)
+        except Exception as e:
+            res['errors'].append(f'Cannot parse PE: {e}')
+            return res
+
+        dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[6]
+        if dd.Size:
+            pe.close()
+            res['injected'] = True
+            res['reason'] = 'debug directory already present'
+            return res
+
+        path_bytes = dbg_relpath.encode('ascii') + b'\x00.dll\x00'
+        misc = bytearray(misc_size)
+        struct.pack_into('<I', misc, 0, 1)
+        struct.pack_into('<I', misc, 4, misc_size)
+        misc[8] = 0
+        misc[9:12] = b'\x00\x00\x14'
+        misc[12:12 + len(path_bytes)] = path_bytes
+
+        pe_ts = pe.FILE_HEADER.TimeDateStamp
+        # kd matches in-PE NB10 signature to PDB stream-1 and the image
+        # TimeDateStamp (see !sym noisy "mismatched pdb" when they differ).
+        nb10_sig = pe_ts
+        pdb_bytes = pdb_name.encode('ascii') + b'\x00'
+        nb10 = bytearray(16 + len(pdb_bytes))
+        nb10[0:4] = b'NB10'
+        struct.pack_into('<I', nb10, 8, nb10_sig & 0xFFFFFFFF)
+        struct.pack_into('<I', nb10, 12, 1)
+        nb10[16:16 + len(pdb_bytes)] = pdb_bytes
+        nb10_size = len(nb10)
+
+        need = misc_size + 56 + nb10_size  # MISC + 2 debug dir entries + NB10
+        host = None
+        for s in pe.sections:
+            if s.SizeOfRawData - s.Misc_VirtualSize >= need:
+                host = s
+                break
+        if host is None:
+            pe.close()
+            res['errors'].append(
+                f'No section with {need} bytes slack for HAL debug chain')
+            return res
+
+        base_off = int(host.PointerToRawData + host.Misc_VirtualSize)
+        base_rva = int(host.VirtualAddress + host.Misc_VirtualSize)
+        misc_off = base_off
+        misc_rva = base_rva
+        dd_off = base_off + misc_size
+        dd_rva = base_rva + misc_size
+        nb10_off = dd_off + 56
+        nb10_rva = dd_rva + 56
+        pe_type = pe.PE_TYPE
+        dd_base = pe.OPTIONAL_HEADER.get_file_offset()
+        dd_hdr_off = dd_base + (112 if pe_type == 0x20b else 96) + 6 * 8
+
+        try:
+            with open(pe_path, 'rb') as f:
+                data = bytearray(f.read())
+        except OSError as e:
+            pe.close()
+            res['errors'].append(str(e))
+            return res
+        pe.close()
+
+        data[misc_off:misc_off + misc_size] = misc
+        misc_entry = struct.pack(
+            '<IIHHIIII', 0, pe_ts & 0xFFFFFFFF, 0, 0,
+            4, misc_size, misc_rva, misc_off)
+        nb10_entry = struct.pack(
+            '<IIHHIIII', 0, pe_ts & 0xFFFFFFFF, 0, 0,
+            2, nb10_size, nb10_rva, nb10_off)
+        data[dd_off:dd_off + 28] = misc_entry
+        data[dd_off + 28:dd_off + 56] = nb10_entry
+        data[nb10_off:nb10_off + nb10_size] = nb10
+        struct.pack_into('<II', data, dd_hdr_off, dd_rva, 56)
+
+        try:
+            with open(pe_path, 'wb') as f:
+                f.write(data)
+        except OSError as e:
+            res['errors'].append(str(e))
+            return res
+
+        res['injected'] = True
+        res['misc_rva'] = misc_rva
+        res['nb10_rva'] = nb10_rva
+        res['nb10_sig'] = nb10_sig
+        res['section'] = host.Name.rstrip(b'\x00').decode('ascii', 'replace')
+        return res
+
+    @staticmethod
+    def inject_pe_misc_separate_debug(
+            pe_path: str,
+            dbg_relpath: str = 'dll\\halmacpi.dbg',
+            misc_size: int = 272) -> Dict[str, Any]:
+        """Legacy wrapper — use :meth:`inject_pe_hal_debug_chain`."""
+        return SymbolUpdater.inject_pe_hal_debug_chain(
+            pe_path, dbg_relpath=dbg_relpath, misc_size=misc_size)
+
+    @staticmethod
+    def deploy_hal_windbg_symbols(output_dir: str, patched_pe_path: str,
+                                  dbg_path: str, pdb_path: str) -> Dict[str, Any]:
+        """Copy HAL symbol files using the names WinDbg actually searches for.
+
+        The kernel exposes this module as ``hal`` / ``HAL.dll`` (see
+        ``lmDvm hal``), while Microsoft stores separate debug as
+        ``dll\\halmacpi.dbg``.  Deploy both naming schemes plus a
+        timestamp-matched PE copy so dbghelp can bind the chain.
+        """
+        res: Dict[str, Any] = {'deployed': [], 'errors': [], 'bind_check': {}}
+        try:
+            import pefile as _pefile
+            import shutil as _shutil
+            pe = _pefile.PE(patched_pe_path, fast_load=True)
+            pe_ts = pe.FILE_HEADER.TimeDateStamp
+            pe_chk = pe.OPTIONAL_HEADER.CheckSum
+            pe_soi = pe.OPTIONAL_HEADER.SizeOfImage
+            pe.close()
+        except Exception as e:
+            res['errors'].append(f'Cannot read patched PE: {e}')
+            return res
+
+        os.makedirs(output_dir, exist_ok=True)
+        pe_copies = ('halmacpi.dll', 'HAL.dll')
+        pairs = (
+            ('halmacpi.dbg', dbg_path),
+            ('HAL.dbg', dbg_path),
+            ('halmacpi.pdb', pdb_path),
+            ('HAL.pdb', pdb_path),
+        )
+        for name, src in pairs:
+            if not os.path.isfile(src):
+                res['errors'].append(f'Missing source for {name}: {src}')
+                continue
+            dst = os.path.join(output_dir, name)
+            try:
+                _shutil.copy2(src, dst)
+                res['deployed'].append(dst)
+            except OSError as e:
+                res['errors'].append(f'Cannot copy {name}: {e}')
+
+        misc_result = None
+        for name in pe_copies:
+            dst = os.path.join(output_dir, name)
+            try:
+                _shutil.copy2(patched_pe_path, dst)
+                res['deployed'].append(dst)
+            except OSError as e:
+                res['errors'].append(f'Cannot copy {name}: {e}')
+                continue
+            inj = SymbolUpdater.inject_pe_hal_debug_chain(
+                dst, dbg_relpath='dll\\halmacpi.dbg')
+            if name == 'HAL.dll':
+                misc_result = inj
+            if inj.get('errors'):
+                res['errors'].extend(inj['errors'])
+        if misc_result:
+            res['misc_injected'] = misc_result
+
+        if os.path.isfile(dbg_path):
+            with open(dbg_path, 'rb') as f:
+                dbg = f.read(48)
+            if len(dbg) >= 48 and struct.unpack_from('<H', dbg, 0)[0] == 0x4944:
+                res['bind_check'] = {
+                    'pe_timestamp': pe_ts,
+                    'pe_checksum': pe_chk,
+                    'pe_size_of_image': pe_soi,
+                    'dbg_timestamp': struct.unpack_from('<I', dbg, 8)[0],
+                    'dbg_checksum': struct.unpack_from('<I', dbg, 12)[0],
+                    'dbg_size_of_image': struct.unpack_from('<I', dbg, 20)[0],
+                    'dbg_sections': struct.unpack_from('<I', dbg, 24)[0],
+                }
+                bc = res['bind_check']
+                bc['timestamp_match'] = bc['dbg_timestamp'] == bc['pe_timestamp']
+                bc['checksum_match'] = bc['dbg_checksum'] == bc['pe_checksum']
+                bc['size_match'] = bc['dbg_size_of_image'] == bc['pe_size_of_image']
         return res
 
     # ------------------------------------------------------------------
@@ -5833,6 +6351,8 @@ class SymbolUpdater:
         variants = []
         # New / compressed (PDB 7.0): GSIHashHdr + HR + bitmap + present offsets
         variants.append({'fmt': 'new', 'off_base': 1, 'cref': 1, 'stride': 12,
+                         'bucket_sort': 'len_name'})
+        variants.append({'fmt': 'new', 'off_base': 1, 'cref': 1, 'stride': 12,
                          'bucket_sort': 'name'})
         # Old / uncompressed (PDB 2.0): HR + bucket table.  Permutations,
         # ordered most-likely-first for the Win2000 ntkrnlmp.pdb layout:
@@ -5876,6 +6396,10 @@ class SymbolUpdater:
             if bucket_sort == 'name':
                 # mspdb-style: case-folded name, then record offset.
                 lst.sort(key=lambda t: (t[1].lower(), t[0]))
+            elif bucket_sort == 'len_name':
+                # PDB 7.0 HAL-style: shortest name first, then case-folded
+                # name, then record offset (observed in halmacpi.pdb).
+                lst.sort(key=lambda t: (len(t[1]), t[1].lower(), t[0]))
             else:
                 # preserve symbol-record order within the bucket
                 lst.sort(key=lambda t: t[0])

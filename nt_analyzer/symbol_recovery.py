@@ -437,6 +437,8 @@ class SymbolRecoveryEngine:
             raise RuntimeError("No diff result available")
 
         from nt_analyzer.ubrt_engine import SymbolUpdater
+        from nt_analyzer.pdb70.msf import detect_pdb_format
+        from nt_analyzer.pdb70.updater import SymbolUpdater70
 
         if not os.path.isfile(orig_pdb_path):
             raise FileNotFoundError(f"Source PDB not found: {orig_pdb_path}")
@@ -449,36 +451,78 @@ class SymbolRecoveryEngine:
         os.close(fd)
         shutil.copy2(orig_pdb_path, tmp_path)
 
+        pdb_fmt = detect_pdb_format(tmp_path)
+        if pdb_fmt == 'pdb70':
+            Updater = SymbolUpdater70
+        elif pdb_fmt == 'pdb20':
+            Updater = SymbolUpdater
+        else:
+            raise RuntimeError(f'Unsupported PDB format for export: {pdb_fmt}')
+
         try:
             # Safety gate for publics re-indexing: decide up-front (on the
             # pristine copy, before any edit) whether our GSI serializer can
             # reproduce this file's existing publics hash byte-for-byte.  If
             # it can't, we will append symbols but not touch the hash, so we
             # can never regress symbols that already resolve.
-            repro = SymbolUpdater.verify_publics_reproducible(tmp_path)
-            # Apply cumulative shifts per section.  Process sections from
-            # highest VA to lowest to avoid double-shifting.
-            results = []
+            repro = Updater.verify_publics_reproducible(tmp_path)
             sorted_matches = sorted(self._diff.matches,
                                     key=lambda m: m.orig.va, reverse=True)
-            for m in sorted_matches:
-                if m.va_delta == 0:
-                    continue
-                r = SymbolUpdater.patch_pdb_file(
+            results = []
+            remap_result = None
+            reindex_result = None
+
+            if pdb_fmt == 'pdb70':
+                if not self._recovered:
+                    raise RuntimeError(
+                        'Call recover_symbols() before export_pdb() for PDB 7.0')
+                if not patched_pe_path:
+                    raise RuntimeError(
+                        'patched_pe_path is required for PDB 7.0 export')
+                map_result = Updater.patch_section_map_for_pe(
+                    tmp_path, orig_pe_path, patched_pe_path)
+                results.append(map_result)
+                remap_result = Updater.remap_publics_by_address(
                     tmp_path,
-                    shift_rva=m.orig.va,
-                    delta=m.va_delta,
-                    pe_path=orig_pe_path,
-                    image_base=self._diff.orig_image_base
-                )
-                results.append({
-                    'section': m.orig.name,
-                    'orig_va': m.orig.va,
-                    'delta': m.va_delta,
-                    'patched': r.get('patched', 0),
-                    'total': r.get('total', 0),
-                    'errors': r.get('errors', []),
-                })
+                    self._recovered,
+                    patched_pe_path,
+                    image_base=self._diff.patched_image_base)
+                results.append(remap_result)
+                if remap_result.get('errors'):
+                    raise RuntimeError(
+                        'PDB 7.0 public remap failed: '
+                        + '; '.join(remap_result['errors']))
+                # Rebind per-module private procs/data (kd "private symbols").
+                module_result = Updater.remap_module_symbols(
+                    tmp_path,
+                    self._recovered,
+                    patched_pe_path,
+                    image_base=self._diff.patched_image_base)
+                results.append(module_result)
+                if module_result.get('errors'):
+                    raise RuntimeError(
+                        'PDB 7.0 module remap failed: '
+                        + '; '.join(module_result['errors']))
+            else:
+                # PDB 2.0: cumulative shifts per section (high VA first).
+                for m in sorted_matches:
+                    if m.va_delta == 0:
+                        continue
+                    r = Updater.patch_pdb_file(
+                        tmp_path,
+                        shift_rva=m.orig.va,
+                        delta=m.va_delta,
+                        pe_path=orig_pe_path,
+                        image_base=self._diff.orig_image_base
+                    )
+                    results.append({
+                        'section': m.orig.name,
+                        'orig_va': m.orig.va,
+                        'delta': m.va_delta,
+                        'patched': r.get('patched', 0),
+                        'total': r.get('total', 0),
+                        'errors': r.get('errors', []),
+                    })
 
             # Inject discovered symbols (new sections like .sec21).
             inject_result = None
@@ -491,7 +535,7 @@ class SymbolRecoveryEngine:
             # real, correctly-decorated symbol is already present.
             skipped_dupes = []
             if discovered:
-                existing_cores = SymbolUpdater.existing_public_cores(tmp_path)
+                existing_cores = Updater.existing_public_cores(tmp_path)
                 if existing_cores:
                     deduped = {}
                     for va, name in discovered.items():
@@ -501,34 +545,69 @@ class SymbolRecoveryEngine:
                             deduped[va] = name
                     discovered = deduped
             if discovered and patched_pe_path:
-                inject_result = SymbolUpdater.inject_symbols_pdb(
+                inject_result = Updater.inject_symbols_pdb(
                     tmp_path, discovered, pe_path=patched_pe_path,
                     image_base=self._diff.patched_image_base)
             if inject_result is not None:
                 inject_result['skipped_duplicates'] = skipped_dupes
 
-            # Re-index the publics hash so the injected symbols become
-            # enumerable in WinDbg (`x nt!*`) and resolvable by name.  Only
-            # run when injection added records *and* the reproduce gate
-            # proved our serializer matches this file exactly.
+            # Re-index the publics hash after symrec edits.
             reindex_result = None
-            if (inject_result and inject_result.get('injected') and
-                    repro.get('reproducible')):
-                reindex_result = SymbolUpdater.rebuild_publics_index(
+            needs_reindex = (
+                pdb_fmt == 'pdb70' and remap_result and
+                remap_result.get('remapped', 0) > 0)
+            if inject_result and inject_result.get('injected'):
+                needs_reindex = True
+            if needs_reindex and repro.get('reproducible'):
+                reindex_result = Updater.rebuild_publics_index(
                     tmp_path, variant=repro.get('variant'))
 
             # Re-stamp signature/age so the remapped PDB matches the image
             # being debugged (the patched binary).
             stamp_result = None
             cv = {}
+            src_dbg = os.path.splitext(orig_pdb_path)[0] + '.dbg'
+            has_separate_dbg = os.path.isfile(src_dbg)
             if patched_pe_path and os.path.isfile(patched_pe_path):
                 cv = SymbolUpdater.read_pe_codeview(patched_pe_path)
-                if cv.get('format') == 'NB10' and 'signature' in cv:
-                    stamp_result = SymbolUpdater.stamp_pdb_signature(
-                        tmp_path, cv['signature'], cv.get('age'))
+                stamp_sig = cv.get('signature')
+                # Patched HAL has no in-image CodeView; kd matches PE NB10
+                # signature against PDB stream-1 (see !sym noisy:
+                # "mismatched pdb").  Use the patched PE TimeDateStamp.
+                if stamp_sig is None and cv.get('timestamp') is not None and \
+                        (has_separate_dbg or pdb_fmt == 'pdb70'):
+                    stamp_sig = cv['timestamp']
+                if stamp_sig is not None:
+                    stamp_age = cv.get('age')
+                    if stamp_age is None and has_separate_dbg:
+                        # Stripped PEs have no in-image CodeView age; kd matches
+                        # the PDB info-stream age against the .dbg NB10 age.
+                        # sync_dbg_sections_from_pe leaves the NB10 age intact,
+                        # so adopt the source .dbg's age (NOT a hard-coded 1) or
+                        # the pdb/dbg age pair will disagree and kd rejects it.
+                        try:
+                            dbg_cv = SymbolUpdater.read_dbg_codeview(src_dbg)
+                            if dbg_cv.get('age') is not None:
+                                stamp_age = dbg_cv['age']
+                        except Exception:
+                            pass
+                    if stamp_age is None:
+                        stamp_age = 1
+                    if pdb_fmt == 'pdb70':
+                        stamp_result = SymbolUpdater70.stamp_pdb_info(
+                            tmp_path, stamp_sig, stamp_age)
+                    elif cv.get('format') == 'NB10' or \
+                            (pdb_fmt == 'pdb20' and has_separate_dbg):
+                        # Stripped drivers (e.g. scsiport) carry no in-PE
+                        # CodeView; their separate .dbg NB10 is stamped to the
+                        # patched PE timestamp by sync_dbg_sections_from_pe.
+                        # Align the PDB 2.0 info-stream signature to the same
+                        # value or kd rejects the PDB and shows export symbols.
+                        stamp_result = SymbolUpdater.stamp_pdb_signature(
+                            tmp_path, stamp_sig, stamp_age)
 
             # Validate the temp BEFORE it is allowed to replace anything.
-            validation = SymbolUpdater.validate_pdb(tmp_path)
+            validation = Updater.validate_pdb(tmp_path)
             if not validation.get('valid'):
                 raise RuntimeError(
                     "Refusing to write a structurally invalid PDB; the "
@@ -544,14 +623,48 @@ class SymbolRecoveryEngine:
             os.replace(tmp_path, output_path)
             tmp_path = None  # consumed by os.replace
 
-            # If a sibling .dbg lives next to the output, match its
-            # TimeDateStamp to the patched image too (stripped images are
-            # matched to their .dbg by timestamp only).
+            # HAL / stripped DLLs: separate .dbg (MISC debug) binds by timestamp.
+            # Copy the sibling .dbg from the source symbol tree, patch its
+            # section/symbol RVAs, then re-stamp header + NB10 to the patched PE.
+            dbg_export = None
             dbg_stamp = None
-            sibling_dbg = os.path.splitext(output_path)[0] + '.dbg'
-            if cv.get('timestamp') and os.path.isfile(sibling_dbg):
+            out_dbg = os.path.splitext(output_path)[0] + '.dbg'
+            hal_deploy = None
+            if os.path.isfile(src_dbg) and patched_pe_path and \
+                    os.path.isfile(patched_pe_path):
+                dbg_backup = None
+                if os.path.isfile(out_dbg) and \
+                        os.path.abspath(out_dbg) != os.path.abspath(src_dbg):
+                    dbg_backup = out_dbg + '.bak'
+                    shutil.copy2(out_dbg, dbg_backup)
+                shutil.copy2(src_dbg, out_dbg)
+                dbg_patch_results = []
+                for m in sorted_matches:
+                    if m.va_delta == 0:
+                        continue
+                    r = SymbolUpdater.patch_dbg_file(
+                        out_dbg,
+                        shift_rva=m.orig.va,
+                        delta=m.va_delta,
+                        image_base=self._diff.orig_image_base,
+                    )
+                    dbg_patch_results.append(r)
+                dbg_stamp = SymbolUpdater.sync_dbg_sections_from_pe(
+                    out_dbg, patched_pe_path)
+                deploy_dir = os.path.dirname(os.path.abspath(output_path))
+                hal_deploy = SymbolUpdater.deploy_hal_windbg_symbols(
+                    deploy_dir, patched_pe_path, out_dbg, output_path)
+                dbg_export = {
+                    'output_path': out_dbg,
+                    'backup': dbg_backup,
+                    'section_results': dbg_patch_results,
+                    'stamped': dbg_stamp,
+                    'hal_deploy': hal_deploy,
+                }
+            elif os.path.isfile(out_dbg) and cv.get('timestamp'):
+                # Legacy: sibling already present — timestamp-only stamp.
                 dbg_stamp = SymbolUpdater.stamp_dbg_timestamp(
-                    sibling_dbg, cv['timestamp'])
+                    out_dbg, cv['timestamp'])
         finally:
             if tmp_path and os.path.isfile(tmp_path):
                 try:
@@ -562,15 +675,20 @@ class SymbolRecoveryEngine:
         return {
             'output_path': output_path,
             'section_results': results,
-            'total_sections_shifted': sum(1 for r in results if r['patched'] > 0),
+            'total_sections_shifted': sum(
+                1 for r in results
+                if r.get('patched', 0) > 0 or r.get('remapped', 0) > 0),
             'injected': inject_result,
             'publics_reproducible': repro,
             'reindexed': reindex_result,
             'codeview': cv,
             'stamped': stamp_result,
             'dbg_stamped': dbg_stamp,
+            'dbg_export': dbg_export,
+            'hal_deploy': hal_deploy,
             'validation': validation,
             'backup': backup_path,
+            'pdb_format': pdb_fmt,
         }
 
     # ------------------------------------------------------------------
@@ -846,3 +964,165 @@ class SymbolRecoveryEngine:
 
         self._recovered.extend(unique)
         return unique
+
+
+def read_pdb_info(pdb_path: str) -> Dict[str, Any]:
+    """Read a PDB's info-stream identity (format, signature/guid, age).
+
+    Works for both PDB 2.0 (JG) and PDB 7.0 (DS).  Returns a dict with
+    keys: format ('pdb20'/'pdb70'/'unknown'), signature (int|None),
+    age (int|None), guid (bytes|None), error (str, optional).
+    """
+    import math
+    info: Dict[str, Any] = {'format': 'unknown', 'signature': None,
+                            'age': None, 'guid': None}
+    try:
+        with open(pdb_path, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        info['error'] = str(e)
+        return info
+
+    def _extract_stream1_pdb20(d):
+        page_size = struct.unpack_from('<I', d, 44)[0]
+        root_size = struct.unpack_from('<I', d, 52)[0]
+        if not page_size or page_size > 0x10000:
+            return None
+        nrp = math.ceil(root_size / page_size) if root_size else 0
+        rps = [struct.unpack_from('<H', d, 60 + i * 2)[0] for i in range(nrp)]
+        root = b''.join(d[p * page_size:p * page_size + page_size]
+                        for p in rps)[:root_size]
+        ns = struct.unpack_from('<H', root, 0)[0]
+        off = 4
+        sizes = [struct.unpack_from('<I', root, off + i * 8)[0]
+                 for i in range(ns)]
+        off = 4 + ns * 8
+        pages = []
+        for sz in sizes:
+            cnt = math.ceil(sz / page_size) if sz not in (0, 0xFFFFFFFF) else 0
+            pages.append([struct.unpack_from('<H', root, off + j * 2)[0]
+                          for j in range(cnt)])
+            off += cnt * 2
+        if len(pages) < 2 or not pages[1]:
+            return None
+        return b''.join(d[p * page_size:p * page_size + page_size]
+                        for p in pages[1])
+
+    try:
+        from nt_analyzer.pdb70.msf import detect_pdb_format
+        fmt = detect_pdb_format(pdb_path)
+    except Exception:
+        fmt = 'unknown'
+
+    if fmt == 'pdb70':
+        info['format'] = 'pdb70'
+        try:
+            from nt_analyzer.pdb70.updater import SymbolUpdater70
+            msf = SymbolUpdater70._load_msf(pdb_path)
+            s1 = msf['read_stream'](1)
+            if len(s1) >= 28:
+                info['signature'] = struct.unpack_from('<I', s1, 4)[0]
+                info['age'] = struct.unpack_from('<I', s1, 8)[0]
+                info['guid'] = bytes(s1[12:28])
+        except Exception as e:  # pragma: no cover - defensive
+            info['error'] = str(e)
+    elif fmt == 'pdb20':
+        info['format'] = 'pdb20'
+        s1 = _extract_stream1_pdb20(data)
+        if s1 and len(s1) >= 12:
+            info['signature'] = struct.unpack_from('<I', s1, 4)[0]
+            info['age'] = struct.unpack_from('<I', s1, 8)[0]
+    else:
+        info['error'] = 'Unrecognized PDB magic'
+    return info
+
+
+def verify_export_correspondence(patched_pe_path: str, out_pdb_path: str,
+                                 orig_pe_path: str = None,
+                                 orig_pdb_path: str = None) -> Dict[str, Any]:
+    """Verify an exported PDB will bind to the patched image in WinDbg/kd.
+
+    Replicates kd's matching rule: the image's CodeView record (taken from
+    the in-PE debug directory, or from the sibling .dbg for stripped PEs)
+    must agree with the PDB info stream on signature/guid AND age.  For
+    stripped images the .dbg header TimeDateStamp must equal the image
+    TimeDateStamp (that is how kd locates the .dbg in the first place).
+
+    Returns a dict:
+      {'ok': bool, 'checks': [(label, passed, detail), ...],
+       'format': str, 'errors': [...]}
+    """
+    from nt_analyzer.ubrt_engine import SymbolUpdater
+    res: Dict[str, Any] = {'ok': False, 'checks': [], 'errors': [],
+                           'format': 'unknown'}
+
+    def chk(label, passed, detail=''):
+        res['checks'].append((label, bool(passed), detail))
+
+    if not os.path.isfile(out_pdb_path):
+        res['errors'].append(f'Exported PDB not found: {out_pdb_path}')
+        return res
+    if not patched_pe_path or not os.path.isfile(patched_pe_path):
+        res['errors'].append('Patched PE not found')
+        return res
+
+    pdb_info = read_pdb_info(out_pdb_path)
+    res['format'] = pdb_info.get('format', 'unknown')
+    if pdb_info.get('error'):
+        res['errors'].append(f"PDB read: {pdb_info['error']}")
+
+    cv = SymbolUpdater.read_pe_codeview(patched_pe_path) or {}
+    pe_ts = cv.get('timestamp')
+    out_dbg = os.path.splitext(out_pdb_path)[0] + '.dbg'
+    has_out_dbg = os.path.isfile(out_dbg)
+    dbg_cv = SymbolUpdater.read_dbg_codeview(out_dbg) if has_out_dbg else {}
+
+    # Choose the CodeView record kd will actually use to match the PDB:
+    # in-PE record if present, else the sibling .dbg's NB10/RSDS.
+    if cv.get('format') in ('NB10', 'RSDS'):
+        match_src = 'in-PE CodeView'
+        match_cv = cv
+    elif dbg_cv.get('format') in ('NB10', 'RSDS'):
+        match_src = 'sibling .dbg'
+        match_cv = dbg_cv
+    else:
+        match_src = None
+        match_cv = {}
+
+    if match_src is None:
+        chk('image has a usable CodeView record', False,
+            'stripped PE with no sibling .dbg — kd will fall back to exports')
+        return res
+    chk('image CodeView source', True,
+        f"{match_src} ({match_cv.get('format')})")
+
+    # The IMAGE record's format dictates how kd matches, regardless of the
+    # PDB's own MSF version: an NB10 image is matched by the 32-bit info-stream
+    # signature (a PDB 7.0 file carries one too); an RSDS image by the GUID.
+    if match_cv.get('format') == 'RSDS':
+        mguid = match_cv.get('guid')
+        same = (mguid is not None and pdb_info.get('guid') == mguid)
+        chk('PDB GUID matches image (RSDS)', same,
+            f"pdb={(pdb_info.get('guid') or b'').hex()} "
+            f"img={(mguid or b'').hex()}")
+    else:  # NB10
+        msig = match_cv.get('signature')
+        sig_p = pdb_info.get('signature')
+        same = (msig is not None and sig_p == msig)
+        chk('PDB signature matches image (NB10)', same,
+            f"pdb=0x{(sig_p or 0):08X} img=0x{(msig or 0):08X}")
+
+    match_age = match_cv.get('age')
+    age_ok = (match_age is not None and pdb_info.get('age') == match_age)
+    chk('PDB age matches image', age_ok,
+        f"pdb={pdb_info.get('age')} img={match_age}")
+
+    # Stripped image: the .dbg is located purely by TimeDateStamp.
+    if cv.get('format') not in ('NB10', 'RSDS') and has_out_dbg:
+        dbg_ts = dbg_cv.get('timestamp')
+        ts_ok = (pe_ts is not None and dbg_ts == pe_ts)
+        chk('.dbg TimeDateStamp matches image', ts_ok,
+            f"dbg=0x{(dbg_ts or 0):08X} img=0x{(pe_ts or 0):08X}")
+
+    res['ok'] = all(p for _, p, _ in res['checks'])
+    return res

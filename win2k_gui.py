@@ -9944,6 +9944,10 @@ class SymbolRecoveryTab(ttk.Frame):
         ttk.Button(btn_frm, text="\U0001F4BE  Export PDB\u2026",
                    command=self._export_pdb).pack(side="left", padx=5)
         ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
+        ttk.Button(btn_frm, text="\U0001F4CB  Batch / Verify\u2026",
+                   style="Accent.TButton",
+                   command=self._open_batch).pack(side="left", padx=5)
+        ttk.Separator(btn_frm, orient="vertical").pack(side="left", padx=8, fill="y", pady=2)
         ttk.Button(btn_frm, text="\u270F  Edit Selected",
                    command=self._edit_selected).pack(side="left", padx=5)
         ttk.Button(btn_frm, text="\u2716  Clear",
@@ -10507,10 +10511,29 @@ class SymbolRecoveryTab(ttk.Frame):
             self.status_var.set(status_msg)
             output_write(self.output, f"\n  \u2714 PDB exported: {out_path}\n", "ok")
             for sr in result.get('section_results', []):
-                output_write(self.output,
-                    f"    Section {sr['section']}: {sr['patched']}/{sr['total']} "
-                    f"symbols shifted by {sr['delta']:+d}\n",
-                    "ok" if sr['patched'] > 0 else "dim")
+                if sr.get('modules') is not None:
+                    output_write(self.output,
+                        f"    Module symbols rebound: {sr.get('remapped', 0)} "
+                        f"across {sr.get('modules', 0)} modules "
+                        f"({sr.get('unmatched', 0)} kept)\n",
+                        "ok" if sr.get('remapped', 0) else "dim")
+                elif 'remapped' in sr and 'total' in sr:
+                    output_write(self.output,
+                        f"    Publics remapped: {sr['remapped']}/{sr['total']} "
+                        f"({sr.get('unmatched', 0)} unmatched, "
+                        f"{sr.get('export_anchors', 0)} export-anchored)\n",
+                        "ok" if sr.get('remapped', 0) else "dim")
+                elif sr.get('patched') and sr.get('frames'):
+                    changed = {k: v for k, v in sr['frames'].items() if k != v}
+                    if changed:
+                        output_write(self.output,
+                            f"    Section-map frames updated: {changed}\n", "ok")
+                elif 'section' in sr:
+                    output_write(self.output,
+                        f"    Section {sr['section']}: {sr.get('patched', 0)}/"
+                        f"{sr.get('total', 0)} symbols shifted by "
+                        f"{sr.get('delta', 0):+d}\n",
+                        "ok" if sr.get('patched', 0) else "dim")
                 for err in sr.get('errors', []):
                     output_write(self.output, f"      \u26A0 {err}\n", "warn")
             if inj:
@@ -10564,8 +10587,16 @@ class SymbolRecoveryTab(ttk.Frame):
                     "    \u26A0 Patched image uses RSDS (PDB 7.0) debug info; "
                     "this PDB 2.0 export cannot be signature-matched to it\n",
                     "warn")
-            dbg_stamp = result.get('dbg_stamped') or {}
-            if dbg_stamp.get('stamped'):
+            dbg_exp = result.get('dbg_export') or {}
+            dbg_stamp = dbg_exp.get('stamped') or result.get('dbg_stamped') or {}
+            if dbg_exp.get('output_path'):
+                ts = dbg_stamp.get('timestamp')
+                ts_s = f"0x{ts:08X}" if isinstance(ts, int) else "?"
+                output_write(self.output,
+                    f"    \u2714 DBG exported \u2192 {dbg_exp['output_path']}\n"
+                    f"      (TimeDateStamp {ts_s}; deploy .pdb + .dbg together)\n",
+                    "ok")
+            elif dbg_stamp.get('stamped'):
                 output_write(self.output,
                     "    Stamped sibling .dbg TimeDateStamp to match image\n",
                     "ok")
@@ -10579,6 +10610,27 @@ class SymbolRecoveryTab(ttk.Frame):
                     f"    Backup of previous file: {result['backup']}\n", "dim")
 
         run_with_progress(self, work, done)
+
+    # ── Batch / Verify ────────────────────────────────────────────────
+
+    def _open_batch(self):
+        """Open (or focus) the batch processing + verification window."""
+        win = getattr(self, '_batch_win', None)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
+        self._batch_win = SymRecovBatchWindow(self)
+
+    def load_entry_into_fields(self, orig, sym, patched):
+        """Push a batch entry's paths into the single-mode entry fields."""
+        self._orig_ent.set_value(orig or "")
+        self._sym_ent.set_value(sym or "")
+        self._patch_ent.set_value(patched or "")
+        self.status_var.set(
+            "\u2022 Loaded entry into single-mode fields \u2014 click "
+            "'Analyze Diff' to begin")
 
     # ── Clear ─────────────────────────────────────────────────────────
 
@@ -10620,6 +10672,598 @@ class SymbolRecoveryTab(ttk.Frame):
         for row in s.get("tree_data", []):
             self._tree.insert("", "end", values=row)
         self.output.set_state(s.get("output"))
+
+
+class SymRecovBatchWindow(tk.Toplevel):
+    """Batch driver for Symbol Recovery.
+
+    Manage a list of (name, original, patched, symbols, output) entries.
+    Process them one by one or all at once, and verify that each exported
+    PDB will bind to its patched image in WinDbg/kd (signature/guid + age,
+    and .dbg timestamp for stripped images).
+    """
+
+    COLS = ("name", "orig", "patched", "sym", "out", "status")
+
+    def __init__(self, tab):
+        super().__init__(tab)
+        self.tab = tab
+        self.title("SymRecov \u2014 Batch / Verify")
+        self.configure(bg=T["bg"])
+        self.geometry("1180x680")
+        self.minsize(900, 520)
+        self._entries = {}     # iid -> dict(name, orig, patched, sym, out)
+        self._running = False
+
+        # ── Top: default output folder ──
+        top = tk.Frame(self, bg=T["bg"])
+        top.pack(fill="x", padx=12, pady=(10, 4))
+        ttk.Label(top, text="Output folder:", width=14, anchor="e").pack(side="left")
+        self._outdir_var = tk.StringVar(
+            value=os.path.join(os.path.expanduser("~"), "Downloads",
+                               "Modified sym"))
+        oe = tk.Entry(top, textvariable=self._outdir_var, bg=T["entry_bg"],
+                      fg=T["fg"], insertbackground=T["fg"],
+                      font=("Consolas", 10), relief="flat", bd=5)
+        oe.pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(top, text="Browse \u2026",
+                   command=self._browse_outdir).pack(side="left")
+        ttk.Label(top, text="(per-entry output = this folder \\ <name>.pdb "
+                  "unless overridden)", foreground=T["fg_dim"]).pack(
+                      side="left", padx=8)
+
+        # ── Entry management buttons ──
+        bar1 = tk.Frame(self, bg=T["bg"])
+        bar1.pack(fill="x", padx=12, pady=(2, 2))
+        ttk.Button(bar1, text="\u2795 From current fields",
+                   command=self._add_from_fields).pack(side="left", padx=3)
+        ttk.Button(bar1, text="\u2795 Add entry\u2026",
+                   command=lambda: self._entry_dialog(None)).pack(side="left", padx=3)
+        ttk.Button(bar1, text="\u270F Edit\u2026",
+                   command=self._edit_selected).pack(side="left", padx=3)
+        ttk.Button(bar1, text="\u2716 Remove",
+                   command=self._remove_selected).pack(side="left", padx=3)
+        ttk.Button(bar1, text="\u2192 Load into single",
+                   command=self._send_to_single).pack(side="left", padx=3)
+        ttk.Separator(bar1, orient="vertical").pack(side="left", padx=8, fill="y")
+        ttk.Button(bar1, text="\U0001F50D Auto-discover\u2026",
+                   command=self._auto_discover).pack(side="left", padx=3)
+        ttk.Button(bar1, text="\U0001F5C1 Load list\u2026",
+                   command=self._load_list).pack(side="left", padx=3)
+        ttk.Button(bar1, text="\U0001F4BE Save list\u2026",
+                   command=self._save_list).pack(side="left", padx=3)
+        ttk.Button(bar1, text="\u2716 Clear list",
+                   command=self._clear_list).pack(side="left", padx=3)
+
+        # ── Treeview ──
+        mid = tk.Frame(self, bg=T["bg"])
+        mid.pack(fill="both", expand=True, padx=12, pady=4)
+        mid.rowconfigure(0, weight=1)
+        mid.columnconfigure(0, weight=1)
+        self._tree = ttk.Treeview(mid, columns=self.COLS, show="headings",
+                                  selectmode="extended")
+        heads = {"name": "Name", "orig": "Original Binary",
+                 "patched": "Patched Binary", "sym": "Symbols (.pdb)",
+                 "out": "Output (.pdb)", "status": "Status"}
+        widths = {"name": 120, "orig": 220, "patched": 220, "sym": 200,
+                  "out": 200, "status": 150}
+        for c in self.COLS:
+            self._tree.heading(c, text=heads[c])
+            self._tree.column(c, width=widths[c], minwidth=60,
+                              anchor="center" if c == "status" else "w")
+        self._tree.tag_configure("ok", foreground="#37d67a")
+        self._tree.tag_configure("fail", foreground="#ff5c5c")
+        self._tree.tag_configure("skip", foreground="#e0a030")
+        self._tree.tag_configure("run", foreground="#4aa3ff")
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=self._tree.yview)
+        hsb = ttk.Scrollbar(mid, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._tree.bind("<Double-1>", lambda e: self._edit_selected())
+
+        # ── Run controls ──
+        bar2 = tk.Frame(self, bg=T["bg"])
+        bar2.pack(fill="x", padx=12, pady=(2, 2))
+        self._verify_only = tk.BooleanVar(value=False)
+        self._check_orig = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar2, text="Verify only (don't re-export)",
+                        variable=self._verify_only).pack(side="left", padx=4)
+        ttk.Checkbutton(bar2, text="Also verify original \u2194 symbols",
+                        variable=self._check_orig).pack(side="left", padx=10)
+        self._run_btn = ttk.Button(bar2, text="\u25B6  Run All",
+                                    style="Accent.TButton",
+                                    command=self._run_all)
+        self._run_btn.pack(side="right", padx=4)
+        ttk.Button(bar2, text="\u25B6 Run selected",
+                   command=self._run_selected).pack(side="right", padx=4)
+        self._prog = ttk.Progressbar(bar2, mode="determinate", length=220)
+        self._prog.pack(side="right", padx=10)
+
+        # ── Log ──
+        self._log = scrolledtext.ScrolledText(
+            self, height=12, bg=T["entry_bg"], fg=T["fg"],
+            insertbackground=T["fg"], font=("Consolas", 9), relief="flat", bd=4,
+            wrap="word")
+        self._log.pack(fill="both", expand=False, padx=12, pady=(2, 4))
+        self._log.tag_config("ok", foreground="#37d67a")
+        self._log.tag_config("fail", foreground="#ff5c5c")
+        self._log.tag_config("warn", foreground="#e0a030")
+        self._log.tag_config("head", foreground="#4aa3ff")
+        self._log.tag_config("dim", foreground=T["fg_dim"])
+
+        self._status = tk.StringVar(value="\u2022 Add entries, then Run All")
+        sb = tk.Frame(self, bg=T["bg"])
+        sb.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(sb, textvariable=self._status,
+                  foreground=T["fg_dim"]).pack(side="left")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── logging helpers ──
+    def _logw(self, text, tag=None):
+        self._log.insert("end", text, tag or "")
+        self._log.see("end")
+
+    def _browse_outdir(self):
+        d = filedialog.askdirectory(parent=self, title="Output folder")
+        if d:
+            self._outdir_var.set(d)
+
+    # ── entry CRUD ──
+    def _default_out(self, name):
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name or "out")
+        if not safe.lower().endswith(".pdb"):
+            safe += ".pdb"
+        return os.path.join(self._outdir_var.get().strip(), safe)
+
+    def _insert_entry(self, e):
+        iid = self._tree.insert("", "end", values=(
+            e.get("name", ""), e.get("orig", ""), e.get("patched", ""),
+            e.get("sym", ""), e.get("out", ""), e.get("status", "")))
+        self._entries[iid] = e
+        return iid
+
+    def _stem(self, path):
+        return os.path.splitext(os.path.basename(path))[0] if path else ""
+
+    def _add_from_fields(self):
+        orig = self.tab._orig_ent.get_value()
+        sym = self.tab._sym_ent.get_value()
+        patched = self.tab._patch_ent.get_value()
+        if not (orig and patched and sym):
+            messagebox.showwarning("Missing fields",
+                "Fill Original, Patched and Symbols in the main tab first.",
+                parent=self)
+            return
+        name = self._stem(patched) or self._stem(sym)
+        self._insert_entry({"name": name, "orig": orig, "patched": patched,
+                            "sym": sym, "out": self._default_out(name),
+                            "status": ""})
+        self._status.set(f"\u2022 {len(self._entries)} entr"
+                         f"{'y' if len(self._entries)==1 else 'ies'}")
+
+    def _entry_dialog(self, iid):
+        e = self._entries.get(iid, {}) if iid else {}
+        dlg = tk.Toplevel(self)
+        dlg.title("Edit entry" if iid else "Add entry")
+        dlg.configure(bg=T["bg"])
+        dlg.geometry("760x280")
+        dlg.transient(self)
+        dlg.grab_set()
+        vars_ = {}
+        rows = [("name", "Name"), ("orig", "Original Binary"),
+                ("patched", "Patched Binary"), ("sym", "Symbols (.pdb)"),
+                ("out", "Output (.pdb)")]
+        frm = tk.Frame(dlg, bg=T["bg"])
+        frm.pack(fill="both", expand=True, padx=12, pady=10)
+        frm.columnconfigure(1, weight=1)
+
+        def picker(var, kind):
+            if kind == "name":
+                return
+            if kind == "out":
+                p = filedialog.asksaveasfilename(
+                    parent=dlg, defaultextension=".pdb",
+                    filetypes=[("PDB", "*.pdb"), ("All", "*.*")])
+            elif kind == "sym":
+                p = filedialog.askopenfilename(
+                    parent=dlg, filetypes=[("PDB", "*.pdb"), ("All", "*.*")])
+            else:
+                p = filedialog.askopenfilename(
+                    parent=dlg, filetypes=[
+                        ("PE", "*.dll;*.sys;*.exe;*.drv"), ("All", "*.*")])
+            if p:
+                var.set(p)
+
+        for r, (key, label) in enumerate(rows):
+            ttk.Label(frm, text=label + ":", width=16, anchor="e").grid(
+                row=r, column=0, padx=(0, 8), pady=3, sticky="e")
+            v = tk.StringVar(value=e.get(key, ""))
+            vars_[key] = v
+            tk.Entry(frm, textvariable=v, bg=T["entry_bg"], fg=T["fg"],
+                     insertbackground=T["fg"], font=("Consolas", 10),
+                     relief="flat", bd=5).grid(row=r, column=1, sticky="ew",
+                                               pady=3)
+            if key != "name":
+                ttk.Button(frm, text="\u2026",
+                           command=lambda vv=v, kk=key: picker(vv, kk)).grid(
+                               row=r, column=2, padx=(6, 0))
+
+        def autoname(*_):
+            if not vars_["name"].get().strip():
+                vars_["name"].set(self._stem(vars_["patched"].get()))
+        vars_["patched"].trace_add("write", autoname)
+
+        def save():
+            ne = {k: vars_[k].get().strip() for k in vars_}
+            if not ne["name"]:
+                ne["name"] = self._stem(ne["patched"]) or self._stem(ne["sym"])
+            if not ne["out"]:
+                ne["out"] = self._default_out(ne["name"])
+            ne["status"] = ""
+            if iid:
+                self._entries[iid] = ne
+                self._tree.item(iid, values=(
+                    ne["name"], ne["orig"], ne["patched"], ne["sym"],
+                    ne["out"], ne["status"]), tags=())
+            else:
+                self._insert_entry(ne)
+            self._status.set(f"\u2022 {len(self._entries)} entries")
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg=T["bg"])
+        btns.pack(fill="x", padx=12, pady=(0, 10))
+        ttk.Button(btns, text="Save", style="Accent.TButton",
+                   command=save).pack(side="right", padx=4)
+        ttk.Button(btns, text="Cancel",
+                   command=dlg.destroy).pack(side="right", padx=4)
+
+    def _edit_selected(self):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        self._entry_dialog(sel[0])
+
+    def _remove_selected(self):
+        for iid in self._tree.selection():
+            self._tree.delete(iid)
+            self._entries.pop(iid, None)
+        self._status.set(f"\u2022 {len(self._entries)} entries")
+
+    def _clear_list(self):
+        self._tree.delete(*self._tree.get_children())
+        self._entries.clear()
+        self._status.set("\u2022 list cleared")
+
+    def _send_to_single(self):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        e = self._entries[sel[0]]
+        self.tab.load_entry_into_fields(e.get("orig"), e.get("sym"),
+                                        e.get("patched"))
+        self.tab.app.nb.select(self.tab)
+
+    # ── list persistence ──
+    def _save_list(self):
+        if not self._entries:
+            messagebox.showinfo("Empty", "Nothing to save.", parent=self)
+            return
+        p = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not p:
+            return
+        data = {"output_dir": self._outdir_var.get(),
+                "entries": [
+                    {k: e.get(k, "") for k in
+                     ("name", "orig", "patched", "sym", "out")}
+                    for e in self._entries.values()]}
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self._status.set(f"\u2022 saved {len(data['entries'])} entries")
+        except OSError as e:
+            messagebox.showerror("Save failed", str(e), parent=self)
+
+    def _load_list(self):
+        p = filedialog.askopenfilename(
+            parent=self, filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not p:
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Load failed", str(e), parent=self)
+            return
+        if data.get("output_dir"):
+            self._outdir_var.set(data["output_dir"])
+        for e in data.get("entries", []):
+            e = dict(e)
+            e.setdefault("status", "")
+            if not e.get("out"):
+                e["out"] = self._default_out(e.get("name", ""))
+            self._insert_entry(e)
+        self._status.set(f"\u2022 {len(self._entries)} entries loaded")
+
+    # ── auto-discovery ──
+    def _auto_discover(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Auto-discover symbol pairs")
+        dlg.configure(bg=T["bg"])
+        dlg.geometry("760x260")
+        dlg.transient(self)
+        dlg.grab_set()
+        frm = tk.Frame(dlg, bg=T["bg"])
+        frm.pack(fill="both", expand=True, padx=12, pady=10)
+        frm.columnconfigure(1, weight=1)
+        fields = [
+            ("patched", "Patched folder", "Folder of patched PE files (16e set)"),
+            ("orig", "Originals folder", "Folder/tree of vanilla PE files"),
+            ("sym", "Symbols root", "Folder/tree containing MS .pdb files"),
+        ]
+        vars_ = {}
+        for r, (key, label, hint) in enumerate(fields):
+            ttk.Label(frm, text=label + ":", width=16, anchor="e").grid(
+                row=r, column=0, padx=(0, 8), pady=4, sticky="e")
+            v = tk.StringVar()
+            vars_[key] = v
+            tk.Entry(frm, textvariable=v, bg=T["entry_bg"], fg=T["fg"],
+                     insertbackground=T["fg"], font=("Consolas", 10),
+                     relief="flat", bd=5).grid(row=r, column=1, sticky="ew",
+                                               pady=4)
+            ttk.Button(frm, text="\u2026",
+                       command=lambda vv=v: vv.set(
+                           filedialog.askdirectory(parent=dlg) or vv.get())
+                       ).grid(row=r, column=2, padx=(6, 0))
+            ttk.Label(frm, text=hint, foreground=T["fg_dim"]).grid(
+                row=r, column=1, sticky="w", pady=(26, 0))
+
+        def go():
+            pat = vars_["patched"].get().strip()
+            org = vars_["orig"].get().strip()
+            sym = vars_["sym"].get().strip()
+            if not (pat and os.path.isdir(pat)):
+                messagebox.showwarning("Need patched folder",
+                                       "Select a valid patched folder.",
+                                       parent=dlg)
+                return
+            n = self._do_discover(pat, org, sym)
+            dlg.destroy()
+            self._status.set(f"\u2022 discovered {n} entries")
+
+        btns = tk.Frame(dlg, bg=T["bg"])
+        btns.pack(fill="x", padx=12, pady=(0, 10))
+        ttk.Button(btns, text="Discover", style="Accent.TButton",
+                   command=go).pack(side="right", padx=4)
+        ttk.Button(btns, text="Cancel",
+                   command=dlg.destroy).pack(side="right", padx=4)
+
+    # HAL ships under several variant names; map a patched stem to candidates.
+    _SYM_ALIASES = {"hal": ["halmacpi", "halaacpi", "halacpi", "halapic",
+                            "halmps", "hal"]}
+    _PE_EXT = (".dll", ".sys", ".exe", ".drv", ".cpl", ".ocx", ".sys")
+
+    def _find_in_tree(self, root, stems, exts):
+        """Find the first file under root whose stem matches and ext allowed."""
+        if not root or not os.path.isdir(root):
+            return None
+        stems = [s.lower() for s in stems]
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                base, ext = os.path.splitext(f)
+                if ext.lower() in exts and base.lower() in stems:
+                    return os.path.join(dirpath, f)
+        return None
+
+    def _do_discover(self, pat_dir, orig_root, sym_root):
+        added = 0
+        for f in sorted(os.listdir(pat_dir)):
+            patched = os.path.join(pat_dir, f)
+            base, ext = os.path.splitext(f)
+            if not os.path.isfile(patched) or ext.lower() not in self._PE_EXT:
+                continue
+            stem = base.lower()
+            stems = [stem] + self._SYM_ALIASES.get(stem, [])
+            orig = self._find_in_tree(orig_root, stems, self._PE_EXT)
+            sym = self._find_in_tree(sym_root, stems, (".pdb",))
+            if not (orig and sym):
+                # record an incomplete entry so the user sees what's missing
+                self._insert_entry({
+                    "name": stem, "orig": orig or "", "patched": patched,
+                    "sym": sym or "",
+                    "out": self._default_out(stem),
+                    "status": "MISSING " + (
+                        "orig" if not orig else "") + (
+                        " sym" if not sym else "")})
+                continue
+            self._insert_entry({"name": stem, "orig": orig, "patched": patched,
+                                "sym": sym, "out": self._default_out(stem),
+                                "status": ""})
+            added += 1
+        return added
+
+    # ── run / verify ──
+    def _set_status(self, iid, text, tag):
+        vals = list(self._tree.item(iid, "values"))
+        vals[5] = text
+        self._tree.item(iid, values=vals, tags=(tag,))
+        self._entries[iid]["status"] = text
+
+    def _run_selected(self):
+        self._run(list(self._tree.selection()))
+
+    def _run_all(self):
+        self._run(list(self._tree.get_children()))
+
+    def _run(self, iids):
+        if self._running:
+            return
+        iids = [i for i in iids if i in self._entries]
+        if not iids:
+            messagebox.showinfo("Nothing to run",
+                                "Add or select entries first.", parent=self)
+            return
+        self._running = True
+        self._run_btn.config(state="disabled")
+        verify_only = self._verify_only.get()
+        check_orig = self._check_orig.get()
+        self._prog.config(maximum=len(iids), value=0)
+        self._logw(f"\n=== Batch run: {len(iids)} entr"
+                   f"{'y' if len(iids)==1 else 'ies'} "
+                   f"({'verify-only' if verify_only else 'export+verify'}) "
+                   f"===\n", "head")
+        for i in iids:
+            self._set_status(i, "queued", "run")
+
+        def worker():
+            n_ok = n_fail = 0
+            for idx, iid in enumerate(iids):
+                e = dict(self._entries[iid])
+                self.after(0, self._set_status, iid, "running\u2026", "run")
+                result = self._process_entry(e, verify_only, check_orig)
+                if result["ok"]:
+                    n_ok += 1
+                else:
+                    n_fail += 1
+                self.after(0, self._apply_result, iid, result, idx + 1)
+            self.after(0, self._run_done, n_ok, n_fail)
+
+        run_async(worker)
+
+    def _apply_result(self, iid, result, done_count):
+        self._set_status(iid, result["status"],
+                         "ok" if result["ok"] else
+                         ("skip" if result.get("skip") else "fail"))
+        self._prog.config(value=done_count)
+        e = self._entries[iid]
+        self._logw(f"\n\u2022 {e.get('name','?')}  "
+                   f"[{os.path.basename(e.get('patched',''))}]\n", "head")
+        for line, tag in result["detail"]:
+            self._logw("    " + line + "\n", tag)
+
+    def _run_done(self, n_ok, n_fail):
+        self._running = False
+        self._run_btn.config(state="normal")
+        self._logw(f"\n=== Done: {n_ok} ok, {n_fail} failed ===\n",
+                   "ok" if not n_fail else "warn")
+        self._status.set(f"\u2022 finished: {n_ok} ok, {n_fail} failed")
+
+    def _process_entry(self, e, verify_only, check_orig):
+        """Run export (optional) + verification for one entry (worker thread)."""
+        from nt_analyzer.symbol_recovery import (
+            SymbolRecoveryEngine, verify_export_correspondence, read_pdb_info)
+        from nt_analyzer.ubrt_engine import SymbolUpdater
+        detail = []
+        orig = e.get("orig", "")
+        patched = e.get("patched", "")
+        sym = e.get("sym", "")
+        out = e.get("out", "")
+
+        for label, p in (("original", orig), ("patched", patched),
+                         ("symbols", sym)):
+            if not p or not os.path.isfile(p):
+                detail.append((f"missing {label}: {p or '(empty)'}", "fail"))
+                return {"ok": False, "skip": True,
+                        "status": f"MISSING {label}", "detail": detail}
+
+        # Optional: confirm the source symbols actually belong to the original.
+        if check_orig:
+            try:
+                src_info = read_pdb_info(sym)
+                ocv = SymbolUpdater.read_pe_codeview(orig) or {}
+                if ocv.get("format") not in ("NB10", "RSDS"):
+                    odbg = os.path.splitext(sym)[0] + ".dbg"
+                    if os.path.isfile(odbg):
+                        ocv = SymbolUpdater.read_dbg_codeview(odbg) or ocv
+                if ocv.get("format") == "RSDS":
+                    same = (ocv.get("guid") is not None and
+                            src_info.get("guid") == ocv.get("guid"))
+                else:  # NB10 image -> match the 32-bit info-stream signature
+                    same = (ocv.get("signature") is not None and
+                            src_info.get("signature") == ocv.get("signature"))
+                age_ok = (ocv.get("age") is None or
+                          src_info.get("age") == ocv.get("age"))
+                if ocv.get("format") is None:
+                    detail.append(("orig\u2194sym: original has no CodeView "
+                                   "to compare (ok for many vanilla builds)",
+                                   "dim"))
+                elif same and age_ok:
+                    detail.append(("orig\u2194sym: symbols match the original "
+                                   "binary", "ok"))
+                else:
+                    detail.append(("orig\u2194sym: MISMATCH \u2014 these "
+                                   "symbols were built for a different build "
+                                   "of the original", "warn"))
+            except Exception as ex:
+                detail.append((f"orig\u2194sym check error: {ex}", "warn"))
+
+        # Export (unless verify-only)
+        if not verify_only:
+            try:
+                eng = SymbolRecoveryEngine()
+                diff = eng.diff_binaries(orig, patched)
+                ncount, meta = eng.load_symbols(sym, pe_path=orig)
+                eng.recover_symbols(orig_pe_path=orig)
+                if diff and diff.new_sections:
+                    try:
+                        eng.discover_new_section_symbols(
+                            patched, orig_pe_path=orig)
+                    except Exception:
+                        pass
+                outdir = os.path.dirname(os.path.abspath(out))
+                if outdir:
+                    os.makedirs(outdir, exist_ok=True)
+                eng.export_pdb(sym, out, orig_pe_path=orig,
+                               patched_pe_path=patched)
+                st = eng.get_stats()
+                rate = st.get("success_rate", 0) * 100
+                detail.append((f"export: {meta.get('format','?')} \u2014 "
+                               f"recovered {st.get('ok',0)+st.get('discovered',0)}"
+                               f"/{st.get('total',0)} ({rate:.1f}%), "
+                               f"{diff and len(diff.new_sections) or 0} new "
+                               f"section(s)", "ok"))
+            except PermissionError:
+                detail.append((f"export FAILED: {out} is locked (close "
+                               f"WinDbg/kd and retry)", "fail"))
+                return {"ok": False, "status": "LOCKED", "detail": detail}
+            except Exception as ex:
+                detail.append((f"export FAILED: {ex}", "fail"))
+                return {"ok": False, "status": "EXPORT ERROR", "detail": detail}
+
+        # Verify the (now-written) output binds to the patched image.
+        if not os.path.isfile(out):
+            detail.append((f"verify: output not found: {out}", "fail"))
+            return {"ok": False, "status": "NO OUTPUT", "detail": detail}
+        try:
+            v = verify_export_correspondence(patched, out, orig_pe_path=orig)
+        except Exception as ex:
+            detail.append((f"verify error: {ex}", "fail"))
+            return {"ok": False, "status": "VERIFY ERROR", "detail": detail}
+        for label, passed, det in v["checks"]:
+            detail.append(((("\u2714 " if passed else "\u2717 ") + label +
+                            (f"  ({det})" if det else "")),
+                           "ok" if passed else "fail"))
+        for err in v.get("errors", []):
+            detail.append((f"\u26A0 {err}", "warn"))
+        ok = v["ok"]
+        return {"ok": ok,
+                "status": ("VERIFIED" if ok else "FAILED") +
+                          f" ({v.get('format','?')})",
+                "detail": detail}
+
+    def _on_close(self):
+        if self._running:
+            if not messagebox.askyesno(
+                    "Run in progress",
+                    "A batch run is still in progress. Close anyway?",
+                    parent=self):
+                return
+        self.tab._batch_win = None
+        self.destroy()
 
 
 if __name__ == '__main__':

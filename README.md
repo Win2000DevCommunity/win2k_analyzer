@@ -2,9 +2,18 @@
 
 **The ultimate reverse-engineering and binary compatibility toolkit for porting ReactOS components to Windows 2000 SP4.**
 
-Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (18 tabs)** and a **full CLI (27 commands)**.
+Analyze, compare, decompile, emulate, debug, patch, rewrite, and build NT kernel-mode and user-mode binaries — all from a single tool with both a **dark-themed GUI (18 tabs)** and a **full CLI (28 commands)**.
 
-**NEW in v3.9 — Project Save/Load System (.am files):**
+**NEW in v4.0 — PDB 7.0 Symbol Recovery, Stripped-Driver Binding & Batch Verify:**
+- **PDB 7.0 (MSF 7.00 / DS) SymRecov:** Full support for modern PDBs such as `halmacpi.pdb`. The engine patches the DBI section-map frames to match the patched PE layout, remaps public symbols by recovered VA, and rebinds module-stream private symbols (`S_GPROC32`, `S_LDATA32`, …) so WinDbg/kd resolves `(pdb symbols)` instead of stale export-only names.
+- **PDB 2.0 stripped drivers fixed:** Drivers like `scsiport.sys` and `acpi.sys` that ship without in-image CodeView now export a sibling `.dbg` whose NB10 signature **and age** match the patched PDB info stream — kd no longer falls back to `(export symbols)`.
+- **Export-table anchoring:** Public and private symbol records are anchored to the patched PE export table where available, so key HAL entry points (`HalInitSystem`, etc.) resolve to the correct address even when the MS PDB was built for a different binary revision.
+- **Batch / Verify GUI:** Tab 18 gains a **📋 Batch / Verify…** window — manage a list of `(original, patched, symbols, output)` entries, auto-discover triples from folder trees, save/load JSON job lists, run all entries, and verify each export against kd's binding rules (NB10 signature + age, RSDS GUID + age, `.dbg` TimeDateStamp for stripped images).
+- **CLI `symrecov` command:** One-shot diff + recovery + optional PDB export from the terminal.
+- **Batch script:** `scripts/batch_16e_symrecov.py` automates symbol recovery across a patched hotfix folder (e.g. KB979683 v16e) against vanilla rollup binaries and MS symbols.
+- **Verified modules:** `halmacpi.pdb` (PDB 7.0), `ntkrnlmp.pdb` (PDB 2.0 kernel), `scsiport.pdb`, `acpi.pdb` (1418/1418 symbols, 100% recovery).
+
+**Previously in v3.9 — Project Save/Load System (.am files):**
 - **Custom `.am` project format:** Save and restore the complete state of all 18 GUI tabs — every file path, every option, every output pane — in a single JSON-based `.am` file. Open a project tomorrow and pick up exactly where you left off.
 - **Auto-save:** Toggle auto-save from the File menu — your project is silently saved every 2 minutes while you work. Never lose progress.
 - **Save-on-quit prompt:** Closing the app with unsaved changes triggers a Save/Discard/Cancel dialog.
@@ -93,7 +102,8 @@ Works on **ALL PE file types**: `.dll`, `.sys`, `.exe`, `.cpl`, `.drv`, `.ocx`, 
 - [Opening the GUI](#opening-the-gui)
 - [Tabbed Output System](#tabbed-output-system)
 - [Using the CLI](#using-the-cli)
-- [CLI Command Reference (All 27 Commands)](#cli-command-reference-all-27-commands)
+- [CLI Command Reference (All 28 Commands)](#cli-command-reference-all-28-commands)
+- [What's New in v4.0 — PDB 7.0 Symbol Recovery & Batch Verify](#whats-new-in-v40--pdb-70-symbol-recovery-stripped-driver-binding--batch-verify)
 - [Patching NT System Internals (.sys / Kernel-Mode Binaries)](#patching-nt-system-internals-sys--kernel-mode-binaries)
 - [Kernel Debugger — Live Kernel State](#kernel-debugger--live-kernel-state)
 - [UBRT Engine — Universal Binary Rewriting](#ubrt-engine--universal-binary-rewriting)
@@ -126,6 +136,73 @@ This tool gives you everything in one place:
 7. **Inspect** — Deep PE table inspection: exports, imports, relocations, sections — with hex dump
 8. **Scan** — System-wide cross-reference scanning: find every PE in a directory that imports or calls a given function
 9. **Build** — Generate build scripts (RosBE, MSVC, CMake) for compiling ReactOS DLLs for Win2000
+
+---
+
+## What's New in v4.0 — PDB 7.0 Symbol Recovery, Stripped-Driver Binding & Batch Verify
+
+When you patch Win2000 system binaries (hotfixes, ReactOS backports, KernelEx-style section injections), the original Microsoft debug symbols no longer match the new layout. v4.0 extends Symbol Recovery to handle **both PDB formats** and **stripped kernel drivers**, with automated verification that mirrors WinDbg/kd binding rules.
+
+### PDB 7.0 path (e.g. `halmacpi.pdb`)
+
+Modern HAL symbols use MSF 7.00 / DS format. Simple RVA-threshold patching is not enough when a new section (like `.xcode`) is inserted mid-image. v4.0:
+
+1. **Patches DBI section-map frames** so logical segments map to the patched PE's section indices
+2. **Remaps public symbols** by recovered VA → `(segment, offset)` using WinDbg's frame resolution model
+3. **Rebinds module-stream private symbols** (`S_GPROC32`, `S_LDATA32`, …) — kd prefers these over publics for `(private symbols & lines)`
+4. **Anchors to the export table** where available so entry points like `HalInitSystem` resolve correctly
+
+### PDB 2.0 stripped drivers (e.g. `scsiport.sys`, `acpi.sys`)
+
+Many `.sys` drivers ship **stripped** (no in-PE CodeView). kd locates a sibling `.dbg` by TimeDateStamp, then matches the `.dbg`'s NB10 record to the `.pdb` info stream. v4.0 exports both files with:
+
+- PDB info-stream **signature** = patched PE TimeDateStamp
+- PDB info-stream **age** = source `.dbg` NB10 age (not hard-coded to 1)
+- `.dbg` header TimeDateStamp and NB10 signature synced to the patched PE
+
+### Batch / Verify GUI
+
+Open **SymRecov → 📋 Batch / Verify…** to:
+
+| Feature | Description |
+|---------|-------------|
+| Entry list | Name, original PE, patched PE, symbols, output path per module |
+| Auto-discover | Scan a patched folder + originals tree + symbols root |
+| Save / Load | Persist job lists as JSON |
+| Run All | Background export + verify with per-row status |
+| Verify only | Check existing exports without re-running recovery |
+| Load into single | Push a list entry back to the main tab |
+
+### CLI & batch script
+
+```bash
+# One-shot diff + recovery + PDB export
+python win2k_analyzer.py symrecov \
+  --orig C:\win2k\drivers\acpi.sys \
+  --patched C:\hotfix\acpi.sys \
+  --symbols C:\symbols\sys\acpi.pdb \
+  -o C:\out\acpi.pdb
+
+# Batch all modules in a hotfix folder (requires matching originals + MS symbols)
+python scripts/batch_16e_symrecov.py
+```
+
+### Python verification API
+
+```python
+from nt_analyzer.symbol_recovery import (
+    SymbolRecoveryEngine, verify_export_correspondence, read_pdb_info)
+
+engine = SymbolRecoveryEngine()
+engine.diff_binaries(orig_pe, patched_pe)
+engine.load_symbols("acpi.pdb", pe_path=orig_pe)
+engine.recover_symbols(orig_pe_path=orig_pe)
+engine.export_pdb("acpi.pdb", "acpi_out.pdb",
+                  orig_pe_path=orig_pe, patched_pe_path=patched_pe)
+
+result = verify_export_correspondence(patched_pe, "acpi_out.pdb")
+print(result["ok"], result["checks"])  # True if kd will bind the PDB
+```
 
 ---
 
@@ -996,7 +1073,7 @@ This tool is fully compatible with **GitHub Copilot** in VS Code:
 
 ---
 
-## CLI Command Reference (All 27 Commands)
+## CLI Command Reference (All 28 Commands)
 
 ### PE Analysis
 
@@ -1264,6 +1341,26 @@ Changes the PE ImageBase and walks all relocation entries to fix up absolute add
 python win2k_analyzer.py hex-dump <pe_path> 0x1000 -l 0x100
 ```
 Dumps hex + ASCII at any RVA in a PE file. Useful for verifying patches.
+
+#### `symrecov` — Symbol Recovery for Patched Binaries
+```bash
+# Diff only (no symbols)
+python win2k_analyzer.py symrecov --orig ntkrnlpa.exe --patched ntkrnlpa_patched.exe
+
+# Full recovery + PDB export (PDB 2.0 or 7.0)
+python win2k_analyzer.py symrecov \
+  --orig C:\win2k\halmacpi.dll \
+  --patched C:\hotfix\hal.dll \
+  --symbols C:\symbols\dll\halmacpi.pdb \
+  -o C:\out\halmacpi.pdb
+
+# Also write a recovered .map file
+python win2k_analyzer.py symrecov \
+  --orig acpi.sys --patched acpi_patched.sys \
+  --symbols acpi.pdb -o acpi_out.pdb --map acpi_out.map
+```
+
+Diffs PE section layouts, remaps symbols to the patched address space, optionally discovers symbols in new sections, and exports a patched PDB (+ sibling `.dbg` for stripped drivers). Close WinDbg/kd before exporting — locked PDB files will fail with a permission error.
 
 ---
 
@@ -1742,30 +1839,46 @@ Universal Binary Rewriting Tool — treat any binary like a text file. Insert, d
 - **Progress dialogs** — all long-running operations show real-time progress with percentage and cancel button
 - **Tabbed output** — each analysis opens in a new closeable tab
 
-### Tab 18: 🔄 Symbol Recovery (NEW)
-Recover symbols for patched binaries that lost their debug info — the inverse of UBRT's symbol patching:
+### Tab 18: 🔄 Symbol Recovery
+Recover symbols for patched binaries that lost their debug info — the inverse of UBRT's symbol patching. Supports **PDB 2.0 (JG/MSF)** and **PDB 7.0 (DS/MSF)**.
 
 - **File pickers** — Original Binary + Symbols (.pdb/.dbg/.map/.sym) + Patched Binary
 - **Analyze Diff** — compares PE section tables, matches sections by name+order (handles duplicate names like PAGE, PAGEVRFY, PAGEKD, PAGELK), computes per-section VA deltas, detects new/removed sections, and reports all PE header changes (ImageBase, EntryPoint, SizeOfImage, file size, section count)
-- **Recover Symbols** — remaps every symbol from original to patched address space using section-level VA deltas. Each symbol gets: original VA, recovered VA, delta, owning section, confidence percentage, and status (ok/unmapped/section_removed/outside)
+- **Recover Symbols** — remaps every symbol from original to patched address space using section-level VA deltas. Each symbol gets: original VA, recovered VA, delta, owning section, confidence percentage, and status (ok/unmapped/section_removed/outside/discovered)
 - **Sortable Treeview** — click any column header to sort by name, address, delta, section, confidence, or status
 - **Filter bar** — live text filter by symbol name + dropdown filter by status
 - **Edit symbols** — double-click any symbol to manually set its recovered VA, or select multiple symbols and apply a bulk offset
 - **Export .map** — save recovered symbols as a Microsoft-format symbol map file
-- **Export PDB** — create a patched copy of the original PDB with per-section address shifts applied (processes sections from highest VA to lowest to avoid double-shifting)
-- **Change log** — detailed output showing section mapping table, per-section symbol counts, recovery statistics, and confidence breakdown
+- **Export PDB** — create a patched copy of the original PDB:
+  - **PDB 2.0:** per-section VA shifts, info-stream signature/age stamping, sibling `.dbg` export with section RVAs patched and TimeDateStamp synced to the patched PE
+  - **PDB 7.0:** section-map frame patching, public-symbol remapping by recovered VA, module-stream private symbol rebinding, export-table anchoring
+- **📋 Batch / Verify…** — separate window for list-based processing:
+  - Add entries from the current fields, edit individually, or **Auto-discover** from patched + originals + symbols folder trees
+  - **Save / Load** job lists as JSON
+  - **Run All / Run selected** — export + verify each module in the background
+  - **Verify only** mode checks already-exported PDBs against kd binding rules without re-exporting
+  - Per-row status: `VERIFIED`, `FAILED`, `MISSING orig/sym`, `LOCKED` (close WinDbg first)
+  - **→ Load into single** pushes a list entry back into the main tab fields
+- **Change log** — detailed output showing section mapping, PDB 7.0 remapping stats (publics remapped, module symbols rebound, section-map frames updated), signature stamping, `.dbg` export, and PDB validation
 
-**Backend:** `nt_analyzer/symbol_recovery.py` — `SymbolRecoveryEngine` with `diff_binaries()`, `recover_symbols()`, `export_map_file()`, `export_pdb()`, `get_stats()`
+**Backend:**
+- `nt_analyzer/symbol_recovery.py` — `SymbolRecoveryEngine`, `read_pdb_info()`, `verify_export_correspondence()`
+- `nt_analyzer/pdb70/` — MSF 7.00 parser, DBI section-map loader, PDB 7.0 updater (publics + module streams)
+- `scripts/batch_16e_symrecov.py` — batch driver for hotfix folder symbol recovery
 
-**Real-world test result:**
+**Real-world test results:**
 ```
-Original: ntkrnlpa.exe (21 sections, 1,713,280 bytes)
-Patched:  ntkrnlpa.exe (22 sections, 1,783,104 bytes, +69,824 bytes, new .sec21)
-Symbols:  ntkrnlpa.pdb (PDB 2.0, 7,687 symbols)
+Kernel (PDB 2.0):
+  Original: ntkrnlpa.exe (21 sections)  Patched: ntkrnlpa.exe (22 sections, +.sec21)
+  Symbols:  ntkrnlpa.pdb (7,687 symbols)  Recovery: 7,686/7,687 (99.99%)
 
-Recovery: 7,686/7,687 symbols recovered (99.99%)
-High confidence: 7,553 symbols (98.3%)
-Per-section VA deltas: .text +0, POOLCODE +192, PAGE +256, PAGEVRFY +1024, INIT +1088, .rsrc +66560
+HAL (PDB 7.0):
+  Original: halmacpi.dll  Patched: hal.dll (16e, new .xcode section)
+  Symbols:  halmacpi.pdb  → kd: hal (private pdb symbols), HalInitSystem resolves correctly
+
+Stripped drivers (PDB 2.0 + separate .dbg):
+  acpi.sys:    1418/1418 (100%)  pdb/dbg sig=0x5FD4AF31 age=2  → VERIFIED
+  scsiport.sys: pdb/dbg sig matches patched PE timestamp  → VERIFIED
 ```
 
 ---
@@ -2234,12 +2347,12 @@ for name, code in functions.items():
 
 ```
 win2k_analyzer/
-├── win2k_analyzer.py          # CLI frontend (27 commands)
+├── win2k_analyzer.py          # CLI frontend (28 commands)
 ├── win2k_gui.py               # GUI frontend (18 tabs, dark theme, tabbed output)
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
 │
-├── nt_analyzer/               # Core analysis package (19 modules)
+├── nt_analyzer/               # Core analysis package
 │   ├── __init__.py            # Package init
 │   ├── pe_analyzer.py         # PE export/import/header analysis
 │   ├── syscall_extractor.py   # Syscall number extraction from ntdll stubs
@@ -2257,8 +2370,19 @@ win2k_analyzer/
 │   ├── symbol_loader.py       # Multi-format symbol loader (.map/.pdb/.dbg/.sym)
 │   ├── emulator.py            # Unicorn-based kernel function emulator with API mocking
 │   ├── kernel_debugger.py     # Live kernel-state debugger: multi-PE loader, breakpoints, stepping
-│   ├── ubrt_engine.py         # Universal Binary Rewriting Tool: PE/ELF/Mach-O shift engine, 15-pass ref analysis, .pdb/.dbg symbol patching
-│   └── symbol_recovery.py     # Symbol recovery engine: PE diff, section matching, per-section VA remapping for patched binaries
+│   ├── ubrt_engine.py         # Universal Binary Rewriting Tool: PE/ELF/Mach-O shift engine, .pdb/.dbg symbol patching
+│   ├── symbol_recovery.py     # Symbol recovery: PE diff, PDB 2.0/7.0 export, verify_export_correspondence()
+│   └── pdb70/                 # PDB 7.0 (MSF 7.00) parser, section-map, public/module symbol updater
+│       ├── msf.py             # MSF 7.00 container read/write, format detection
+│       ├── segment_map.py     # DBI section-map loader, frame remap, WinDbg-style RVA resolution
+│       ├── symbols.py         # Public symbol stream walker (PUB32)
+│       └── updater.py         # SymbolUpdater70: patch section map, remap publics/modules, stamp info
+│
+├── scripts/
+│   ├── batch_16e_symrecov.py  # Batch symbol recovery for KB979683 v16e hotfix folder
+│   └── probe_pdb70.py         # PDB 7.0 diagnostic probe
+│
+├── tools/                     # HAL/driver SymRecov diagnostic scripts (hal_verify, hal_diag, …)
 │
 ├── generated_headers/         # Output: generated C header files
 │   ├── peb_win2k.h
@@ -2458,9 +2582,11 @@ A: Yes. Each module in `nt_analyzer/` is standalone. Add new detection rules to 
 
 ## Contributing
 
-This is a community project for Windows 2000 preservation.
+This is a community project for Windows 2000 preservation, maintained by **[Win2000DevCommunity](https://github.com/Win2000DevCommunity)**.
 
-1. Fork the repository
+**Contact:** [win2000.dev.community@gmail.com](mailto:win2000.dev.community@gmail.com)
+
+1. Fork the repository at [github.com/Win2000DevCommunity/win2k_analyzer](https://github.com/Win2000DevCommunity/win2k_analyzer)
 2. Create a feature branch
 3. Submit a pull request
 
@@ -2469,11 +2595,12 @@ Areas that need help:
 - x86-64 decompiler support
 - More calling convention detection heuristics
 - Additional NT version difference rules
-- Testing on more Win2000 system binaries
+- Testing on more Win2000 system binaries (especially hotfix-patched drivers with MS symbols)
 - Pre-built patch sets for common ReactOS DLLs
 - PDB support for hal.pdb, ntdll.pdb, win32k.pdb structure extraction
 - Additional prologue patterns for deep function discovery
 - Graph visualization for cross-reference maps
+- SymRecov: more hotfix folder modules where vanilla originals or MS symbols are missing
 - UBRT: ELF DT_JMPREL / DT_RELA / DT_INIT_ARRAY reference passes
 - UBRT: Mach-O chained fixups and bind opcodes reference analysis
 - UBRT: lazy delta accumulation for large-scale multi-shift performance
@@ -2481,4 +2608,4 @@ Areas that need help:
 
 ---
 
-**Made with love for the Windows 2000 community.**
+**Made with love for the Windows 2000 community by [Win2000DevCommunity](https://github.com/Win2000DevCommunity).**

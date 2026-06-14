@@ -759,10 +759,10 @@ def cmd_symrecov(args):
             new_syms = engine.discover_new_section_symbols(
                 patched, orig_pe_path=orig)
         stats = engine.get_stats()
-        print(f"\n  Recovery: {stats.get('ok', 0):,}/{stats.get('total', 0):,} OK "
-              f"({stats.get('success_rate', 0):.1%})")
-        if stats.get('discovered'):
-            print(f"  Discovered: {stats.get('discovered', 0):,} new symbols")
+        total_ok = stats.get('ok', 0) + stats.get('discovered', 0)
+        print(f"\n  Recovery: {total_ok:,}/{stats.get('total', 0):,} mapped "
+              f"({stats.get('ok', 0):,} remapped + {stats.get('discovered', 0):,} discovered, "
+              f"{stats.get('success_rate', 0):.1%})")
         if new_syms:
             by_sec = {}
             for s in new_syms:
@@ -799,12 +799,63 @@ def cmd_symrecov(args):
             print(f"    ✔ Publics hash rebuilt ({reidx.get('publics')} indexed)")
         elif inj.get('injected') and not repro.get('reproducible'):
             print(f"    ⚠ Publics hash unchanged: {repro.get('reason', 'n/a')}")
+        if result.get('pdb_format') == 'pdb70':
+            for sec_r in result.get('section_results') or []:
+                if sec_r.get('modules') is not None:
+                    print(f"    ✔ PDB 7.0 module symbols rebound: "
+                          f"{sec_r.get('remapped', 0)} across "
+                          f"{sec_r.get('modules', 0)} modules "
+                          f"({sec_r.get('unmatched', 0)} kept)")
+                elif sec_r.get('remapped') is not None and 'total' in sec_r:
+                    print(f"    ✔ PDB 7.0 publics remapped: "
+                          f"{sec_r['remapped']}/{sec_r.get('total', '?')} "
+                          f"({sec_r.get('unmatched', 0)} unmatched, "
+                          f"{sec_r.get('export_anchors', 0)} export-anchored)")
+                elif sec_r.get('patched') and sec_r.get('frames'):
+                    fr = sec_r['frames']
+                    changed = {k: v for k, v in fr.items() if k != v}
+                    if changed:
+                        print(f"    ✔ PDB section-map frames updated: {changed}")
         if val.get('valid'):
             print(f"    ✔ PDB validated: {val.get('streams', val.get('num_streams'))} streams, "
                   f"{val.get('pages', val.get('num_pages'))} pages")
         else:
             for err in val.get('errors', ['validation failed']):
                 print(f"    ✗ {err}")
+        dbg_exp = result.get('dbg_export') or {}
+        dbg_st = dbg_exp.get('stamped') or result.get('dbg_stamped') or {}
+        hal_dep = dbg_exp.get('hal_deploy') or result.get('hal_deploy') or {}
+        if dbg_exp.get('output_path'):
+            ts = dbg_st.get('timestamp')
+            ts_s = f"0x{ts:08X}" if isinstance(ts, int) else '?'
+            print(f"    ✔ DBG exported → {dbg_exp['output_path']}")
+            print(f"      (TimeDateStamp {ts_s}, {dbg_st.get('new_sections', '?')} sections)")
+            if hal_dep.get('deployed'):
+                print(f"    ✔ HAL symbol bundle → {len(hal_dep['deployed'])} files "
+                      f"(HAL.dll + HAL.dbg + HAL.pdb aliases)")
+            misc = hal_dep.get('misc_injected') or {}
+            if misc.get('injected') and misc.get('section'):
+                nb10 = misc.get('nb10_sig')
+                nb10_s = f'0x{nb10:08X}' if isinstance(nb10, int) else '?'
+                print(f"    ✔ PE debug chain on HAL.dll "
+                      f"(MISC→.dbg + NB10→pdb, section {misc['section']}, "
+                      f"NB10 sig {nb10_s})")
+            bc = hal_dep.get('bind_check') or {}
+            if bc:
+                ok = bc.get('timestamp_match') and bc.get('checksum_match') and \
+                     bc.get('size_match')
+                mark = '✔' if ok else '⚠'
+                print(f"    {mark} DBG↔PE bind: ts={bc.get('timestamp_match')} "
+                      f"chk={bc.get('checksum_match')} size={bc.get('size_match')}")
+            print(f"      Deploy folder to .sympath root (…\\symbols), not …\\symbols\\dll")
+            print(f"      Then in kd: .reload /f hal   (module name is hal, not halmacpi.dll)")
+        elif dbg_st.get('stamped'):
+            print(f"    ✔ Sibling .dbg TimeDateStamp stamped")
+        stamp = result.get('stamped') or {}
+        cv = result.get('codeview') or {}
+        if stamp.get('stamped') and cv.get('timestamp'):
+            print(f"    ✔ PDB info signature stamped to PE timestamp "
+                  f"0x{cv['timestamp']:08X}")
 
     if args.map:
         if not sym_count:

@@ -28,3 +28,11 @@ Desktop.ini
 # Project files (user-specific)
 .am_recent
 *.am
+
+# Local diagnostics / batch run logs (not for the repo)
+*.log
+*_probe.txt
+probe_*.txt
+scan_*.txt
+symrecov_*_report.json
+.gui_run.log

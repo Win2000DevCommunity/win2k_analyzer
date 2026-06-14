@@ -225,8 +225,9 @@ def load_pdb_file(pdb_path, image_base=None, pe_path=None):
     if data[:44] == b'Microsoft C/C++ program database 2.00\r\n\x1aJG\x00\x00':
         symbols, meta = _parse_pdb20(data, base, pe_path)
     elif b'Microsoft C/C++ MSF 7.00' in data[:32]:
-        # PDB 7.0 — try pdbparse
-        symbols, meta = _parse_pdb70_via_pdbparse(pdb_path, base)
+        from nt_analyzer.pdb70.symbols import load_public_symbols_from_pdb70
+        symbols, meta = load_public_symbols_from_pdb70(
+            pdb_path, pe_path=pe_path, image_base=base)
     else:
         meta['error'] = f'Unknown PDB format: {data[:24]}'
 
@@ -480,10 +481,13 @@ def _parse_coff_symbols(coff_data, base):
     # COFF debug info header
     num_symbols = struct.unpack_from('<I', coff_data, 0)[0]
     sym_offset = struct.unpack_from('<I', coff_data, 4)[0]
+    if sym_offset < 8:
+        sym_offset = 32
     string_table_offset = sym_offset + num_symbols * 18
 
-    for i in range(min(num_symbols, 10000)):  # safety limit
-        entry_offset = 8 + i * 18
+    idx = 0
+    while idx < min(num_symbols, 10000):
+        entry_offset = sym_offset + idx * 18
         if entry_offset + 18 > len(coff_data):
             break
 
@@ -495,8 +499,7 @@ def _parse_coff_symbols(coff_data, base):
         sclass = coff_data[entry_offset + 16]
         aux_count = coff_data[entry_offset + 17]
 
-        # Skip aux entries
-        i += aux_count
+        idx += 1 + aux_count
 
         # Only care about external or static symbols in valid sections
         if section <= 0:
